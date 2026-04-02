@@ -8,6 +8,7 @@ on:
     paths:
       - 'macos-user/**'
       - 'configs/targets/aarch64-macos-user.mak'
+      - 'configure'
       - 'meson.build'
       - '.github/workflows/build-macos-user.yml'
   pull_request:
@@ -16,6 +17,7 @@ on:
     paths:
       - 'macos-user/**'
       - 'configs/targets/aarch64-macos-user.mak'
+      - 'configure'
       - 'meson.build'
       - '.github/workflows/build-macos-user.yml'
   workflow_dispatch:
