@@ -33,6 +33,17 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Cache Homebrew packages
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/Library/Caches/Homebrew
+            /opt/homebrew/Cellar
+            /opt/homebrew/opt
+          key: homebrew-${{ runner.os }}-${{ hashFiles('.github/workflows/build-macos-user.yml') }}
+          restore-keys: |
+            homebrew-${{ runner.os }}-
+
       - name: Install dependencies
         run: |
           # Update Homebrew and install required packages
@@ -74,6 +85,16 @@ jobs:
           echo ""
           echo "=== Ninja Version ==="
           ninja --version
+
+      - name: Cache QEMU build
+        uses: actions/cache@v5
+        with:
+          path: |
+            build
+            ~/.cache/ccache
+          key: qemu-build-${{ runner.os }}-${{ hashFiles('macos-user/**', 'configure', 'meson.build', 'configs/targets/aarch64-macos-user.mak') }}
+          restore-keys: |
+            qemu-build-${{ runner.os }}-
 
       - name: Configure QEMU
         run: |
