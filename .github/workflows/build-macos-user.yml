@@ -7,6 +7,7 @@ on:
       - 'claude/**'
     paths:
       - 'macos-user/**'
+      - 'common-user/**'
       - 'configs/targets/aarch64-macos-user.mak'
       - 'configure'
       - 'meson.build'
@@ -16,6 +17,7 @@ on:
       - main
     paths:
       - 'macos-user/**'
+      - 'common-user/**'
       - 'configs/targets/aarch64-macos-user.mak'
       - 'configure'
       - 'meson.build'
