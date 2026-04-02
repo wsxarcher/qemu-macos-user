@@ -5,8 +5,6 @@
 #ifndef TARGET_ARCH_H
 #define TARGET_ARCH_H
 
-#include "qemu/osdep.h"
-
 /* Target register set structures */
 struct target_pt_regs {
     abi_ulong regs[31];
