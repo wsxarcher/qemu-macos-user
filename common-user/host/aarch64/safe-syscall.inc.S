@@ -66,8 +66,8 @@ safe_syscall_end:
         /* Linux kernel returns (small) negative errno. */
         cmp     x0, #-4096
         b.hi    0f
-#elif defined(__FreeBSD__)
-        /* FreeBSD kernel returns positive errno and C bit set. */
+#elif defined(__FreeBSD__) || defined(__APPLE__)
+        /* FreeBSD and macOS kernels return positive errno and C bit set. */
         b.cs    1f
 #else
 #error "unsupported os"
