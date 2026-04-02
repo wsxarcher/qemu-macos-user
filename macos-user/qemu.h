@@ -16,6 +16,7 @@
 #include "user/abitypes.h"
 #include "user/page-protection.h"
 #include "syscall_defs.h"
+#include "target_syscall.h"
 #include "target_arch.h"
 
 #undef DEBUG_REMAP
