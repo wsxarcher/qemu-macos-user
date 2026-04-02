@@ -1,5 +1,6 @@
 /*
  * ARM AArch64 definitions for macOS user mode
+ * Target-specific definitions and macros
  */
 
 #ifndef TARGET_ARCH_H
