@@ -6,7 +6,7 @@
 #define USER_INTERNALS_H
 
 #include "qemu/osdep.h"
-#include "exec/user/abitypes.h"
+#include "user/abitypes.h"
 
 /* Environment list */
 struct envlist;
