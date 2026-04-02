@@ -10,12 +10,9 @@
 #ifndef QEMU_H
 #define QEMU_H
 
-#include "qemu/osdep.h"
 #include "cpu.h"
 #include "accel/tcg/cpu-ldst.h"
-#include "exec/exec-all.h"
-#include "exec/cpu-all.h"
-#include "exec/page-protection.h"
+
 #include "user/abitypes.h"
 #include "user/page-protection.h"
 #include "syscall_defs.h"
