@@ -5,14 +5,6 @@
 #ifndef TARGET_ARCH_H
 #define TARGET_ARCH_H
 
-/* Target register set structures */
-struct target_pt_regs {
-    abi_ulong regs[31];
-    abi_ulong sp;
-    abi_ulong pc;
-    abi_ulong pstate;
-};
-
 #define TARGET_FREEBSD_NR_syscall    0
 #define TARGET_FREEBSD_NR___syscall  198
 
