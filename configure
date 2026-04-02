@@ -254,6 +254,7 @@ EXESUF=""
 system="yes"
 linux_user=""
 bsd_user=""
+macos_user=""
 plugins="$default_feature"
 subdirs=""
 ninja=""
@@ -718,6 +719,7 @@ for opt do
   --disable-user)
       linux_user="no" ;
       bsd_user="no" ;
+      macos_user="no" ;
   ;;
   --enable-user) ;;
   --disable-linux-user) linux_user="no"
@@ -727,6 +729,10 @@ for opt do
   --disable-bsd-user) bsd_user="no"
   ;;
   --enable-bsd-user) bsd_user="yes"
+  ;;
+  --disable-macos-user) macos_user="no"
+  ;;
+  --enable-macos-user) macos_user="yes"
   ;;
   --enable-pie) pie="yes"
   ;;
@@ -825,8 +831,16 @@ if [ -n "$host_arch" ] && [ -d "$source_path/common-user/host/$host_arch" ]; the
             mak_wilds="${mak_wilds} $source_path/configs/targets/*-bsd-user.mak"
         fi
     fi
+    # Always include macos-user targets in the list for discoverability,
+    # but only auto-enable on darwin
+    if [ "$macos_user" = "" ]; then
+        test $host_os = darwin && macos_user=yes
+    fi
+    if [ "$macos_user" != no ]; then
+        mak_wilds="${mak_wilds} $source_path/configs/targets/*-macos-user.mak"
+    fi
 else
-    if [ "$linux_user" = yes ] || [ "$bsd_user" = yes ]; then
+    if [ "$linux_user" = yes ] || [ "$bsd_user" = yes ] || [ "$macos_user" = yes ]; then
         error_exit "user mode emulation not supported on this architecture"
     fi
 fi
