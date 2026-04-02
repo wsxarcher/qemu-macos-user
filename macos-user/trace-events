@@ -1,0 +1,3 @@
+# Tracing for macOS user mode
+macos_syscall(int num) "syscall %d"
+macos_syscall_ret(int num, int ret) "syscall %d returned %d"
