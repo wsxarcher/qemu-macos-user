@@ -6,6 +6,7 @@
 #define SIGNAL_COMMON_H
 
 #include "qemu/osdep.h"
+#include "target_arch_signal.h"
 #include "qemu.h"
 
 void host_signal_handler(int host_signum, siginfo_t *info, void *puc);
