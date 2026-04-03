@@ -10,7 +10,6 @@
 #include "qemu/osdep.h"
 #include "qemu.h"
 #include "user-internals.h"
-#include "user-mmap.h"
 
 /* Memory mapping implementation */
 abi_long target_mmap(abi_ulong start, abi_ulong len, int prot,
