@@ -127,10 +127,7 @@ static inline unsigned int target_to_host_bitmask(unsigned int target_mask, cons
     return target_mask;
 }
 
-static inline int target_to_host_signal(int sig)
-{
-    return sig;
-}
+int target_to_host_signal(int sig);
 
 /* Flag tables */
 extern const void *fcntl_flags_tbl;

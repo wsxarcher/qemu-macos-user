@@ -10,6 +10,7 @@ macos_user_ss.add(files(
   'machload.c',
   'main.c',
   'mmap.c',
+  'plugin-api.c',
   'signal.c',
   'strace.c',
   'syscall.c',
