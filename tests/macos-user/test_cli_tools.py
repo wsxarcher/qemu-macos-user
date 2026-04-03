@@ -19,9 +19,20 @@ import unittest
 # ---------------------------------------------------------------------------
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_QEMU_BINARY = REPO_ROOT / "build" / "qemu-aarch64"
+_SIGNED_BINARY = REPO_ROOT / "build" / "qemu-aarch64"
+_UNSIGNED_BINARY = REPO_ROOT / "build" / "qemu-aarch64-unsigned"
+
+def _resolve_default_binary():
+    """Return the QEMU binary path, trying signed then unsigned names."""
+    if _SIGNED_BINARY.is_file():
+        return _SIGNED_BINARY
+    if _UNSIGNED_BINARY.is_file():
+        return _UNSIGNED_BINARY
+    # Return the signed name so the error message is clear
+    return _SIGNED_BINARY
+
 QEMU_BINARY = Path(
-    os.environ.get("QEMU_MACOS_USER", str(DEFAULT_QEMU_BINARY))
+    os.environ.get("QEMU_MACOS_USER", str(_resolve_default_binary()))
 ).expanduser()
 
 

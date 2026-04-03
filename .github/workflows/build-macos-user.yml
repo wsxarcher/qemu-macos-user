@@ -117,26 +117,42 @@ jobs:
           cd build
           make -j$(sysctl -n hw.ncpu) V=1
 
+      - name: Resolve QEMU binary
+        id: resolve-binary
+        run: |
+          # The meson build produces qemu-aarch64-unsigned on macOS.
+          # The entitlement.sh custom_target should rename it to qemu-aarch64,
+          # but this may not happen if Rez/SetFile tools are unavailable.
+          # Use whichever binary exists.
+          if [ -f build/qemu-aarch64 ]; then
+            QEMU_BIN="$(pwd)/build/qemu-aarch64"
+          elif [ -f build/qemu-aarch64-unsigned ]; then
+            QEMU_BIN="$(pwd)/build/qemu-aarch64-unsigned"
+          else
+            echo "ERROR: No QEMU binary found in build/"
+            find build -maxdepth 1 -name "qemu-*" -type f
+            exit 1
+          fi
+          echo "QEMU_BIN=${QEMU_BIN}" >> "$GITHUB_ENV"
+          echo "qemu_bin=${QEMU_BIN}" >> "$GITHUB_OUTPUT"
+          echo "Resolved QEMU binary: ${QEMU_BIN}"
+
       - name: Verify binary
         run: |
-          echo "=== Checking for qemu-aarch64 binary ==="
-          ls -lh build/qemu-aarch64* || echo "Binary not found at expected location"
-          find build -name "qemu-aarch64*" -type f
+          echo "=== Checking QEMU binary ==="
+          ls -lh "$QEMU_BIN"
           echo ""
           echo "=== File information ==="
-          file build/qemu-aarch64 2>/dev/null || echo "Cannot read binary"
+          file "$QEMU_BIN"
           echo ""
           echo "=== Binary size ==="
-          du -h build/qemu-aarch64 2>/dev/null || echo "Cannot get size"
-          echo ""
-          echo "=== Testing binary execution ==="
-          build/qemu-aarch64 --version 2>/dev/null || echo "Binary cannot execute or --version not supported"
+          du -h "$QEMU_BIN"
 
       - name: Run basic tests
         run: |
           echo "=== Running basic sanity tests ==="
           # Test help output
-          build/qemu-aarch64 -h > /tmp/help.txt 2>&1 || echo "Help command failed"
+          "$QEMU_BIN" -h > /tmp/help.txt 2>&1 || echo "Help command failed"
           if [ -s /tmp/help.txt ]; then
             echo "Help output generated successfully"
             head -20 /tmp/help.txt
@@ -145,8 +161,11 @@ jobs:
           fi
 
       - name: Test macOS CLI tools under emulation
+        env:
+          QEMU_MACOS_USER: ${{ steps.resolve-binary.outputs.qemu_bin }}
         run: |
           echo "=== Running macOS CLI tool comparison tests ==="
+          echo "Using binary: ${QEMU_MACOS_USER}"
           python3 tests/macos-user/test_cli_tools.py
 
       - name: Create build summary
@@ -161,13 +180,8 @@ jobs:
           echo "- **Branch**: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "## Binary Information" >> $GITHUB_STEP_SUMMARY
-          if [ -f build/qemu-aarch64 ]; then
-            echo "- **Binary**: qemu-aarch64" >> $GITHUB_STEP_SUMMARY
-            echo "- **Size**: $(du -h build/qemu-aarch64 | cut -f1)" >> $GITHUB_STEP_SUMMARY
-            echo "- **Type**: $(file build/qemu-aarch64 | cut -d: -f2)" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "✅ Build successful!" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "❌ Build failed - binary not found" >> $GITHUB_STEP_SUMMARY
-          fi
+          echo "- **Binary**: $(basename "$QEMU_BIN")" >> $GITHUB_STEP_SUMMARY
+          echo "- **Size**: $(du -h "$QEMU_BIN" | cut -f1)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Type**: $(file "$QEMU_BIN" | cut -d: -f2)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Build successful!" >> $GITHUB_STEP_SUMMARY
