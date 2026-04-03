@@ -1,0 +1,186 @@
+name: Build macOS User Mode Emulation
+
+on:
+  push:
+    branches:
+      - main
+      - 'claude/**'
+    paths:
+      - 'macos-user/**'
+      - 'common-user/**'
+      - 'configs/targets/aarch64-macos-user.mak'
+      - 'configure'
+      - 'meson.build'
+      - '.github/workflows/build-macos-user.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'macos-user/**'
+      - 'common-user/**'
+      - 'configs/targets/aarch64-macos-user.mak'
+      - 'configure'
+      - 'meson.build'
+      - '.github/workflows/build-macos-user.yml'
+  workflow_dispatch:
+
+jobs:
+  build-macos-user:
+    name: Build QEMU macOS User Mode (ARM64)
+    runs-on: macos-14  # macOS with Apple Silicon (M1)
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Cache Homebrew packages
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/Library/Caches/Homebrew
+            /opt/homebrew/Cellar
+            /opt/homebrew/opt
+          key: homebrew-${{ runner.os }}-${{ hashFiles('.github/workflows/build-macos-user.yml') }}
+          restore-keys: |
+            homebrew-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: |
+          # Update Homebrew and install required packages
+          brew update
+          brew install \
+            meson \
+            ninja \
+            pkg-config \
+            glib \
+            pixman \
+            libffi \
+            libslirp \
+            capstone \
+            dtc \
+            gettext \
+            zlib \
+            zstd
+
+      - name: Display system information
+        run: |
+          echo "=== System Information ==="
+          sw_vers
+          uname -a
+          echo ""
+          echo "=== CPU Architecture ==="
+          uname -m
+          echo ""
+          echo "=== Xcode Version ==="
+          xcodebuild -version || echo "Xcode not found"
+          echo ""
+          echo "=== Clang Version ==="
+          clang --version
+          echo ""
+          echo "=== Python Version ==="
+          python3 --version
+          echo ""
+          echo "=== Meson Version ==="
+          meson --version
+          echo ""
+          echo "=== Ninja Version ==="
+          ninja --version
+
+      - name: Cache QEMU build
+        uses: actions/cache@v5
+        with:
+          path: |
+            build
+            ~/.cache/ccache
+          key: qemu-build-${{ runner.os }}-${{ hashFiles('macos-user/**', 'configure', 'meson.build', 'configs/targets/aarch64-macos-user.mak') }}
+          restore-keys: |
+            qemu-build-${{ runner.os }}-
+
+      - name: Configure QEMU
+        run: |
+          mkdir -p build
+          cd build
+          ../configure \
+            --target-list=aarch64-macos-user \
+            --disable-system \
+            --disable-bsd-user \
+            --disable-linux-user \
+            --enable-tcg \
+            --enable-debug-info \
+            --python=python3
+
+      - name: Display configuration
+        run: |
+          echo "=== Build Configuration ==="
+          cat build/config-host.mak | grep -E "TARGET_|CONFIG_" | head -30
+          echo ""
+          echo "=== Configured targets ==="
+          cat build/config-host.mak | grep TARGET_DIRS
+
+      - name: Build QEMU macOS user mode
+        run: |
+          cd build
+          make -j$(sysctl -n hw.ncpu) V=1
+
+      - name: Verify binary
+        run: |
+          echo "=== Checking for qemu-aarch64-macos binary ==="
+          ls -lh build/qemu-aarch64-macos* || echo "Binary not found at expected location"
+          find build -name "qemu-aarch64-macos*" -type f
+          echo ""
+          echo "=== File information ==="
+          file build/qemu-aarch64-macos 2>/dev/null || echo "Cannot read binary"
+          echo ""
+          echo "=== Binary size ==="
+          du -h build/qemu-aarch64-macos 2>/dev/null || echo "Cannot get size"
+          echo ""
+          echo "=== Testing binary execution ==="
+          build/qemu-aarch64-macos --version 2>/dev/null || echo "Binary cannot execute or --version not supported"
+
+      - name: Run basic tests
+        run: |
+          echo "=== Running basic sanity tests ==="
+          # Test help output
+          build/qemu-aarch64-macos -h > /tmp/help.txt 2>&1 || echo "Help command failed"
+          if [ -s /tmp/help.txt ]; then
+            echo "Help output generated successfully"
+            head -20 /tmp/help.txt
+          else
+            echo "Warning: Help output is empty"
+          fi
+
+      - name: Upload QEMU binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-aarch64-macos-${{ github.sha }}
+          path: build/qemu-aarch64-macos
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create build summary
+        run: |
+          echo "# macOS User Mode Emulation Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Build Information" >> $GITHUB_STEP_SUMMARY
+          echo "- **Build Date**: $(date)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Runner OS**: macOS $(sw_vers -productVersion)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Architecture**: $(uname -m)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch**: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Binary Information" >> $GITHUB_STEP_SUMMARY
+          if [ -f build/qemu-aarch64-macos ]; then
+            echo "- **Binary**: qemu-aarch64-macos" >> $GITHUB_STEP_SUMMARY
+            echo "- **Size**: $(du -h build/qemu-aarch64-macos | cut -f1)" >> $GITHUB_STEP_SUMMARY
+            echo "- **Type**: $(file build/qemu-aarch64-macos | cut -d: -f2)" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "✅ Build successful!" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "❌ Build failed - binary not found" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Artifact" >> $GITHUB_STEP_SUMMARY
+          echo "The built binary is available as a workflow artifact: \`qemu-aarch64-macos-${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY

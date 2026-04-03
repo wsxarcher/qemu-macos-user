@@ -13,9 +13,11 @@
         .global safe_syscall_base
         .global safe_syscall_start
         .global safe_syscall_end
+#if defined(__ELF__)
         .type   safe_syscall_base, #function
         .type   safe_syscall_start, #function
         .type   safe_syscall_end, #function
+#endif
 
         /* This is the entry point for making a system call. The calling
          * convention here is that of a C varargs function with the
@@ -66,8 +68,8 @@ safe_syscall_end:
         /* Linux kernel returns (small) negative errno. */
         cmp     x0, #-4096
         b.hi    0f
-#elif defined(__FreeBSD__)
-        /* FreeBSD kernel returns positive errno and C bit set. */
+#elif defined(__FreeBSD__) || defined(__APPLE__)
+        /* FreeBSD and macOS kernels return positive errno and C bit set. */
         b.cs    1f
 #else
 #error "unsupported os"
@@ -85,4 +87,6 @@ safe_syscall_end:
 1:      b       safe_syscall_set_errno_tail
 
         .cfi_endproc
+#if defined(__ELF__)
         .size   safe_syscall_base, .-safe_syscall_base
+#endif

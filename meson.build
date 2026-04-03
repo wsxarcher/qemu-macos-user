@@ -64,13 +64,15 @@ target_dirs = config_host['TARGET_DIRS'].split()
 # type of binaries to build
 have_linux_user = false
 have_bsd_user = false
+have_macos_user = false
 have_system = false
 foreach target : target_dirs
   have_linux_user = have_linux_user or target.endswith('linux-user')
   have_bsd_user = have_bsd_user or target.endswith('bsd-user')
+  have_macos_user = have_macos_user or target.endswith('macos-user')
   have_system = have_system or target.endswith('-softmmu')
 endforeach
-have_user = have_linux_user or have_bsd_user
+have_user = have_linux_user or have_bsd_user or have_macos_user
 
 ############
 # Programs #
@@ -3310,6 +3312,14 @@ foreach target : target_dirs
       error('Target @0@ is only available on a BSD host'.format(target))
     endif
     config_target += { 'CONFIG_BSD_USER': 'y' }
+  elif target.endswith('macos-user')
+    if host_os != 'darwin'
+      if default_targets
+        continue
+      endif
+      error('Target @0@ is only available on a macOS host'.format(target))
+    endif
+    config_target += { 'CONFIG_MACOS_USER': 'y' }
   elif target.endswith('softmmu')
     config_target += { 'CONFIG_SYSTEM_ONLY': 'y' }
     config_target += { 'CONFIG_SOFTMMU': 'y' }
@@ -3593,6 +3603,9 @@ if have_linux_user
 endif
 if have_bsd_user
   trace_events_subdirs += [ 'bsd-user' ]
+endif
+if have_macos_user
+  trace_events_subdirs += [ 'macos-user' ]
 endif
 if have_block
   trace_events_subdirs += [
@@ -3884,6 +3897,7 @@ common_user_inc = []
 subdir('common-user')
 subdir('bsd-user')
 subdir('linux-user')
+subdir('macos-user')
 
 # needed for fuzzing binaries
 subdir('tests/qtest/libqos')
@@ -4299,6 +4313,11 @@ foreach target : target_dirs
       target_inc += include_directories('bsd-user/host/' / host_arch)
       dir = base_dir / abi
       arch_srcs += files(dir / 'signal.c', dir / 'target_arch_cpu.c')
+    endif
+    if 'CONFIG_MACOS_USER' in config_target
+      base_dir = 'macos-user'
+      dir = base_dir / abi
+      arch_srcs += files(dir / 'signal.c')
     endif
     target_inc += include_directories(
       base_dir,
