@@ -13,7 +13,10 @@ void print_syscall(CPUState *cpu, int num,
                   abi_long arg4, abi_long arg5, abi_long arg6)
 {
     if (do_strace) {
-        fprintf(stderr, "syscall[%d] = %ld, %ld, %ld, %ld, %ld, %ld\n",
+        fprintf(stderr, "syscall[%d] = " TARGET_ABI_FMT_ld ", "
+                TARGET_ABI_FMT_ld ", " TARGET_ABI_FMT_ld ", "
+                TARGET_ABI_FMT_ld ", " TARGET_ABI_FMT_ld ", "
+                TARGET_ABI_FMT_ld "\n",
                 num, arg1, arg2, arg3, arg4, arg5, arg6);
     }
 }
@@ -23,6 +26,6 @@ void print_syscall_ret(CPUState *cpu, int num, abi_long ret,
                        abi_long arg4, abi_long arg5, abi_long arg6)
 {
     if (do_strace) {
-        fprintf(stderr, "syscall[%d] -> %ld\n", num, ret);
+        fprintf(stderr, "syscall[%d] -> " TARGET_ABI_FMT_ld "\n", num, ret);
     }
 }

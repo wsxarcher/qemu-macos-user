@@ -29,6 +29,24 @@
 #include "trace.h"
 
 /*
+ * macOS does not provide sigorset(3). Provide a simple implementation
+ * that computes dest = left | right for each signal in the set.
+ */
+static inline int sigorset(sigset_t *dest, const sigset_t *left,
+                           const sigset_t *right)
+{
+    int i;
+
+    sigemptyset(dest);
+    for (i = 1; i < NSIG; i++) {
+        if (sigismember(left, i) || sigismember(right, i)) {
+            sigaddset(dest, i);
+        }
+    }
+    return 0;
+}
+
+/*
  * Signal action table: stores the guest program's registered signal actions.
  */
 static struct target_sigaction sigact_table[TARGET_NSIG];
