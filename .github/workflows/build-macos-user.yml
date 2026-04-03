@@ -13,6 +13,7 @@ on:
       - 'configure'
       - 'meson.build'
       - '.github/workflows/build-macos-user.yml'
+      - 'tests/macos-user/**'
   pull_request:
     branches:
       - master
@@ -23,6 +24,7 @@ on:
       - 'configure'
       - 'meson.build'
       - '.github/workflows/build-macos-user.yml'
+      - 'tests/macos-user/**'
   workflow_dispatch:
 
 jobs:
@@ -141,6 +143,11 @@ jobs:
           else
             echo "Warning: Help output is empty"
           fi
+
+      - name: Test macOS CLI tools under emulation
+        run: |
+          echo "=== Running macOS CLI tool comparison tests ==="
+          python3 tests/macos-user/test_cli_tools.py
 
       - name: Create build summary
         run: |
