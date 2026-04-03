@@ -29,6 +29,8 @@ jobs:
   build-macos-user:
     name: Build QEMU macOS User Mode (ARM64)
     runs-on: macos-14
+    env:
+      PATH: /opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 
     steps:
       - name: Checkout repository
@@ -36,21 +38,9 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Cache Homebrew packages
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/Library/Caches/Homebrew
-            /opt/homebrew/Cellar
-            /opt/homebrew/opt
-          key: homebrew-${{ runner.os }}-${{ hashFiles('.github/workflows/build-macos-user.yml') }}
-          restore-keys: |
-            homebrew-${{ runner.os }}-
-
       - name: Install dependencies
         run: |
-          # Update Homebrew and install required packages
-          brew update
+          # Install required packages
           brew install \
             meson \
             ninja \
