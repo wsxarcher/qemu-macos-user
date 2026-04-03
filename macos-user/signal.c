@@ -8,13 +8,22 @@
  */
 
 #include "qemu/osdep.h"
+#include "accel/tcg/cpu-ops.h"
 #include "qemu.h"
+#include "user/cpu_loop.h"
+#include "user/signal.h"
 #include "signal-common.h"
 #include "user-internals.h"
 
 /* Per-thread signal table */
 static struct emulated_sigtable sigtable[TARGET_NSIG];
 static sigset_t blocked_signals;
+int host_interrupt_signal = SIGINFO;
+
+int target_to_host_signal(int sig)
+{
+    return sig;
+}
 
 void signal_init(void)
 {
@@ -112,10 +121,34 @@ int do_sigaction(int sig, const struct target_sigaction *act,
     return 0;
 }
 
-long do_sigreturn(CPUArchState *env, abi_ulong addr)
+void cpu_loop_exit_sigsegv(CPUState *cpu, vaddr addr,
+                           MMUAccessType access_type, bool maperr, uintptr_t ra)
 {
-    /* TODO: Implement sigreturn */
-    return -TARGET_ENOSYS;
+    const TCGCPUOps *tcg_ops = cpu->cc->tcg_ops;
+
+    if (tcg_ops->record_sigsegv) {
+        tcg_ops->record_sigsegv(cpu, addr, access_type, maperr, ra);
+    }
+
+    force_sig_fault(TARGET_SIGSEGV,
+                    maperr ? TARGET_SEGV_MAPERR : TARGET_SEGV_ACCERR,
+                    addr);
+    cpu->exception_index = EXCP_INTERRUPT;
+    cpu_loop_exit_restore(cpu, ra);
+}
+
+void cpu_loop_exit_sigbus(CPUState *cpu, vaddr addr,
+                          MMUAccessType access_type, uintptr_t ra)
+{
+    const TCGCPUOps *tcg_ops = cpu->cc->tcg_ops;
+
+    if (tcg_ops->record_sigbus) {
+        tcg_ops->record_sigbus(cpu, addr, access_type, ra);
+    }
+
+    force_sig_fault(TARGET_SIGBUS, TARGET_BUS_ADRALN, addr);
+    cpu->exception_index = EXCP_INTERRUPT;
+    cpu_loop_exit_restore(cpu, ra);
 }
 
 long do_rt_sigreturn(CPUArchState *env)
