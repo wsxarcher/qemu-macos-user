@@ -15,10 +15,4 @@ void setup_frame(int sig, struct target_sigaction *ka,
 
 #define SI_KERNEL 0x80
 
-/* Get task state from CPU */
-static inline TaskState *get_task_state(CPUState *cpu)
-{
-    return (TaskState *)cpu->opaque;
-}
-
 #endif /* SIGNAL_COMMON_H */

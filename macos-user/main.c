@@ -225,6 +225,7 @@ void init_task_state(TaskState *ts)
 {
     ts->ts_tid = 0;
     ts->next = NULL;
+    ts->bprm = NULL;
     ts->info = NULL;
     sigemptyset(&ts->signal_mask);
 }
@@ -361,6 +362,12 @@ int main(int argc, char **argv, char **envp)
     init_task_state(ts);
     ts->info = &info;
     cpu->opaque = ts;
+
+    /* Set up binary program info for gdb */
+    struct macos_binprm *bprm = g_new0(struct macos_binprm, 1);
+    bprm->filename = g_strdup(filename);
+    bprm->fullpath = realpath(filename, NULL);
+    ts->bprm = bprm;
 
     /* Load the binary */
     char *memp = NULL;
