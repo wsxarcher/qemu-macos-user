@@ -15,6 +15,7 @@
 
 #include "qapi/error.h"
 #include "qemu.h"
+#include "user-internals.h"
 #include "qemu/config-file.h"
 #include "qemu/error-report.h"
 #include "qemu/path.h"
@@ -133,9 +134,6 @@ static void usage(void)
            target_dflssiz);
     exit(1);
 }
-
-static int do_strace;
-static const char *cpu_model;
 
 static void handle_arg_help(const char *arg)
 {
@@ -262,7 +260,6 @@ int main(int argc, char **argv, char **envp)
     int ret;
     int i;
     const char *gdbstub = NULL;
-    envlist_t *envlist = NULL;
 
     qemu_init_cpu_list();
     module_call_init(MODULE_INIT_TRACE);
