@@ -7,12 +7,12 @@ This workflow builds the macOS user-mode emulation target (`aarch64-macos-user`)
 ### Triggers
 
 The workflow runs on:
-- **Push** to `main` or any `claude/**` branch when changes are made to:
+- **Push** to `master` or any `claude/**` or `copilot/**` branch when changes are made to:
   - `macos-user/**` files
   - `configs/targets/aarch64-macos-user.mak`
   - `meson.build`
   - The workflow file itself
-- **Pull requests** targeting `main` with the same path filters
+- **Pull requests** targeting `master` with the same path filters
 - **Manual dispatch** via the GitHub Actions UI
 
 ### Requirements
