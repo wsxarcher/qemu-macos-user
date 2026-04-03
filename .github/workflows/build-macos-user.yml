@@ -119,24 +119,24 @@ jobs:
 
       - name: Verify binary
         run: |
-          echo "=== Checking for qemu-aarch64-macos binary ==="
-          ls -lh build/qemu-aarch64-macos* || echo "Binary not found at expected location"
-          find build -name "qemu-aarch64-macos*" -type f
+          echo "=== Checking for qemu-aarch64 binary ==="
+          ls -lh build/qemu-aarch64* || echo "Binary not found at expected location"
+          find build -name "qemu-aarch64*" -type f
           echo ""
           echo "=== File information ==="
-          file build/qemu-aarch64-macos 2>/dev/null || echo "Cannot read binary"
+          file build/qemu-aarch64 2>/dev/null || echo "Cannot read binary"
           echo ""
           echo "=== Binary size ==="
-          du -h build/qemu-aarch64-macos 2>/dev/null || echo "Cannot get size"
+          du -h build/qemu-aarch64 2>/dev/null || echo "Cannot get size"
           echo ""
           echo "=== Testing binary execution ==="
-          build/qemu-aarch64-macos --version 2>/dev/null || echo "Binary cannot execute or --version not supported"
+          build/qemu-aarch64 --version 2>/dev/null || echo "Binary cannot execute or --version not supported"
 
       - name: Run basic tests
         run: |
           echo "=== Running basic sanity tests ==="
           # Test help output
-          build/qemu-aarch64-macos -h > /tmp/help.txt 2>&1 || echo "Help command failed"
+          build/qemu-aarch64 -h > /tmp/help.txt 2>&1 || echo "Help command failed"
           if [ -s /tmp/help.txt ]; then
             echo "Help output generated successfully"
             head -20 /tmp/help.txt
@@ -161,10 +161,10 @@ jobs:
           echo "- **Branch**: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "## Binary Information" >> $GITHUB_STEP_SUMMARY
-          if [ -f build/qemu-aarch64-macos ]; then
-            echo "- **Binary**: qemu-aarch64-macos" >> $GITHUB_STEP_SUMMARY
-            echo "- **Size**: $(du -h build/qemu-aarch64-macos | cut -f1)" >> $GITHUB_STEP_SUMMARY
-            echo "- **Type**: $(file build/qemu-aarch64-macos | cut -d: -f2)" >> $GITHUB_STEP_SUMMARY
+          if [ -f build/qemu-aarch64 ]; then
+            echo "- **Binary**: qemu-aarch64" >> $GITHUB_STEP_SUMMARY
+            echo "- **Size**: $(du -h build/qemu-aarch64 | cut -f1)" >> $GITHUB_STEP_SUMMARY
+            echo "- **Type**: $(file build/qemu-aarch64 | cut -d: -f2)" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "✅ Build successful!" >> $GITHUB_STEP_SUMMARY
           else

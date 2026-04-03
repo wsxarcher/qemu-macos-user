@@ -19,7 +19,7 @@ import unittest
 # ---------------------------------------------------------------------------
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_QEMU_BINARY = REPO_ROOT / "build" / "qemu-aarch64-macos"
+DEFAULT_QEMU_BINARY = REPO_ROOT / "build" / "qemu-aarch64"
 QEMU_BINARY = Path(
     os.environ.get("QEMU_MACOS_USER", str(DEFAULT_QEMU_BINARY))
 ).expanduser()
