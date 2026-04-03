@@ -63,7 +63,7 @@ void queue_signal(CPUArchState *env, int sig, int si_type,
 void force_sig_fault(int sig, int code, abi_ulong addr)
 {
     CPUState *cpu = thread_cpu;
-    CPUArchState *env = cpu->env_ptr;
+    CPUArchState *env = cpu_env(cpu);
     target_siginfo_t info;
 
     memset(&info, 0, sizeof(info));
