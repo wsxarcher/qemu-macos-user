@@ -15,4 +15,15 @@ void setup_frame(int sig, struct target_sigaction *ka,
 
 #define SI_KERNEL 0x80
 
+/*
+ * Internal si_code type markers stored in the top 8 bits of si_code
+ * between host_to_target_siginfo_noswap() and tswap_siginfo().
+ * They are stripped before writing to guest memory.
+ */
+#define QEMU_SI_NOINFO   0
+#define QEMU_SI_FAULT    1
+#define QEMU_SI_TIMER    2
+#define QEMU_SI_MESGQ    3
+#define QEMU_SI_POLL     4
+
 #endif /* SIGNAL_COMMON_H */

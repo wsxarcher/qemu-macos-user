@@ -17,4 +17,7 @@ macos_user_ss.add(files(
   'uaccess.c',
 ))
 
+# Architecture-specific sources
+subdir('aarch64')
+
 specific_ss.add_all(when: 'CONFIG_MACOS_USER', if_true: macos_user_ss)
