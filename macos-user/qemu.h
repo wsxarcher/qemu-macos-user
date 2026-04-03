@@ -12,6 +12,7 @@
 
 #include "cpu.h"
 #include "accel/tcg/cpu-ldst.h"
+#include "accel/tcg/vcpu-state.h"
 
 #include "user/abitypes.h"
 #include "user/page-protection.h"
@@ -50,12 +51,22 @@ struct emulated_sigtable {
 };
 
 /*
+ * This structure is used to hold the arguments that are
+ * used when loading binaries.
+ */
+struct macos_binprm {
+    char *filename;         /* (Given) Name of binary */
+    char *fullpath;         /* Full path of binary */
+};
+
+/*
  * Task state shared between all threads in a task
  */
 struct TaskState {
     pid_t ts_tid;     /* tid (or pid) of this task */
 
     struct TaskState *next;
+    struct macos_binprm *bprm;
     struct image_info *info;
 
     struct target_sigaltstack sigaltstack_base;
