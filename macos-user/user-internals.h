@@ -7,6 +7,7 @@
 
 #include "qemu/osdep.h"
 #include "user/abitypes.h"
+#include <sys/ioctl.h>
 
 /* Environment list */
 struct envlist;
@@ -81,11 +82,9 @@ static inline int safe_open(const char *path, int flags, mode_t mode)
     return ret;
 }
 
-/* Page operations */
-#define TARGET_PAGE_BITS 12
-#define TARGET_PAGE_SIZE (1 << TARGET_PAGE_BITS)
-#define TARGET_PAGE_MASK ~(TARGET_PAGE_SIZE - 1)
-#define TARGET_PAGE_ALIGN(addr) (((addr) + TARGET_PAGE_SIZE - 1) & TARGET_PAGE_MASK)
+/* Page operations - TARGET_PAGE_BITS is defined per-target in cpu-param.h;
+ * TARGET_PAGE_SIZE, TARGET_PAGE_MASK, and TARGET_PAGE_ALIGN are provided
+ * by include/exec/target_page.h and must not be redefined here. */
 
 /* BSD-style helpers (TODO: implement properly) */
 static inline abi_long do_bsd_fcntl(int fd, int cmd, abi_ulong arg)
