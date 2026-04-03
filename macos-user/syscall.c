@@ -8,6 +8,7 @@
  */
 
 #include "qemu/osdep.h"
+#include <sys/random.h>
 #include "qemu.h"
 #include "user/guest-host.h"
 #include "user-internals.h"
