@@ -24,6 +24,7 @@
 #include "syscall_defs.h"
 #include "target_syscall.h"
 #include "target_arch.h"
+#include "target_arch_signal.h"
 
 #undef DEBUG_REMAP
 
