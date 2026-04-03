@@ -8,6 +8,7 @@ then asserts the outputs are identical (or equivalent where noted).
 """
 
 import os
+from pathlib import Path
 import subprocess
 import sys
 import tempfile
@@ -17,9 +18,11 @@ import unittest
 # Configuration
 # ---------------------------------------------------------------------------
 
-QEMU_BINARY = os.environ.get(
-    "QEMU_MACOS_USER", "build/qemu-aarch64-macos"
-)
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_QEMU_BINARY = REPO_ROOT / "build" / "qemu-aarch64-macos"
+QEMU_BINARY = Path(
+    os.environ.get("QEMU_MACOS_USER", str(DEFAULT_QEMU_BINARY))
+).expanduser()
 
 
 def _run(args, *, timeout=30, env=None, stdin_data=None):
@@ -41,7 +44,7 @@ def _run_native(args, **kwargs):
 
 def _run_emulated(args, **kwargs):
     """Run a command under qemu-macos-user."""
-    return _run([QEMU_BINARY] + list(args), **kwargs)
+    return _run([str(QEMU_BINARY)] + list(args), **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -397,10 +400,10 @@ class TestCLITools(unittest.TestCase):
 
 if __name__ == "__main__":
     # Verify the QEMU binary exists before running tests
-    if not os.path.isfile(QEMU_BINARY):
+    if not QEMU_BINARY.is_file():
         print(
             f"ERROR: QEMU binary not found at '{QEMU_BINARY}'. "
-            "Set QEMU_MACOS_USER env var or run from the repo root.",
+            "Set QEMU_MACOS_USER to the built binary path.",
             file=sys.stderr,
         )
         sys.exit(1)
