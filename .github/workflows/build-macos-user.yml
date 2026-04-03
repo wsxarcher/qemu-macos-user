@@ -3,8 +3,9 @@ name: Build macOS User Mode Emulation
 on:
   push:
     branches:
-      - main
+      - master
       - 'claude/**'
+      - 'copilot/**'
     paths:
       - 'macos-user/**'
       - 'common-user/**'
@@ -14,7 +15,7 @@ on:
       - '.github/workflows/build-macos-user.yml'
   pull_request:
     branches:
-      - main
+      - master
     paths:
       - 'macos-user/**'
       - 'common-user/**'
