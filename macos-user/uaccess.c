@@ -34,11 +34,6 @@ void *lock_user_string(abi_ulong guest_addr)
     return (void *)(uintptr_t)guest_addr;
 }
 
-void gdb_exit(int code)
-{
-    /* TODO: Implement GDB exit notification */
-}
-
 void dump_core_and_abort(int sig)
 {
     abort();

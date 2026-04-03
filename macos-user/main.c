@@ -66,10 +66,6 @@ bool qemu_cpu_is_self(CPUState *cpu)
     return thread_cpu == cpu;
 }
 
-void qemu_cpu_kick(CPUState *cpu)
-{
-}
-
 /* Fork handling */
 void fork_start(void)
 {
