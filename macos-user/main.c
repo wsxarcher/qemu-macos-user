@@ -58,10 +58,11 @@ unsigned long target_dflssiz = 8 * 1024 * 1024;     /* initial stack size limit 
 unsigned long target_maxssiz = 64 * 1024 * 1024;    /* max stack size */
 unsigned long target_sgrowsiz = 128 * 1024;         /* amount to grow stack */
 
-CPUArchState *thread_cpu;
+__thread CPUState *thread_cpu;
+
 bool qemu_cpu_is_self(CPUState *cpu)
 {
-    return true;
+    return thread_cpu == cpu;
 }
 
 void qemu_cpu_kick(CPUState *cpu)
@@ -133,12 +134,8 @@ static void usage(void)
     exit(1);
 }
 
-THREAD CPUState *thread_cpu;
-
-bool qemu_plugin_user_exit(void)
-{
-    return false;
-}
+static int do_strace;
+static const char *cpu_model;
 
 static void handle_arg_help(const char *arg)
 {
@@ -216,11 +213,6 @@ static void handle_arg_panic(const char *arg)
     /* Ignore for now */
 }
 
-void qemu_init_cpu_list(void)
-{
-    QTAILQ_INIT_RCU(&cpus_queue);
-}
-
 void init_task_state(TaskState *ts)
 {
     ts->ts_tid = 0;
@@ -269,13 +261,15 @@ int main(int argc, char **argv, char **envp)
     char **target_envp = NULL;
     int ret;
     int i;
-    int gdbstub = 0;
+    const char *gdbstub = NULL;
+    envlist_t *envlist = NULL;
 
     qemu_init_cpu_list();
     module_call_init(MODULE_INIT_TRACE);
     module_call_init(MODULE_INIT_QOM);
 
-    if ((envlist = envlist_create()) == NULL) {
+    envlist = envlist_create();
+    if (envlist == NULL) {
         fprintf(stderr, "Unable to allocate envlist\n");
         exit(EXIT_FAILURE);
     }
@@ -340,20 +334,25 @@ int main(int argc, char **argv, char **envp)
     /* Zero the BSS */
     memset(&info, 0, sizeof(info));
 
-    /* Initialize TCG */
-    tcg_exec_init(0, false);
-
     if (cpu_model == NULL) {
         cpu_model = TARGET_DEFAULT_CPU_MODEL;
     }
 
-    /* Create CPU */
-    cpu = cpu_create(cpu_model);
-    if (!cpu) {
-        fprintf(stderr, "Unable to create CPU\n");
-        exit(EXIT_FAILURE);
+    const char *cpu_type = parse_cpu_option(cpu_model);
+
+    /* init tcg before creating CPUs and to get qemu_host_page_size */
+    {
+        AccelState *accel = current_accel();
+        AccelClass *ac = ACCEL_GET_CLASS(accel);
+
+        accel_init_interfaces(ac);
+        ac->init_machine(accel, NULL);
     }
+
+    /* Create CPU */
+    cpu = cpu_create(cpu_type);
     env = cpu_env(cpu);
+    cpu_reset(cpu);
 
     thread_cpu = cpu;
 
@@ -398,6 +397,13 @@ int main(int argc, char **argv, char **envp)
     /* Setup arguments on stack */
     regs.sp = setup_arg_pages(&info, stack_base, &regs, target_argv, envp);
 
+    /*
+     * Now that we've loaded the binary, GUEST_BASE is fixed.  Delay
+     * generating the prologue until now so that the prologue can take
+     * the real value of GUEST_BASE into account.
+     */
+    tcg_prologue_init();
+
     /* Initialize CPU state */
     target_cpu_init(env, &regs);
 
@@ -405,7 +411,7 @@ int main(int argc, char **argv, char **envp)
     signal_init();
 
     if (gdbstub) {
-        gdbserver_start(gdbstub);
+        gdbserver_start(gdbstub, &error_fatal);
     }
 
     /* Start CPU loop */

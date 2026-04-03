@@ -9,7 +9,6 @@
 
 #include "qemu/osdep.h"
 #include "qemu.h"
-#include "user/loader.h"
 #include "user/guest-base.h"
 #include "qemu/path.h"
 #include <mach-o/loader.h>

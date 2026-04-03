@@ -15,7 +15,9 @@
 #include "accel/tcg/vcpu-state.h"
 
 #include "user/abitypes.h"
+#include "user/mmap.h"
 #include "user/page-protection.h"
+#include "exec/gdbstub.h"
 #include "syscall_defs.h"
 #include "target_syscall.h"
 #include "target_arch.h"
@@ -110,7 +112,7 @@ int target_msync(abi_ulong start, abi_ulong len, int flags);
 int target_mprotect(abi_ulong start, abi_ulong len, int prot);
 
 /* Main thread handling */
-extern CPUArchState *thread_cpu;
+extern __thread CPUState *thread_cpu;
 
 int loader_exec(const char *filename, char **argv, char **envp,
                 struct target_pt_regs *regs, struct image_info *infop,
@@ -118,7 +120,6 @@ int loader_exec(const char *filename, char **argv, char **envp,
 
 uint32_t get_elf_hwcap(void);
 
-void qemu_init_cpu_list(void);
 void init_task_state(TaskState *ts);
 
 #endif /* QEMU_H */
