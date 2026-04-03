@@ -12,8 +12,6 @@
 #include "user-internals.h"
 #include "strace.h"
 #include "signal-common.h"
-#include "loader.h"
-#include "user/syscall-trace.h"
 
 /* Syscall implementation */
 abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
