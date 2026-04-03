@@ -35,6 +35,7 @@ void unlock_user(void *host_ptr, abi_ulong guest_addr, size_t len);
 void *lock_user_string(abi_ulong guest_addr);
 
 /* Error handling */
+#define TARGET_EPERM        1
 #define TARGET_EFAULT       14
 #define TARGET_EINVAL       22
 #define TARGET_ENOMEM       12
@@ -97,16 +98,10 @@ static inline abi_long do_bsd_ioctl(int fd, int cmd, abi_ulong arg)
     return get_errno(ioctl(fd, cmd, arg));
 }
 
-static inline abi_long do_bsd_sigprocmask(void *env, int how,
-                                          abi_ulong set, abi_ulong oldset)
-{
-    return -TARGET_ENOSYS;
-}
-
-static inline abi_long do_sigaltstack(abi_ulong ss, abi_ulong old_ss, void *env)
-{
-    return -TARGET_ENOSYS;
-}
+/* Signal handling - implemented in signal.c */
+abi_long do_bsd_sigprocmask(void *env, int how,
+                            abi_ulong set, abi_ulong oldset);
+abi_long do_sigaltstack(abi_ulong ss, abi_ulong old_ss, abi_ulong sp);
 
 /* Conversion functions (stubs for now) */
 static inline int host_to_target_stat(abi_ulong target_addr, struct stat *host_st)
