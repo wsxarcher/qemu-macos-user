@@ -10,12 +10,20 @@
  * See the COPYING file in the top-level directory.
  */
 
-        .global safe_syscall_base
-        .global safe_syscall_start
-        .global safe_syscall_end
-        .type   safe_syscall_base, #function
-        .type   safe_syscall_start, #function
-        .type   safe_syscall_end, #function
+#if defined(__APPLE__)
+#define CNAME(X) _##X
+#else
+#define CNAME(X) X
+#endif
+
+        .global CNAME(safe_syscall_base)
+        .global CNAME(safe_syscall_start)
+        .global CNAME(safe_syscall_end)
+#if defined(__ELF__)
+        .type   CNAME(safe_syscall_base), #function
+        .type   CNAME(safe_syscall_start), #function
+        .type   CNAME(safe_syscall_end), #function
+#endif
 
         /* This is the entry point for making a system call. The calling
          * convention here is that of a C varargs function with the
@@ -23,7 +31,7 @@
          * second one the system call number (as a 'long'), and all further
          * arguments being syscall arguments (also 'long').
          */
-safe_syscall_base:
+CNAME(safe_syscall_base):
         .cfi_startproc
         /* The syscall calling convention isn't the same as the
          * C one:
@@ -54,20 +62,20 @@ safe_syscall_base:
          * The code sequence must therefore be able to cope with this, and
          * the syscall instruction must be the final one in the sequence.
          */
-safe_syscall_start:
+CNAME(safe_syscall_start):
         /* if signal_pending is non-zero, don't do the call */
         ldr     w10, [x9]
         cbnz    w10, 2f
         svc     0x0
-safe_syscall_end:
+CNAME(safe_syscall_end):
 
         /* code path for having successfully executed the syscall */
 #if defined(__linux__)
         /* Linux kernel returns (small) negative errno. */
         cmp     x0, #-4096
         b.hi    0f
-#elif defined(__FreeBSD__)
-        /* FreeBSD kernel returns positive errno and C bit set. */
+#elif defined(__FreeBSD__) || defined(__APPLE__)
+        /* FreeBSD and macOS kernels return positive errno and C bit set. */
         b.cs    1f
 #else
 #error "unsupported os"
@@ -77,12 +85,14 @@ safe_syscall_end:
 #if defined(__linux__)
         /* code path setting errno */
 0:      neg     w0, w0
-        b       safe_syscall_set_errno_tail
+        b       CNAME(safe_syscall_set_errno_tail)
 #endif
 
         /* code path when we didn't execute the syscall */
 2:      mov     w0, #QEMU_ERESTARTSYS
-1:      b       safe_syscall_set_errno_tail
+1:      b       CNAME(safe_syscall_set_errno_tail)
 
         .cfi_endproc
-        .size   safe_syscall_base, .-safe_syscall_base
+#if defined(__ELF__)
+        .size   CNAME(safe_syscall_base), .-CNAME(safe_syscall_base)
+#endif
