@@ -9,6 +9,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu.h"
+#include "user/guest-host.h"
 #include "user-internals.h"
 #include "strace.h"
 #include "signal-common.h"
@@ -359,7 +360,9 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
         break;
 
     case TARGET_MACOS_NR_sigaction:
-        ret = do_sigaction(arg1, arg2, arg3);
+        ret = do_sigaction(arg1,
+                           arg2 ? g2h_untagged(arg2) : NULL,
+                           arg3 ? g2h_untagged(arg3) : NULL);
         break;
 
     case TARGET_MACOS_NR_sigprocmask:
