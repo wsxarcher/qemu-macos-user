@@ -25,6 +25,8 @@
 #include "user/signal.h"
 #include "signal-common.h"
 #include "user-internals.h"
+#include "user/guest-host.h"
+#include "user/page-protection.h"
 #include "gdbstub/user.h"
 #include "trace.h"
 
@@ -285,13 +287,81 @@ void host_signal_handler(int host_sig, siginfo_t *info, void *puc)
     CPUState *cpu = thread_cpu;
     TaskState *ts = get_task_state(cpu);
     target_siginfo_t tinfo;
+    ucontext_t *uc = puc;
     struct emulated_sigtable *k;
     int guest_sig;
+    uintptr_t pc = 0;
 
     if (host_sig == host_interrupt_signal) {
         ts->signal_pending = 1;
         cpu_exit(cpu);
         return;
+    }
+
+    /*
+     * Synchronous SIGSEGV and SIGBUS that arise from guest code execution
+     * need special handling: the fault may be QEMU's own TB write-protection
+     * or a genuine guest memory fault.  We must handle these before queuing
+     * them as guest signals.
+     */
+    if ((host_sig == SIGSEGV || host_sig == SIGBUS) && info->si_code > 0) {
+        uintptr_t host_addr = (uintptr_t)info->si_addr;
+        abi_ptr guest_addr = h2g_nocheck(host_addr);
+        bool is_write;
+
+        pc = uc->uc_mcontext->__ss.__pc;
+
+        /* On AArch64, ESR bit 6 (WnR) indicates write for data aborts */
+        uint32_t esr = uc->uc_mcontext->__es.__esr;
+        is_write = extract32(esr, 6, 1);
+
+        MMUAccessType access_type = adjust_signal_pc(&pc, is_write);
+
+        if (host_sig == SIGSEGV) {
+            bool maperr = true;
+
+            if (info->si_code == SEGV_ACCERR && h2g_valid(host_addr)) {
+                /* Write to a TB-protected page — let QEMU handle it */
+                if (is_write &&
+                    handle_sigsegv_accerr_write(cpu, &uc->uc_sigmask,
+                                                pc, guest_addr)) {
+                    return;
+                }
+
+                /*
+                 * With guest_base, the guest address space is a PROT_NONE
+                 * reservation.  We may get SEGV_ACCERR for pages that are
+                 * valid in the guest but not yet mapped; treat as MAPERR
+                 * if the page is not marked valid.
+                 */
+                if (page_get_flags(guest_addr) & PAGE_VALID) {
+                    maperr = false;
+                }
+            }
+
+            if (do_strace) {
+                fprintf(stderr, "qemu: SIGSEGV guest_addr=0x%llx "
+                        "host_addr=%p code=%d %s write=%d "
+                        "page_flags=0x%x pc=0x%llx\n",
+                        (unsigned long long)guest_addr,
+                        (void *)host_addr,
+                        info->si_code,
+                        maperr ? "MAPERR" : "ACCERR",
+                        is_write,
+                        page_get_flags(guest_addr),
+                        (unsigned long long)pc);
+            }
+
+            sigprocmask(SIG_SETMASK, &uc->uc_sigmask, NULL);
+            cpu_loop_exit_sigsegv(cpu, guest_addr, access_type, maperr, pc);
+            /* NOTREACHED */
+        } else {
+            sigprocmask(SIG_SETMASK, &uc->uc_sigmask, NULL);
+            if (info->si_code == BUS_ADRALN) {
+                cpu_loop_exit_sigbus(cpu, guest_addr, access_type, pc);
+                /* NOTREACHED */
+            }
+        }
     }
 
     /* Get the target signal number. */

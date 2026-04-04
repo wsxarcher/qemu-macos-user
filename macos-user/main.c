@@ -39,6 +39,8 @@
 
 #include "target_arch_cpu.h"
 
+#include <mach-o/loader.h>
+
 uintptr_t qemu_host_page_size;
 intptr_t qemu_host_page_mask;
 
@@ -104,6 +106,39 @@ void cpu_loop(CPUArchState *env)
 {
     target_cpu_loop(env);
 }
+
+/*
+ * Guest address space constant.
+ *
+ * guest_base is the host-address offset applied to every guest address.
+ * We choose a value high enough that the guest's shared cache region
+ * (starting at 0x180000000) lands well above the host's own shared
+ * cache at the same virtual address.
+ *
+ * 64 GiB keeps both the guest binary (typically loaded at 0x100000000)
+ * and the shared cache region (0x180000000..0x2E459C000) safely away
+ * from the host's occupancy.
+ */
+#define GUEST_BASE_OFFSET  0x10000000000ULL   /* 64 GiB */
+
+/*
+ * The guest address space spans from 0 to GUEST_ADDR_SPACE.  We reserve
+ * this range at (host) address guest_base..guest_base+GUEST_ADDR_SPACE
+ * with PROT_NONE so that no host allocation can land there.
+ *
+ * Must be large enough to cover the commpage at 0xFFFFFC000 (~4 GiB)
+ * and the shared cache region ending at ~0x2E459C000 (~12 GiB).
+ */
+#define GUEST_ADDR_SPACE   0x1000000000ULL    /* 64 GiB */
+
+/*
+ * macOS arm64 commpage — a read-only page the kernel maps at a fixed
+ * address containing system constants (timing, CPU features, etc.).
+ * Guest code (especially dyld) reads the commpage directly.
+ * With guest_base != 0, we mirror the host commpage content.
+ */
+#define COMMPAGE_GUEST_ADDR  0xFFFFF0000ULL
+#define COMMPAGE_SIZE        0x10000          /* 64 KiB */
 
 static void usage(void)
 {
@@ -217,30 +252,124 @@ void init_task_state(TaskState *ts)
     sigemptyset(&ts->signal_mask);
 }
 
-/* Setup initial stack and registers */
+/*
+ * Build the initial stack in the layout the XNU kernel uses.
+ *
+ * For dynamic binaries (dyld present) the layout is:
+ *
+ *  SP →  [mach_header of main binary]   (8 bytes)
+ *        [argc]                          (8 bytes)
+ *        [argv[0] ptr] ... [argv[argc-1] ptr] [NULL]
+ *        [envp[0] ptr] ... [envp[envc-1] ptr] [NULL]
+ *        [apple[0] ptr] ... [apple[n] ptr] [NULL]
+ *        ... string data for argv, envp, apple ...
+ *
+ * For static binaries, the mach_header slot is omitted and
+ * the layout starts with argc.
+ */
 static abi_ulong setup_arg_pages(struct image_info *info,
                                   abi_ulong stack_base,
                                   struct target_pt_regs *regs,
                                   char **argv, char **envp)
 {
+    int argc = 0, envc = 0;
+    size_t str_size = 0;
+    bool is_dynamic = (info->interp_entry != 0);
+
+    while (argv[argc]) {
+        str_size += strlen(argv[argc]) + 1;
+        argc++;
+    }
+    while (envp[envc]) {
+        str_size += strlen(envp[envc]) + 1;
+        envc++;
+    }
+
+    /* Build "apple" strings: just executable_path for now */
+    char exec_path_str[PATH_MAX + 32];
+    snprintf(exec_path_str, sizeof(exec_path_str),
+             "executable_path=%s", argv[0]);
+
+    const char *apple_strings[] = {
+        exec_path_str,
+        NULL
+    };
+    int applec = 0;
+    while (apple_strings[applec]) {
+        str_size += strlen(apple_strings[applec]) + 1;
+        applec++;
+    }
+
+    /*
+     * Calculate space needed:
+     * - mach_header pointer (dynamic only)
+     * - argc
+     * - argv pointers + NULL
+     * - envp pointers + NULL
+     * - apple pointers + NULL
+     * - all string data
+     */
+    size_t ptrs_size = sizeof(abi_ulong) * (
+        (is_dynamic ? 1 : 0) +      /* mach_header */
+        1 +                           /* argc */
+        (argc + 1) +                  /* argv + NULL */
+        (envc + 1) +                  /* envp + NULL */
+        (applec + 1)                  /* apple + NULL */
+    );
+
     abi_ulong sp = stack_base;
-    int argc = 0;
-    int envc = 0;
+    sp -= str_size;
+    sp -= ptrs_size;
+    sp &= ~15;  /* ARM64 16-byte alignment */
 
-    /* Count arguments */
-    while (argv[argc]) argc++;
-    while (envp[envc]) envc++;
+    abi_ulong ptr_pos = sp;
+    abi_ulong str_pos = sp + ptrs_size;
 
-    /* Allocate space for arguments on stack */
-    sp -= (argc + 1) * sizeof(abi_ulong);  /* argv */
-    sp -= (envc + 1) * sizeof(abi_ulong);  /* envp */
-    sp -= 2 * sizeof(abi_ulong);           /* argc and argv ptr */
+    /* Helper: write a pointer-sized value to guest memory */
+    #define PUT_PTR(val) do { \
+        abi_ulong _v = (val); \
+        memcpy(g2h_untagged(ptr_pos), &_v, sizeof(_v)); \
+        ptr_pos += sizeof(abi_ulong); \
+    } while (0)
 
-    /* Align stack to 16 bytes (ARM64 requirement) */
-    sp &= ~15;
+    /* [mach_header] — only for dynamic binaries */
+    if (is_dynamic) {
+        PUT_PTR(info->mach_header_addr);
+    }
+
+    /* [argc] */
+    PUT_PTR((abi_ulong)argc);
+
+    /* [argv pointers] */
+    for (int i = 0; i < argc; i++) {
+        size_t len = strlen(argv[i]) + 1;
+        memcpy(g2h_untagged(str_pos), argv[i], len);
+        PUT_PTR(str_pos);
+        str_pos += len;
+    }
+    PUT_PTR(0); /* argv NULL terminator */
+
+    /* [envp pointers] */
+    for (int i = 0; i < envc; i++) {
+        size_t len = strlen(envp[i]) + 1;
+        memcpy(g2h_untagged(str_pos), envp[i], len);
+        PUT_PTR(str_pos);
+        str_pos += len;
+    }
+    PUT_PTR(0); /* envp NULL terminator */
+
+    /* [apple pointers] */
+    for (int i = 0; i < applec; i++) {
+        size_t len = strlen(apple_strings[i]) + 1;
+        memcpy(g2h_untagged(str_pos), apple_strings[i], len);
+        PUT_PTR(str_pos);
+        str_pos += len;
+    }
+    PUT_PTR(0); /* apple NULL terminator */
+
+    #undef PUT_PTR
 
     regs->sp = sp;
-
     return sp;
 }
 
@@ -378,9 +507,111 @@ int main(int argc, char **argv, char **envp)
     bprm->fullpath = realpath(filename, NULL);
     ts->bprm = bprm;
 
+    /*
+     * Set up guest_base for dynamic binaries.
+     *
+     * For dynamically linked binaries, guest dyld needs to privately map
+     * the shared cache at 0x180000000 (SHARED_REGION_BASE).  The host
+     * process has its own shared cache at the same virtual address.
+     * By setting guest_base, all guest virtual addresses are translated
+     * to host addresses by adding guest_base, so the guest's 0x180000000
+     * maps to a different (unused) host address.
+     *
+     * We also inject DYLD_SHARED_REGION=private so that dyld maps the
+     * cache itself instead of expecting the kernel to have mapped it.
+     *
+     * For static binaries, guest_base stays 0 and addresses are 1:1.
+     */
+    {
+        /*
+         * Peek at the Mach-O to detect LC_LOAD_DYLINKER without loading.
+         * Alternatively, we could always set guest_base, but for static
+         * binaries it introduces unnecessary overhead.
+         */
+        int peek_fd = open(filename, O_RDONLY);
+        bool is_dynamic = false;
+        if (peek_fd >= 0) {
+            struct mach_header_64 mh;
+            if (read(peek_fd, &mh, sizeof(mh)) == sizeof(mh)) {
+                uint8_t *cmdbuf = g_malloc(mh.sizeofcmds);
+                if (read(peek_fd, cmdbuf, mh.sizeofcmds) ==
+                    (ssize_t)mh.sizeofcmds) {
+                    uint8_t *p = cmdbuf;
+                    for (uint32_t ci = 0; ci < mh.ncmds; ci++) {
+                        struct load_command *lc = (struct load_command *)p;
+                        if (lc->cmd == LC_LOAD_DYLINKER) {
+                            is_dynamic = true;
+                            break;
+                        }
+                        p += lc->cmdsize;
+                    }
+                }
+                g_free(cmdbuf);
+            }
+            close(peek_fd);
+        }
+
+        if (is_dynamic) {
+            /*
+             * Reserve a region of host virtual address space for the
+             * guest.  MAP_FIXED ensures we get exactly this address.
+             */
+            void *reservation = mmap((void *)GUEST_BASE_OFFSET,
+                                     GUEST_ADDR_SPACE,
+                                     PROT_NONE,
+                                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                                     -1, 0);
+            if (reservation == MAP_FAILED) {
+                fprintf(stderr, "qemu: unable to reserve guest address "
+                        "space at 0x%llx: %s\n",
+                        (unsigned long long)GUEST_BASE_OFFSET,
+                        strerror(errno));
+                _exit(EXIT_FAILURE);
+            }
+            guest_base = (uintptr_t)reservation;
+            have_guest_base = true;
+
+            /*
+             * Tell guest dyld to map the shared cache privately instead
+             * of expecting the kernel to have set up the shared region.
+             */
+            envlist_setenv(envlist, "DYLD_SHARED_REGION=private");
+
+            /*
+             * Mirror the host commpage into the guest address space.
+             * The commpage is a read-only page at a fixed address
+             * containing timing and CPU feature constants.  dyld and
+             * libc read it directly; without it the guest faults.
+             */
+            void *cp_host = g2h_untagged(COMMPAGE_GUEST_ADDR);
+            void *cp = mmap(cp_host, COMMPAGE_SIZE,
+                            PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                            -1, 0);
+            if (cp != MAP_FAILED) {
+                /*
+                 * The 64 KiB commpage region has two readable 16 KiB
+                 * sub-regions (text at +0x4000, data at +0xC000) with
+                 * unmapped gaps.  Copy only the readable parts.
+                 */
+                memcpy(cp + 0x4000, (void *)(COMMPAGE_GUEST_ADDR + 0x4000),
+                       0x4000);
+                memcpy(cp + 0xC000, (void *)(COMMPAGE_GUEST_ADDR + 0xC000),
+                       0x4000);
+                mprotect(cp, COMMPAGE_SIZE, PROT_READ);
+                mmap_lock();
+                page_set_flags(COMMPAGE_GUEST_ADDR,
+                               COMMPAGE_GUEST_ADDR + COMMPAGE_SIZE - 1,
+                               PAGE_VALID | PAGE_READ, ~0);
+                mmap_unlock();
+            }
+        }
+    }
+
     /* Load the binary */
     char *memp = NULL;
-    ret = loader_exec(filename, target_argv, envp, &regs, &info, &memp);
+    target_envp = envlist_to_environ(envlist, NULL);
+    ret = loader_exec(filename, target_argv, target_envp, &regs, &info, &memp);
     if (ret != 0) {
         fprintf(stderr, "Error loading %s: %s\n", filename, strerror(-ret));
         _exit(EXIT_FAILURE);
@@ -389,30 +620,38 @@ int main(int argc, char **argv, char **envp)
     /* Setup stack */
     abi_ulong stack_size = target_dflssiz;
 
-    /* Let the kernel pick a suitable address for the stack */
-    void *stack = mmap(NULL,
+    /*
+     * Allocate the guest stack.  Pick a guest address above the loaded
+     * segments and mmap at the corresponding host address.
+     */
+    abi_ulong guest_stack_base = TARGET_PAGE_ALIGN(info.start_mmap);
+    void *stack = mmap(g2h_untagged(guest_stack_base),
                       stack_size,
                       PROT_READ | PROT_WRITE,
-                      MAP_PRIVATE | MAP_ANONYMOUS,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
                       -1, 0);
     if (stack == MAP_FAILED) {
         fprintf(stderr, "Unable to allocate stack\n");
         _exit(EXIT_FAILURE);
     }
 
-    abi_ulong stack_base = (abi_ulong)(uintptr_t)stack + stack_size;
+    abi_ulong stack_top = guest_stack_base + stack_size;
 
-    info.start_stack = stack_base;
-    info.stack_limit = stack_base - stack_size;
+    info.start_stack = stack_top;
+    info.stack_limit = guest_stack_base;
 
-    /* Register stack pages with QEMU page table */
+    /* Register stack pages with QEMU page table (guest addresses) */
     mmap_lock();
-    page_set_flags(stack_base - stack_size, stack_base - 1,
+    page_set_flags(guest_stack_base, stack_top - 1,
                    PAGE_VALID | PAGE_READ | PAGE_WRITE, ~0);
     mmap_unlock();
 
     /* Setup arguments on stack */
-    regs.sp = setup_arg_pages(&info, stack_base, &regs, target_argv, envp);
+    if (target_envp == NULL) {
+        target_envp = envlist_to_environ(envlist, NULL);
+    }
+    regs.sp = setup_arg_pages(&info, stack_top, &regs, target_argv,
+                              target_envp);
 
     /*
      * Now that we've loaded the binary, GUEST_BASE is fixed.  Delay
@@ -423,6 +662,30 @@ int main(int argc, char **argv, char **envp)
 
     /* Initialize CPU state */
     target_cpu_init(env, &regs);
+
+    /*
+     * Set up TPIDRRO_EL0 with a minimal thread descriptor.
+     * On macOS, the kernel initializes this register to point to a
+     * per-thread structure.  dyld reads TPIDRRO_EL0 to find the
+     * errno pointer (at offset 8) and other per-thread data.
+     * We allocate a small zeroed area so the errno-pointer check
+     * sees NULL and takes the fallback path.
+     */
+    {
+        size_t tsd_size = qemu_host_page_size;
+        abi_ulong guest_tsd = TARGET_PAGE_ALIGN(stack_top + 0x10000);
+        void *tsd = mmap(g2h_untagged(guest_tsd), tsd_size,
+                         PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                         -1, 0);
+        if (tsd != MAP_FAILED) {
+            mmap_lock();
+            page_set_flags(guest_tsd, guest_tsd + tsd_size - 1,
+                           PAGE_VALID | PAGE_READ | PAGE_WRITE, ~0);
+            mmap_unlock();
+            env->cp15.tpidrro_el[0] = (uint64_t)guest_tsd;
+        }
+    }
 
     /* Initialize signals */
     signal_init();

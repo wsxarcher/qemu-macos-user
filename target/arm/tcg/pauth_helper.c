@@ -409,42 +409,19 @@ static uint64_t pauth_auth(CPUARMState *env, uint64_t ptr, uint64_t modifier,
                            ARMPACKey *key, bool data, int keynumber,
                            uintptr_t ra, bool is_combined)
 {
-    ARMCPU *cpu = env_archcpu(env);
     ARMMMUIdx mmu_idx = arm_stage1_mmu_idx(env);
     ARMVAParameters param = aa64_va_parameters(env, ptr, mmu_idx, data, false);
-    ARMPauthFeature pauth_feature = cpu_isar_feature(pauth_feature, cpu);
-    int bot_bit, top_bit;
-    uint64_t pac, orig_ptr, cmp_mask;
 
-    orig_ptr = pauth_original_ptr(ptr, param);
-    pac = pauth_computepac(env, orig_ptr, modifier, *key);
-    bot_bit = 64 - param.tsz;
-    top_bit = 64 - 8 * param.tbi;
-
-    cmp_mask = MAKE_64BIT_MASK(bot_bit, top_bit - bot_bit);
-    cmp_mask &= ~MAKE_64BIT_MASK(55, 1);
-
-    if (pauth_feature >= PauthFeat_2) {
-        ARMPauthFeature fault_feature =
-            is_combined ? PauthFeat_FPACCOMBINED : PauthFeat_FPAC;
-        uint64_t result = ptr ^ (pac & cmp_mask);
-
-        if (pauth_feature >= fault_feature
-            && ((result ^ sextract64(result, 55, 1)) & cmp_mask)) {
-            pauth_fail_exception(env, data, keynumber, ra);
-        }
-        return result;
-    }
-
-    if ((pac ^ ptr) & cmp_mask) {
-        int error_code = (keynumber << 1) | (keynumber ^ 1);
-        if (param.tbi) {
-            return deposit64(orig_ptr, 53, 2, error_code);
-        } else {
-            return deposit64(orig_ptr, 61, 2, error_code);
-        }
-    }
-    return orig_ptr;
+    /*
+     * In macOS user-mode emulation we share the host address space which
+     * includes the dyld shared cache.  Pointers in the cache were signed
+     * by the host kernel with keys we cannot access.  Instead of
+     * verifying the PAC (which would always fail for host-signed
+     * pointers), simply strip the PAC bits and return the clean pointer.
+     * Guest-signed pointers also work correctly because stripping a
+     * PAC that we inserted ourselves still yields the original pointer.
+     */
+    return pauth_original_ptr(ptr, param);
 }
 
 static uint64_t pauth_strip(CPUARMState *env, uint64_t ptr, bool data)

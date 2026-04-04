@@ -10,6 +10,7 @@
 #include "qemu/osdep.h"
 #include "qemu.h"
 #include "user/guest-base.h"
+#include "user/guest-host.h"
 #include "user/page-protection.h"
 #include "exec/mmap-lock.h"
 #include "qemu/path.h"
@@ -89,8 +90,8 @@ static int load_macho_image(const char *filename, int fd,
         goto exit_read;
     }
 
-    /* Verify it's an executable */
-    if (hdr.filetype != MH_EXECUTE) {
+    /* Verify it's an executable or dynamic linker */
+    if (hdr.filetype != MH_EXECUTE && hdr.filetype != MH_DYLINKER) {
         fprintf(stderr, "Not an executable Mach-O file (type %d)\n",
                 hdr.filetype);
         goto exit_read;
@@ -143,14 +144,28 @@ static int load_macho_image(const char *filename, int fd,
     abi_ulong total_size = hi - lo;
 
     /*
-     * Reserve an address range big enough for all segments.
-     * Let the kernel choose the location (no MAP_FIXED) so we don't
-     * collide with the host QEMU binary.
+     * Map the binary into the guest address space.
+     *
+     * When guest_base is set, we map at the binary's preferred addresses
+     * (offset by guest_base).  guest_base is set up by main() before
+     * loader_exec is called, so g2h_untagged() will translate correctly.
+     *
+     * When guest_base is 0 (static binaries), let the kernel choose to
+     * avoid collisions with the host QEMU binary.
      */
-    void *base = mmap(NULL, total_size,
-                      PROT_NONE,
-                      MAP_PRIVATE | MAP_ANONYMOUS,
-                      -1, 0);
+    void *base;
+    if (guest_base != 0) {
+        /* Map at the original vmaddr, translated to host via guest_base */
+        base = mmap(g2h_untagged(lo), total_size,
+                    PROT_NONE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                    -1, 0);
+    } else {
+        base = mmap(NULL, total_size,
+                    PROT_NONE,
+                    MAP_PRIVATE | MAP_ANONYMOUS,
+                    -1, 0);
+    }
     if (base == MAP_FAILED) {
         perror("mmap reserve");
         goto exit_read;
@@ -160,6 +175,8 @@ static int load_macho_image(const char *filename, int fd,
 
     /*
      * Pass 2: map each segment at its biased address.
+     * seg_start/seg_end are HOST addresses (for mmap/pread/mprotect).
+     * We convert to guest addresses for page_set_flags and info fields.
      */
     info->start_code = UINTPTR_MAX;
     info->end_code = 0;
@@ -178,6 +195,8 @@ static int load_macho_image(const char *filename, int fd,
                     (struct segment_command_64 *)lc;
                 abi_ulong seg_start = seg->vmaddr + load_bias;
                 abi_ulong seg_end = seg_start + seg->vmsize;
+                abi_ulong guest_start = h2g(seg_start);
+                abi_ulong guest_end = h2g(seg_end);
                 off_t file_offset = seg->fileoff;
                 size_t file_size = seg->filesize;
                 int prot = 0;
@@ -229,29 +248,29 @@ static int load_macho_image(const char *filename, int fd,
                     if (prot & PROT_WRITE) qemu_flags |= PAGE_WRITE;
                     if (prot & PROT_EXEC)  qemu_flags |= PAGE_EXEC;
                     mmap_lock();
-                    page_set_flags(seg_start, seg_end - 1,
+                    page_set_flags(guest_start, guest_end - 1,
                                    qemu_flags, ~0);
                     mmap_unlock();
                 }
 
-                /* Track code and data segments */
+                /* Track code and data segments (guest addresses) */
                 if (strcmp(seg->segname, "__TEXT") == 0) {
-                    if (seg_start < info->start_code) {
-                        info->start_code = seg_start;
+                    if (guest_start < info->start_code) {
+                        info->start_code = guest_start;
                     }
-                    if (seg_end > info->end_code) {
-                        info->end_code = seg_end;
+                    if (guest_end > info->end_code) {
+                        info->end_code = guest_end;
                     }
                 }
                 if (strncmp(seg->segname, "__DATA", 6) == 0) {
-                    if (seg_start < info->start_data) {
-                        info->start_data = seg_start;
+                    if (guest_start < info->start_data) {
+                        info->start_data = guest_start;
                     }
-                    if (seg_end > info->end_data) {
-                        info->end_data = seg_end;
+                    if (guest_end > info->end_data) {
+                        info->end_data = guest_end;
                     }
-                    info->brk = seg_end;
-                    info->start_brk = seg_end;
+                    info->brk = guest_end;
+                    info->start_brk = guest_end;
                 }
             }
             break;
@@ -261,10 +280,8 @@ static int load_macho_image(const char *filename, int fd,
                 struct entry_point_command *ep =
                     (struct entry_point_command *)lc;
                 /*
-                 * entryoff is relative to __TEXT; the biased __TEXT
-                 * starts at (original __TEXT vmaddr + load_bias).
-                 * For a PIE binary, info->start_code already includes
-                 * the bias.
+                 * entryoff is relative to __TEXT; start_code is
+                 * already a guest address.
                  */
                 info->entry = info->start_code + ep->entryoff;
             }
@@ -283,11 +300,25 @@ static int load_macho_image(const char *filename, int fd,
                 uint64_t *regs64 = (uint64_t *)&tcdata[4];
                 /* pc is at index 32: x[29] + fp + lr + sp + pc */
                 uint64_t thread_pc = regs64[32];
-                info->entry = thread_pc + load_bias;
+                /*
+                 * thread_pc is an absolute vmaddr from the Mach-O.
+                 * Convert to guest address via load_bias + h2g.
+                 */
+                info->entry = h2g(thread_pc + load_bias);
             }
             break;
 
         case LC_LOAD_DYLINKER:
+            {
+                struct dylinker_command *dc =
+                    (struct dylinker_command *)lc;
+                if (pinterp_name && !*pinterp_name) {
+                    *pinterp_name = g_strdup(
+                        (char *)lc + dc->name.offset);
+                }
+            }
+            break;
+
         case LC_UUID:
         case LC_SOURCE_VERSION:
         case LC_BUILD_VERSION:
@@ -299,12 +330,14 @@ static int load_macho_image(const char *filename, int fd,
         case LC_DYSYMTAB:
         case LC_LOAD_DYLIB:
         case LC_ID_DYLIB:
+        case LC_ID_DYLINKER:
         case LC_LOAD_WEAK_DYLIB:
         case LC_FUNCTION_STARTS:
         case LC_DATA_IN_CODE:
         case LC_CODE_SIGNATURE:
         case LC_DYLD_EXPORTS_TRIE:
         case LC_DYLD_CHAINED_FIXUPS:
+        case LC_SEGMENT_SPLIT_INFO:
             break;
 
         default:
@@ -320,10 +353,10 @@ static int load_macho_image(const char *filename, int fd,
         goto exit_read;
     }
 
-    info->load_addr = (abi_ulong)(uintptr_t)base;
+    info->load_addr = h2g((abi_ulong)(uintptr_t)base);
     info->load_bias = load_bias;
 
-    /* Set up initial mmap region after loaded segments */
+    /* Set up initial mmap region after loaded segments (guest addr) */
     info->start_mmap = TARGET_PAGE_ALIGN(info->end_data + 0x10000000);
 
     retval = 0;
@@ -350,12 +383,56 @@ int loader_exec(const char *filename, char **argv, char **envp,
     close(fd);
 
     if (retval < 0) {
+        g_free(interp_name);
         return retval;
+    }
+
+    /* Record the main binary's mach_header guest address */
+    info->mach_header_addr = info->start_code;
+
+    /*
+     * If the binary has LC_LOAD_DYLINKER (dynamically linked),
+     * load dyld into the guest address space and use its entry point.
+     */
+    if (interp_name) {
+        struct image_info dyld_info = {0};
+
+        fd = open(interp_name, O_RDONLY);
+        if (fd < 0) {
+            fprintf(stderr, "Cannot open dynamic linker %s: %s\n",
+                    interp_name, strerror(errno));
+            g_free(interp_name);
+            return -errno;
+        }
+
+        retval = load_macho_image(interp_name, fd, &dyld_info, NULL);
+        close(fd);
+        g_free(interp_name);
+
+        if (retval < 0) {
+            fprintf(stderr, "Failed to load dynamic linker\n");
+            return retval;
+        }
+
+        /* Use dyld's entry point; store main binary's entry separately */
+        info->interp_entry = dyld_info.entry;
+
+        /* Extend mmap region past dyld's loaded segments */
+        if (dyld_info.end_data > info->end_data) {
+            info->start_mmap = TARGET_PAGE_ALIGN(
+                dyld_info.end_data + 0x10000000);
+        }
+    } else {
+        info->interp_entry = 0;
     }
 
     /* Set up initial registers for ARM64 */
     memset(regs, 0, sizeof(*regs));
-    regs->pc = info->entry;
+    /*
+     * For dynamic binaries, start at dyld's entry.
+     * For static binaries, start at the binary's own entry.
+     */
+    regs->pc = info->interp_entry ? info->interp_entry : info->entry;
     /* sp will be set up properly by main.c after stack allocation */
     regs->sp = 0;
 

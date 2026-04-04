@@ -9,13 +9,47 @@
 
 #include "qemu/osdep.h"
 #include <sys/random.h>
+#include <sys/sysctl.h>
+#include <sys/syscall.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include "qemu.h"
 #include "user/guest-host.h"
 #include "user-internals.h"
 #include "strace.h"
 #include "signal-common.h"
+#include "exec/mmap-lock.h"
+#include "user/page-protection.h"
+
+/* csops is a private syscall, declare it here */
+extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
+
+/*
+ * On macOS with Cryptex volumes (macOS 13+), /System/Library/dyld/ does
+ * not exist on the root volume.  The shared cache files live under the
+ * Cryptex prefix.  dyld hardcodes the traditional path, so we redirect
+ * file-system accesses to the actual location.
+ */
+#define CRYPTEX_PREFIX "/System/Volumes/Preboot/Cryptexes/OS"
+#define DYLD_CACHE_DIR "/System/Library/dyld"
+
+static const char *redirect_path(const char *path, char *buf, size_t bufsz)
+{
+    if (strncmp(path, DYLD_CACHE_DIR, strlen(DYLD_CACHE_DIR)) == 0) {
+        snprintf(buf, bufsz, "%s%s", CRYPTEX_PREFIX, path);
+        struct stat st;
+        if (stat(buf, &st) == 0) {
+            return buf;
+        }
+    }
+    return path;
+}
 
 /* Syscall implementation */
+
+/* Guest address of the mapped shared cache (0 = not yet mapped) */
+static uint64_t guest_shared_cache_addr;
+
 abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                           abi_long arg2, abi_long arg3, abi_long arg4,
                           abi_long arg5, abi_long arg6, abi_long arg7,
@@ -69,7 +103,9 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
             if (!p) {
                 ret = -TARGET_EFAULT;
             } else {
-                ret = get_errno(safe_open(p, target_to_host_bitmask(arg2, fcntl_flags_tbl),
+                char rdbuf[PATH_MAX];
+                const char *rp = redirect_path(p, rdbuf, sizeof(rdbuf));
+                ret = get_errno(safe_open(rp, target_to_host_bitmask(arg2, fcntl_flags_tbl),
                                           arg3));
                 unlock_user(p, arg1, 0);
             }
@@ -310,7 +346,9 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
             if (!p) {
                 ret = -TARGET_EFAULT;
             } else {
-                ret = get_errno(stat(p, &st));
+                char rdbuf[PATH_MAX];
+                const char *rp = redirect_path(p, rdbuf, sizeof(rdbuf));
+                ret = get_errno(stat(rp, &st));
                 unlock_user(p, arg1, 0);
                 if (!is_error(ret)) {
                     if (arg2 && host_to_target_stat(arg2, &st)) {
@@ -814,9 +852,18 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
             if (!p) {
                 ret = -TARGET_EFAULT;
             } else {
-                ret = get_errno(openat(arg1, p,
-                                target_to_host_bitmask(arg3,
-                                    fcntl_flags_tbl), arg4));
+                char rdbuf[PATH_MAX];
+                const char *rp = redirect_path(p, rdbuf, sizeof(rdbuf));
+                if (rp != p) {
+                    /* Redirected to absolute path — use AT_FDCWD */
+                    ret = get_errno(openat(AT_FDCWD, rp,
+                                    target_to_host_bitmask(arg3,
+                                        fcntl_flags_tbl), arg4));
+                } else {
+                    ret = get_errno(openat(arg1, p,
+                                    target_to_host_bitmask(arg3,
+                                        fcntl_flags_tbl), arg4));
+                }
                 unlock_user(p, arg2, 0);
             }
         }
@@ -870,7 +917,13 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
             if (!p) {
                 ret = -TARGET_EFAULT;
             } else {
-                ret = get_errno(fstatat(arg1, p, &st, arg4));
+                char rdbuf[PATH_MAX];
+                const char *rp = redirect_path(p, rdbuf, sizeof(rdbuf));
+                if (rp != p) {
+                    ret = get_errno(fstatat(AT_FDCWD, rp, &st, arg4));
+                } else {
+                    ret = get_errno(fstatat(arg1, p, &st, arg4));
+                }
                 unlock_user(p, arg2, 0);
                 if (!is_error(ret)) {
                     if (arg3 && host_to_target_stat(arg3, &st)) {
@@ -990,6 +1043,274 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
     case TARGET_MACOS_NR_kill:
         /* kill(pid_t pid, int sig) */
         ret = get_errno(kill(arg1, target_to_host_signal(arg2)));
+        break;
+
+    /*
+     * Syscalls required by dyld and dynamically linked programs
+     */
+
+    case TARGET_MACOS_NR_sysctl:
+        /* __sysctl(int *name, u_int namelen, void *old, size_t *oldlenp,
+         *          void *new, size_t newlen) */
+        {
+            int *name_ptr = NULL;
+            void *old_ptr = NULL;
+            size_t *oldlen_ptr = NULL;
+            void *new_ptr = NULL;
+
+            if (arg1) name_ptr = (int *)g2h_untagged(arg1);
+            if (arg3) old_ptr = g2h_untagged(arg3);
+            if (arg4) oldlen_ptr = (size_t *)g2h_untagged(arg4);
+            if (arg5) new_ptr = g2h_untagged(arg5);
+
+            ret = get_errno(sysctl(name_ptr, (u_int)arg2, old_ptr,
+                                   oldlen_ptr, new_ptr, (size_t)arg6));
+        }
+        break;
+
+    case TARGET_MACOS_NR_sysctlbyname:
+        /* sysctlbyname(const char *name, void *oldp, size_t *oldlenp,
+         *              void *newp, size_t newlen) */
+        {
+            char *name_str = NULL;
+            void *old_ptr = NULL;
+            size_t *oldlen_ptr = NULL;
+            void *new_ptr = NULL;
+
+            if (arg1) name_str = (char *)g2h_untagged(arg1);
+            if (arg3) old_ptr = g2h_untagged(arg3);
+            if (arg4) oldlen_ptr = (size_t *)g2h_untagged(arg4);
+            if (arg5) new_ptr = g2h_untagged(arg5);
+
+            ret = get_errno(sysctlbyname(name_str, old_ptr,
+                                         oldlen_ptr, new_ptr, (size_t)arg6));
+        }
+        break;
+
+    case TARGET_MACOS_NR_csops:
+    case TARGET_MACOS_NR_csops_audittoken:
+        /*
+         * csops(pid, ops, useraddr, usersize) — code signing operations.
+         * Forward to host kernel so dyld gets valid code signing status.
+         */
+        {
+            void *useraddr = NULL;
+            if (arg3) useraddr = g2h_untagged(arg3);
+            ret = get_errno(csops((pid_t)arg1, (unsigned int)arg2,
+                                  useraddr, (size_t)arg4));
+        }
+        break;
+
+    case TARGET_MACOS_NR_shared_region_check_np:
+        /*
+         * shared_region_check_np(uint64_t *start_address)
+         *
+         * If the shared cache has been mapped via our
+         * shared_region_map_and_slide_2_np handler, return
+         * the base address.  Otherwise return EINVAL.
+         * Special case: arg1 == -1 is disablePageInLinking.
+         */
+        if (arg1 == (abi_ulong)-1) {
+            ret = 0;
+        } else if (guest_shared_cache_addr && arg1) {
+            uint64_t addr = guest_shared_cache_addr;
+            memcpy(g2h_untagged(arg1), &addr, sizeof(addr));
+            ret = 0;
+        } else {
+            ret = -TARGET_EINVAL;
+        }
+        break;
+
+    case TARGET_MACOS_NR_crossarch_trap:
+        /*
+         * crossarch_trap(uint32_t name)
+         * Used for cross-architecture traps. Returns ENOTSUP in XNU.
+         */
+        ret = -TARGET_ENOSYS;
+        break;
+
+    case TARGET_MACOS_NR___mac_syscall:
+        /*
+         * __mac_syscall(const char *policy, int call, void *arg)
+         * MAC framework syscall — used for sandbox checks.
+         * Return 0 (no restrictions) in emulation.
+         */
+        ret = 0;
+        break;
+
+    case TARGET_MACOS_NR_fsgetpath:
+        /*
+         * fsgetpath(char *buf, size_t buflen, fsid_t *fsid, uint64_t objid)
+         * Convert filesystem ID + object ID to a path.
+         * Forward to host kernel with proper guest pointer translation.
+         */
+        {
+            char *buf = arg1 ? (char *)g2h_untagged(arg1) : NULL;
+            void *fsid = arg3 ? g2h_untagged(arg3) : NULL;
+            ret = get_errno(syscall(SYS_fsgetpath, buf, (size_t)arg2,
+                                    fsid, (uint64_t)arg4));
+        }
+        break;
+
+    case 483: /* __nexus_register — stub */
+        ret = -TARGET_ENOSYS;
+        break;
+
+    case 336: /* proc_info */
+        /*
+         * proc_info(int callnum, int pid, uint32_t flavor,
+         *           uint64_t arg, void *buffer, int buffersize)
+         * Forward most calls to host; stub SET_DYLD_IMAGES (callnum 15)
+         * which notifies the kernel about loaded images.
+         */
+        {
+            int callnum = (int)arg1;
+            if (callnum == 0xf) {
+                /* PROC_INFO_CALL_SET_DYLD_IMAGES — stub success */
+                ret = 0;
+            } else {
+                void *buf = arg5 ? g2h_untagged(arg5) : NULL;
+                ret = get_errno(syscall(336, callnum, (int)arg2,
+                                        (uint32_t)arg3, (uint64_t)arg4,
+                                        buf, (int)arg6));
+            }
+        }
+        break;
+
+    case TARGET_MACOS_NR_shared_region_map_and_slide_2_np:
+        /*
+         * shared_region_map_and_slide_2_np(files_count, files,
+         *                                  mappings_count, mappings)
+         *
+         * Emulate the XNU shared-region syscall: for each mapping
+         * descriptor, mmap the file segment at the requested guest
+         * address.  Slide/rebase info is ignored — the cache is
+         * mapped at its preferred address (no ASLR slide).
+         */
+        {
+            uint32_t files_count = (uint32_t)arg1;
+            uint32_t mappings_count = (uint32_t)arg3;
+
+            if (!arg2 || !arg4 || files_count == 0 || mappings_count == 0) {
+                ret = -TARGET_EINVAL;
+                break;
+            }
+
+            /*
+             * shared_file_np: { int sf_fd; uint32_t sf_mappings_count;
+             *                   uint32_t sf_slide; }  = 12 bytes
+             */
+            struct {
+                int32_t  sf_fd;
+                uint32_t sf_mappings_count;
+                uint32_t sf_slide;
+            } *files_arr = g2h_untagged(arg2);
+
+            /*
+             * shared_file_mapping_slide_np:
+             *   mach_vm_address_t  sms_address;        (8)
+             *   mach_vm_size_t     sms_size;           (8)
+             *   mach_vm_offset_t   sms_file_offset;    (8)
+             *   user_addr_t        sms_slide_size;     (8)
+             *   user_addr_t        sms_slide_start;    (8)
+             *   vm_prot_t          sms_max_prot;       (4)
+             *   vm_prot_t          sms_init_prot;      (4)
+             *                                          = 48 bytes
+             */
+            struct {
+                uint64_t sms_address;
+                uint64_t sms_size;
+                uint64_t sms_file_offset;
+                uint64_t sms_slide_size;
+                uint64_t sms_slide_start;
+                int32_t  sms_max_prot;
+                int32_t  sms_init_prot;
+            } *maps_arr = g2h_untagged(arg4);
+
+            /* Walk files to build fd-per-mapping index */
+            uint32_t mi = 0;
+            ret = 0;
+            for (uint32_t fi = 0; fi < files_count && mi < mappings_count; fi++) {
+                int fd = files_arr[fi].sf_fd;
+                uint32_t count = files_arr[fi].sf_mappings_count;
+                for (uint32_t j = 0; j < count && mi < mappings_count; j++, mi++) {
+                    uint64_t addr = maps_arr[mi].sms_address;
+                    uint64_t size = maps_arr[mi].sms_size;
+                    uint64_t off  = maps_arr[mi].sms_file_offset;
+                    int iprot     = maps_arr[mi].sms_init_prot;
+
+                    int host_prot = 0;
+                    if (iprot & 1) host_prot |= PROT_READ;
+                    if (iprot & 2) host_prot |= PROT_WRITE;
+                    if (iprot & 4) host_prot |= PROT_EXEC;
+
+                    void *host_addr = g2h_untagged(addr);
+                    void *p;
+
+                    /* Zero-fill or anonymous mapping (fd == -1 or VM_PROT_ZF) */
+                    if ((iprot & 0x10) || fd < 0) { /* VM_PROT_ZF or no fd */
+                        p = mmap(host_addr, size,
+                                 PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                                 -1, 0);
+                        /*
+                         * When fd=-1 and file_offset is non-zero, the kernel
+                         * copies data from the userspace buffer at that address
+                         * into the mapped region (used for dynamic config data).
+                         */
+                        if (p != MAP_FAILED && fd < 0 && off != 0) {
+                            void *src = g2h_untagged(off);
+                            memcpy(p, src, size);
+                        }
+                        /* Set final protection if not RW */
+                        if (p != MAP_FAILED && host_prot &&
+                            host_prot != (PROT_READ | PROT_WRITE)) {
+                            mprotect(p, size, host_prot);
+                        }
+                    } else {
+                        p = mmap(host_addr, size,
+                                 host_prot,
+                                 MAP_PRIVATE | MAP_FIXED,
+                                 fd, off);
+                    }
+
+                    if (p == MAP_FAILED) {
+                        fprintf(stderr, "qemu: shared_region mmap failed: "
+                                "fi=%u mi=%u addr=0x%llx size=0x%llx "
+                                "off=0x%llx fd=%d prot=0x%x host=%p "
+                                "errno=%d\n",
+                                fi, mi,
+                                (unsigned long long)addr,
+                                (unsigned long long)size,
+                                (unsigned long long)off,
+                                fd, iprot, host_addr, errno);
+                        ret = -TARGET_ENOMEM;
+                        break;
+                    }
+
+                    int qf = PAGE_VALID;
+                    if (host_prot & PROT_READ)  qf |= PAGE_READ;
+                    if (host_prot & PROT_WRITE) qf |= PAGE_WRITE;
+                    if (host_prot & PROT_EXEC)  qf |= PAGE_EXEC;
+                    mmap_lock();
+                    page_set_flags(addr, addr + size - 1, qf, ~0);
+                    mmap_unlock();
+                }
+            }
+
+            /* Record the cache base for shared_region_check_np */
+            if (ret == 0 && mappings_count > 0) {
+                guest_shared_cache_addr = maps_arr[0].sms_address;
+            }
+        }
+        break;
+
+    case TARGET_MACOS_NR_shared_region_map_and_slide_np:
+        /*
+         * shared_region_map_and_slide_np (older variant)
+         * Return ENOENT to force dyld's private mapping fallback.
+         */
+        ret = -TARGET_ENOENT;
         break;
 
     default:

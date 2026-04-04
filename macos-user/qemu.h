@@ -49,6 +49,10 @@ struct image_info {
     abi_ulong arg_start;
     abi_ulong arg_end;
     uint32_t  elf_flags;
+
+    /* dyld support */
+    abi_ulong interp_entry;     /* dyld entry point (0 if static) */
+    abi_ulong mach_header_addr; /* guest address of main binary mach_header */
 };
 
 struct emulated_sigtable {
@@ -102,6 +106,11 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                           abi_long arg5, abi_long arg6, abi_long arg7,
                           abi_long arg8);
 
+abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
+                      abi_long arg2, abi_long arg3, abi_long arg4,
+                      abi_long arg5, abi_long arg6, abi_long arg7,
+                      abi_long arg8);
+
 extern unsigned long target_maxtsiz;
 extern unsigned long target_dfldsiz;
 extern unsigned long target_maxdsiz;
@@ -150,6 +159,9 @@ int loader_exec(const char *filename, char **argv, char **envp,
 uint32_t get_elf_hwcap(void);
 
 void init_task_state(TaskState *ts);
+
+/* Guest private shared cache address (0 = not mapped) */
+extern uint64_t guest_cache_addr;
 
 /* strace/printing support */
 void print_taken_signal(int target_signum, const target_siginfo_t *tinfo);
