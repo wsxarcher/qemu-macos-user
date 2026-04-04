@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Test suite for qemu-macos-user: compare native macOS CLI tool output
-against output when run under qemu-macos-user emulation.
+Test suite for qemu-macos-user: verify emulation of static ARM64 binaries.
 
-Each test runs a macOS CLI tool both natively and under the emulator,
-then asserts the outputs are identical (or equivalent where noted).
+Each test compiles a small ARM64 assembly program, runs it both natively
+and under qemu-macos-user, and compares the output.  All test programs
+use raw macOS syscalls (SVC #0x80) so they do not require dyld.
 """
 
 import os
@@ -19,8 +19,10 @@ import unittest
 # ---------------------------------------------------------------------------
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+ASM_DIR = Path(__file__).resolve().parent / "asm"
 _SIGNED_BINARY = REPO_ROOT / "build" / "qemu-aarch64"
 _UNSIGNED_BINARY = REPO_ROOT / "build" / "qemu-aarch64-unsigned"
+
 
 def _resolve_default_binary():
     """Return the QEMU binary path, trying signed then unsigned names."""
@@ -28,12 +30,53 @@ def _resolve_default_binary():
         return _SIGNED_BINARY
     if _UNSIGNED_BINARY.is_file():
         return _UNSIGNED_BINARY
-    # Return the signed name so the error message is clear
     return _SIGNED_BINARY
+
 
 QEMU_BINARY = Path(
     os.environ.get("QEMU_MACOS_USER", str(_resolve_default_binary()))
 ).expanduser()
+
+
+# ---------------------------------------------------------------------------
+# Helper: build static ARM64 binaries from assembly sources
+# ---------------------------------------------------------------------------
+
+_build_cache: dict[str, Path] = {}
+_build_dir: tempfile.TemporaryDirectory | None = None
+
+
+def _get_build_dir() -> Path:
+    global _build_dir
+    if _build_dir is None:
+        _build_dir = tempfile.TemporaryDirectory(prefix="qemu_test_")
+    return Path(_build_dir.name)
+
+
+def _build_asm(name: str) -> Path:
+    """Assemble and link tests/macos-user/asm/<name>.s into a static binary."""
+    if name in _build_cache:
+        return _build_cache[name]
+
+    src = ASM_DIR / f"{name}.s"
+    if not src.exists():
+        raise FileNotFoundError(f"Assembly source not found: {src}")
+
+    build_dir = _get_build_dir()
+    obj = build_dir / f"{name}.o"
+    exe = build_dir / name
+
+    subprocess.run(
+        ["as", "-o", str(obj), str(src)],
+        check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["ld", "-o", str(exe), str(obj), "-lSystem", "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib"],
+        check=True, capture_output=True,
+    )
+
+    _build_cache[name] = exe
+    return exe
 
 
 def _run(args, *, timeout=30, env=None, stdin_data=None):
@@ -48,14 +91,16 @@ def _run(args, *, timeout=30, env=None, stdin_data=None):
     return result.returncode, result.stdout, result.stderr
 
 
-def _run_native(args, **kwargs):
-    """Run a command natively."""
-    return _run(args, **kwargs)
+def _run_native(binary: Path, args=None, **kwargs):
+    """Run a static binary natively."""
+    cmd = [str(binary)] + (args or [])
+    return _run(cmd, **kwargs)
 
 
-def _run_emulated(args, **kwargs):
-    """Run a command under qemu-macos-user."""
-    return _run([str(QEMU_BINARY)] + list(args), **kwargs)
+def _run_emulated(binary: Path, args=None, **kwargs):
+    """Run a static binary under qemu-macos-user."""
+    cmd = [str(QEMU_BINARY), str(binary)] + (args or [])
+    return _run(cmd, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -63,346 +108,158 @@ def _run_emulated(args, **kwargs):
 # ---------------------------------------------------------------------------
 
 
-class TestCLITools(unittest.TestCase):
-    """Compare native vs emulated output for standard macOS CLI tools."""
+class TestStaticBinaries(unittest.TestCase):
+    """Test ARM64 static binaries under qemu-macos-user emulation."""
 
-    # -- /bin/ls -----------------------------------------------------------
+    # -- Basic I/O ---------------------------------------------------------
 
-    def test_ls_root(self):
-        """ls / should list the root directory identically."""
-        native = _run_native(["/bin/ls", "/"])
-        emulated = _run_emulated(["/bin/ls", "/"])
-        self.assertEqual(native[0], emulated[0], "exit codes differ")
-        self.assertEqual(native[1], emulated[1], "stdout differs")
+    def test_hello_world(self):
+        """write() syscall outputs correct string."""
+        exe = _build_asm("hello")
+        native = _run_native(exe)
+        emulated = _run_emulated(exe)
+        self.assertEqual(native[0], 0, "native exit code")
+        self.assertEqual(emulated[0], native[0], "exit codes differ")
+        self.assertEqual(emulated[1], native[1], "stdout differs")
 
-    def test_ls_tmp(self):
-        """ls /tmp should produce the same listing."""
-        native = _run_native(["/bin/ls", "/tmp"])
-        emulated = _run_emulated(["/bin/ls", "/tmp"])
-        self.assertEqual(native[0], emulated[0], "exit codes differ")
-        self.assertEqual(native[1], emulated[1], "stdout differs")
+    def test_write_stderr(self):
+        """write() to both stdout and stderr."""
+        exe = _build_asm("write_stderr")
+        native = _run_native(exe)
+        emulated = _run_emulated(exe)
+        self.assertEqual(emulated[0], native[0], "exit codes differ")
+        self.assertEqual(emulated[1], native[1], "stdout differs")
+        self.assertEqual(emulated[2], native[2], "stderr differs")
 
-    def test_ls_long_format(self):
-        """ls -la /usr should produce the same listing."""
-        native = _run_native(["/bin/ls", "-la", "/usr"])
-        emulated = _run_emulated(["/bin/ls", "-la", "/usr"])
-        self.assertEqual(native[0], emulated[0], "exit codes differ")
-        self.assertEqual(native[1], emulated[1], "stdout differs")
+    def test_multi_write(self):
+        """Multiple sequential write() calls."""
+        exe = _build_asm("multi_write")
+        native = _run_native(exe)
+        emulated = _run_emulated(exe)
+        self.assertEqual(emulated[0], native[0], "exit codes differ")
+        self.assertEqual(emulated[1], native[1], "stdout differs")
+        expected = b"line 1\nline 2\nline 3\n"
+        self.assertEqual(emulated[1], expected)
 
-    def test_ls_nonexistent(self):
-        """ls on a non-existent path should fail identically."""
-        native = _run_native(["/bin/ls", "/nonexistent_path_xyz"])
-        emulated = _run_emulated(["/bin/ls", "/nonexistent_path_xyz"])
-        self.assertNotEqual(native[0], 0, "native should fail")
-        self.assertEqual(native[0], emulated[0], "exit codes differ")
+    def test_large_write(self):
+        """write() of a 4KB+ buffer."""
+        exe = _build_asm("large_write")
+        native = _run_native(exe)
+        emulated = _run_emulated(exe)
+        self.assertEqual(emulated[0], native[0], "exit codes differ")
+        self.assertEqual(len(emulated[1]), len(native[1]), "output length differs")
+        self.assertEqual(emulated[1], native[1], "stdout differs")
 
-    # -- /bin/echo ---------------------------------------------------------
+    def test_echo_stdin(self):
+        """read() from stdin, write() to stdout."""
+        exe = _build_asm("echo_stdin")
+        data = b"test input data\n"
+        native = _run_native(exe, stdin_data=data)
+        emulated = _run_emulated(exe, stdin_data=data)
+        self.assertEqual(emulated[0], native[0], "exit codes differ")
+        self.assertEqual(emulated[1], native[1], "stdout differs")
+        self.assertEqual(emulated[1], data)
 
-    def test_echo_simple(self):
-        """echo 'hello world' should be identical."""
-        native = _run_native(["/bin/echo", "hello world"])
-        emulated = _run_emulated(["/bin/echo", "hello world"])
-        self.assertEqual(native[0], emulated[0])
-        self.assertEqual(native[1], emulated[1])
+    # -- Exit codes --------------------------------------------------------
 
-    def test_echo_no_args(self):
-        """echo with no args should produce a blank line."""
-        native = _run_native(["/bin/echo"])
-        emulated = _run_emulated(["/bin/echo"])
-        self.assertEqual(native[0], emulated[0])
-        self.assertEqual(native[1], emulated[1])
+    def test_exit_zero(self):
+        """exit(0) returns 0."""
+        exe = _build_asm("hello")
+        emulated = _run_emulated(exe)
+        self.assertEqual(emulated[0], 0)
 
-    def test_echo_special_chars(self):
-        """echo with special characters."""
-        native = _run_native(["/bin/echo", "tab\there", "new\nline"])
-        emulated = _run_emulated(["/bin/echo", "tab\there", "new\nline"])
-        self.assertEqual(native[0], emulated[0])
-        self.assertEqual(native[1], emulated[1])
+    def test_exit_nonzero(self):
+        """exit(42) returns 42."""
+        exe = _build_asm("exit42")
+        native = _run_native(exe)
+        emulated = _run_emulated(exe)
+        self.assertEqual(native[0], 42, "native exit code")
+        self.assertEqual(emulated[0], 42, "emulated exit code")
 
-    # -- /bin/cat ----------------------------------------------------------
+    # -- Arithmetic / CPU operations ----------------------------------------
 
-    def test_cat_etc_shells(self):
-        """cat /etc/shells should be identical."""
-        native = _run_native(["/bin/cat", "/etc/shells"])
-        emulated = _run_emulated(["/bin/cat", "/etc/shells"])
-        self.assertEqual(native[0], emulated[0])
-        self.assertEqual(native[1], emulated[1])
+    def test_arithmetic(self):
+        """Integer add/mul/sub produces correct result."""
+        exe = _build_asm("arithmetic")
+        native = _run_native(exe)
+        emulated = _run_emulated(exe)
+        self.assertEqual(emulated[0], native[0], "exit codes differ")
+        self.assertEqual(emulated[1], b"85\n")
+        self.assertEqual(emulated[1], native[1])
 
-    def test_cat_stdin(self):
-        """cat reading from stdin should echo back identically."""
-        data = b"hello from stdin\n"
-        native = _run_native(["/bin/cat"], stdin_data=data)
-        emulated = _run_emulated(["/bin/cat"], stdin_data=data)
-        self.assertEqual(native[0], emulated[0])
-        self.assertEqual(native[1], emulated[1])
+    def test_loop_sum(self):
+        """Loop summing 1..10 = 55."""
+        exe = _build_asm("loop_sum")
+        native = _run_native(exe)
+        emulated = _run_emulated(exe)
+        self.assertEqual(emulated[0], native[0], "exit codes differ")
+        self.assertEqual(emulated[1], b"55\n")
+        self.assertEqual(emulated[1], native[1])
 
-    # -- /usr/bin/wc -------------------------------------------------------
+    def test_conditional(self):
+        """Conditional select (csel) finds max of 3 numbers."""
+        exe = _build_asm("conditional")
+        native = _run_native(exe)
+        emulated = _run_emulated(exe)
+        self.assertEqual(emulated[0], native[0], "exit codes differ")
+        self.assertEqual(emulated[1], b"42\n")
+        self.assertEqual(emulated[1], native[1])
 
-    def test_wc_etc_shells(self):
-        """wc /etc/shells should produce the same counts."""
-        native = _run_native(["/usr/bin/wc", "/etc/shells"])
-        emulated = _run_emulated(["/usr/bin/wc", "/etc/shells"])
-        self.assertEqual(native[0], emulated[0])
-        self.assertEqual(native[1], emulated[1])
+    def test_bitwise(self):
+        """Bitwise AND/OR/XOR operations."""
+        exe = _build_asm("bitwise")
+        native = _run_native(exe)
+        emulated = _run_emulated(exe)
+        self.assertEqual(emulated[0], native[0], "exit codes differ")
+        self.assertEqual(emulated[1], b"3840\n")
+        self.assertEqual(emulated[1], native[1])
 
-    def test_wc_l_etc_passwd(self):
-        """wc -l /etc/passwd should match."""
-        native = _run_native(["/usr/bin/wc", "-l", "/etc/passwd"])
-        emulated = _run_emulated(["/usr/bin/wc", "-l", "/etc/passwd"])
-        self.assertEqual(native[0], emulated[0])
-        self.assertEqual(native[1], emulated[1])
+    # -- Function calls / Stack --------------------------------------------
 
-    # -- /usr/bin/grep -----------------------------------------------------
+    def test_factorial(self):
+        """Recursive factorial(6) = 720 via BL/RET."""
+        exe = _build_asm("factorial")
+        native = _run_native(exe)
+        emulated = _run_emulated(exe)
+        self.assertEqual(emulated[0], native[0], "exit codes differ")
+        self.assertEqual(emulated[1], b"720\n")
+        self.assertEqual(emulated[1], native[1])
 
-    def test_grep_pattern(self):
-        """grep for /bin/sh in /etc/shells."""
-        native = _run_native(["/usr/bin/grep", "/bin/sh", "/etc/shells"])
-        emulated = _run_emulated(["/usr/bin/grep", "/bin/sh", "/etc/shells"])
-        self.assertEqual(native[0], emulated[0])
-        self.assertEqual(native[1], emulated[1])
+    def test_stack_ops(self):
+        """Push/pop values on stack, sum them."""
+        exe = _build_asm("stack_ops")
+        native = _run_native(exe)
+        emulated = _run_emulated(exe)
+        self.assertEqual(emulated[0], native[0], "exit codes differ")
+        self.assertEqual(emulated[1], b"10\n")
+        self.assertEqual(emulated[1], native[1])
 
-    def test_grep_no_match(self):
-        """grep for a non-matching pattern should return 1."""
-        native = _run_native(
-            ["/usr/bin/grep", "ZZZZNOTHERE", "/etc/shells"]
-        )
-        emulated = _run_emulated(
-            ["/usr/bin/grep", "ZZZZNOTHERE", "/etc/shells"]
-        )
-        self.assertEqual(native[0], 1)
-        self.assertEqual(native[0], emulated[0])
-        self.assertEqual(native[1], emulated[1])
+    # -- Memory operations -------------------------------------------------
 
-    def test_grep_count(self):
-        """grep -c should produce the same match count."""
-        native = _run_native(
-            ["/usr/bin/grep", "-c", "sh", "/etc/shells"]
-        )
-        emulated = _run_emulated(
-            ["/usr/bin/grep", "-c", "sh", "/etc/shells"]
-        )
-        self.assertEqual(native[0], emulated[0])
-        self.assertEqual(native[1], emulated[1])
+    def test_memfill(self):
+        """Fill and verify a memory pattern."""
+        exe = _build_asm("memfill")
+        native = _run_native(exe)
+        emulated = _run_emulated(exe)
+        self.assertEqual(emulated[0], 0, "emulated exit code")
+        self.assertEqual(emulated[0], native[0], "exit codes differ")
+        self.assertEqual(emulated[1], b"OK\n")
+        self.assertEqual(emulated[1], native[1])
 
-    # -- /usr/bin/head / /usr/bin/tail ------------------------------------
+    # -- Syscalls ----------------------------------------------------------
 
-    def test_head_etc_passwd(self):
-        """head -5 /etc/passwd."""
-        native = _run_native(["/usr/bin/head", "-5", "/etc/passwd"])
-        emulated = _run_emulated(["/usr/bin/head", "-5", "/etc/passwd"])
-        self.assertEqual(native[0], emulated[0])
-        self.assertEqual(native[1], emulated[1])
-
-    def test_tail_etc_passwd(self):
-        """tail -5 /etc/passwd."""
-        native = _run_native(["/usr/bin/tail", "-5", "/etc/passwd"])
-        emulated = _run_emulated(["/usr/bin/tail", "-5", "/etc/passwd"])
-        self.assertEqual(native[0], emulated[0])
-        self.assertEqual(native[1], emulated[1])
-
-    # -- /usr/bin/sort / /usr/bin/uniq ------------------------------------
-
-    def test_sort_etc_shells(self):
-        """sort /etc/shells should match."""
-        native = _run_native(["/usr/bin/sort", "/etc/shells"])
-        emulated = _run_emulated(["/usr/bin/sort", "/etc/shells"])
-        self.assertEqual(native[0], emulated[0])
-        self.assertEqual(native[1], emulated[1])
-
-    def test_uniq_stdin(self):
-        """uniq on duplicated input."""
-        data = b"aaa\naaa\nbbb\nbbb\nccc\n"
-        native = _run_native(["/usr/bin/uniq"], stdin_data=data)
-        emulated = _run_emulated(["/usr/bin/uniq"], stdin_data=data)
-        self.assertEqual(native[0], emulated[0])
-        self.assertEqual(native[1], emulated[1])
-
-    # -- /usr/bin/tr -------------------------------------------------------
-
-    def test_tr_lowercase(self):
-        """tr A-Z a-z should lowercase identically."""
-        data = b"HELLO WORLD\n"
-        native = _run_native(
-            ["/usr/bin/tr", "A-Z", "a-z"], stdin_data=data
-        )
-        emulated = _run_emulated(
-            ["/usr/bin/tr", "A-Z", "a-z"], stdin_data=data
-        )
-        self.assertEqual(native[0], emulated[0])
-        self.assertEqual(native[1], emulated[1])
-
-    # -- /usr/bin/cut ------------------------------------------------------
-
-    def test_cut_fields(self):
-        """cut -d: -f1 /etc/passwd should match."""
-        native = _run_native(
-            ["/usr/bin/cut", "-d:", "-f1", "/etc/passwd"]
-        )
-        emulated = _run_emulated(
-            ["/usr/bin/cut", "-d:", "-f1", "/etc/passwd"]
-        )
-        self.assertEqual(native[0], emulated[0])
-        self.assertEqual(native[1], emulated[1])
-
-    # -- /usr/bin/basename / /usr/bin/dirname ------------------------------
-
-    def test_basename(self):
-        native = _run_native(["/usr/bin/basename", "/usr/bin/grep"])
-        emulated = _run_emulated(["/usr/bin/basename", "/usr/bin/grep"])
-        self.assertEqual(native[0], emulated[0])
-        self.assertEqual(native[1], emulated[1])
-
-    def test_dirname(self):
-        native = _run_native(["/usr/bin/dirname", "/usr/bin/grep"])
-        emulated = _run_emulated(["/usr/bin/dirname", "/usr/bin/grep"])
-        self.assertEqual(native[0], emulated[0])
-        self.assertEqual(native[1], emulated[1])
-
-    # -- /usr/bin/env ------------------------------------------------------
-
-    def test_env_print(self):
-        """env should list environment variables; we compare a subset."""
-        env = {
-            "HOME": "/tmp",
-            "USER": "testuser",
-            "PATH": "/usr/bin:/bin",
-            "LANG": "en_US.UTF-8",
-        }
-        native = _run_native(["/usr/bin/env"], env=env)
-        emulated = _run_emulated(["/usr/bin/env"], env=env)
-        self.assertEqual(native[0], emulated[0])
-        # Compare the sorted variable names so ordering doesn't matter
-        native_vars = sorted(native[1].decode().strip().splitlines())
-        emulated_vars = sorted(emulated[1].decode().strip().splitlines())
-        self.assertEqual(native_vars, emulated_vars)
-
-    # -- /usr/bin/true / /usr/bin/false ------------------------------------
-
-    def test_true(self):
-        native = _run_native(["/usr/bin/true"])
-        emulated = _run_emulated(["/usr/bin/true"])
-        self.assertEqual(native[0], 0)
-        self.assertEqual(native[0], emulated[0])
-
-    def test_false(self):
-        native = _run_native(["/usr/bin/false"])
-        emulated = _run_emulated(["/usr/bin/false"])
-        self.assertEqual(native[0], 1)
-        self.assertEqual(native[0], emulated[0])
-
-    # -- /usr/bin/printf ---------------------------------------------------
-
-    def test_printf_format(self):
-        native = _run_native(["/usr/bin/printf", "%s %d\n", "hello", "42"])
-        emulated = _run_emulated(
-            ["/usr/bin/printf", "%s %d\n", "hello", "42"]
-        )
-        self.assertEqual(native[0], emulated[0])
-        self.assertEqual(native[1], emulated[1])
-
-    # -- /usr/bin/sed ------------------------------------------------------
-
-    def test_sed_substitute(self):
-        """sed s/foo/bar/ on stdin."""
-        data = b"foo baz foo\n"
-        native = _run_native(
-            ["/usr/bin/sed", "s/foo/bar/"], stdin_data=data
-        )
-        emulated = _run_emulated(
-            ["/usr/bin/sed", "s/foo/bar/"], stdin_data=data
-        )
-        self.assertEqual(native[0], emulated[0])
-        self.assertEqual(native[1], emulated[1])
-
-    # -- /usr/bin/awk ------------------------------------------------------
-
-    def test_awk_print_field(self):
-        """awk '{print $1}' on stdin."""
-        data = b"alpha beta gamma\none two three\n"
-        native = _run_native(
-            ["/usr/bin/awk", "{print $1}"], stdin_data=data
-        )
-        emulated = _run_emulated(
-            ["/usr/bin/awk", "{print $1}"], stdin_data=data
-        )
-        self.assertEqual(native[0], emulated[0])
-        self.assertEqual(native[1], emulated[1])
-
-    # -- /bin/pwd ----------------------------------------------------------
-
-    def test_pwd(self):
-        """pwd should return the same working directory."""
-        native = _run_native(["/bin/pwd"])
-        emulated = _run_emulated(["/bin/pwd"])
-        self.assertEqual(native[0], emulated[0])
-        self.assertEqual(native[1], emulated[1])
-
-    # -- /bin/mkdir + /bin/rmdir (temp dir) --------------------------------
-
-    def test_mkdir_rmdir(self):
-        """mkdir and rmdir a temporary directory."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            target = os.path.join(tmpdir, "testdir")
-
-            rc1 = _run_emulated(["/bin/mkdir", target])[0]
-            self.assertEqual(rc1, 0, "mkdir under emulation failed")
-            self.assertTrue(os.path.isdir(target))
-
-            rc2 = _run_emulated(["/bin/rmdir", target])[0]
-            self.assertEqual(rc2, 0, "rmdir under emulation failed")
-            self.assertFalse(os.path.exists(target))
-
-    # -- /usr/bin/uname ----------------------------------------------------
-
-    def test_uname(self):
-        """uname -s should report the same OS."""
-        native = _run_native(["/usr/bin/uname", "-s"])
-        emulated = _run_emulated(["/usr/bin/uname", "-s"])
-        self.assertEqual(native[0], emulated[0])
-        self.assertEqual(native[1], emulated[1])
-
-    def test_uname_machine(self):
-        """uname -m should report aarch64/arm64."""
-        native = _run_native(["/usr/bin/uname", "-m"])
-        emulated = _run_emulated(["/usr/bin/uname", "-m"])
-        self.assertEqual(native[0], emulated[0])
-        self.assertEqual(native[1], emulated[1])
-
-    # -- /bin/expr ---------------------------------------------------------
-
-    def test_expr_arithmetic(self):
-        native = _run_native(["/bin/expr", "2", "+", "3"])
-        emulated = _run_emulated(["/bin/expr", "2", "+", "3"])
-        self.assertEqual(native[0], emulated[0])
-        self.assertEqual(native[1], emulated[1])
-
-    # -- /usr/bin/tee (write to temp file) ---------------------------------
-
-    def test_tee(self):
-        """tee should write stdin to a file and stdout identically."""
-        data = b"line one\nline two\n"
-        with tempfile.NamedTemporaryFile(delete=False) as ntf:
-            native_file = ntf.name
-        with tempfile.NamedTemporaryFile(delete=False) as etf:
-            emulated_file = etf.name
-
-        try:
-            native = _run_native(
-                ["/usr/bin/tee", native_file], stdin_data=data
-            )
-            emulated = _run_emulated(
-                ["/usr/bin/tee", emulated_file], stdin_data=data
-            )
-            self.assertEqual(native[0], emulated[0])
-            self.assertEqual(native[1], emulated[1])
-            with open(native_file, "rb") as f:
-                native_content = f.read()
-            with open(emulated_file, "rb") as f:
-                emulated_content = f.read()
-            self.assertEqual(native_content, emulated_content)
-        finally:
-            os.unlink(native_file)
-            os.unlink(emulated_file)
+    def test_getpid(self):
+        """getpid() returns a valid PID (positive integer)."""
+        exe = _build_asm("getpid")
+        native = _run_native(exe)
+        emulated = _run_emulated(exe)
+        self.assertEqual(native[0], 0, "native exit code")
+        self.assertEqual(emulated[0], 0, "emulated exit code")
+        # Both should print a positive integer
+        native_pid = int(native[1].strip())
+        emulated_pid = int(emulated[1].strip())
+        self.assertGreater(native_pid, 0, "native PID should be positive")
+        self.assertGreater(emulated_pid, 0, "emulated PID should be positive")
 
 
 # ---------------------------------------------------------------------------
@@ -410,7 +267,6 @@ class TestCLITools(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # Verify the QEMU binary exists before running tests
     if not QEMU_BINARY.is_file():
         print(
             f"ERROR: QEMU binary not found at '{QEMU_BINARY}'. "
@@ -420,3 +276,4 @@ if __name__ == "__main__":
         sys.exit(1)
 
     unittest.main(verbosity=2)
+

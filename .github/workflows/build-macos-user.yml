@@ -116,6 +116,8 @@ jobs:
         run: |
           cd build
           make -j$(sysctl -n hw.ncpu) V=1
+          # Explicitly build the signed binary with JIT entitlements
+          ninja qemu-aarch64 || true
 
       - name: Resolve QEMU binary
         id: resolve-binary
