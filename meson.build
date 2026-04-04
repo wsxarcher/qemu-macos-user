@@ -4471,6 +4471,10 @@ foreach target : target_dirs
         entitlements = 'accel/hvf/entitlements.plist'
         build_input += files(entitlements)
         install_input += meson.current_source_dir() / entitlements
+      elif 'CONFIG_MACOS_USER' in config_target
+        entitlements = 'macos-user/entitlements.plist'
+        build_input += files(entitlements)
+        install_input += meson.current_source_dir() / entitlements
       endif
 
       emulators += {exe['name'] : custom_target(exe['name'],
