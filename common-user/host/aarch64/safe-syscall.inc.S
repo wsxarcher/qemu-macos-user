@@ -62,11 +62,17 @@ CNAME(safe_syscall_base):
          * The code sequence must therefore be able to cope with this, and
          * the syscall instruction must be the final one in the sequence.
          */
+#if defined(__APPLE__)
+        .alt_entry CNAME(safe_syscall_start)
+#endif
 CNAME(safe_syscall_start):
         /* if signal_pending is non-zero, don't do the call */
         ldr     w10, [x9]
         cbnz    w10, 2f
         svc     0x0
+#if defined(__APPLE__)
+        .alt_entry CNAME(safe_syscall_end)
+#endif
 CNAME(safe_syscall_end):
 
         /* code path for having successfully executed the syscall */

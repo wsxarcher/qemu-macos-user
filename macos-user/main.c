@@ -24,6 +24,7 @@
 #include "qemu/plugin.h"
 #include "user/guest-base.h"
 #include "user/page-protection.h"
+#include "exec/mmap-lock.h"
 #include "accel/accel-ops.h"
 #include "tcg/startup.h"
 #include "qemu/timer.h"
@@ -276,6 +277,13 @@ int main(int argc, char **argv, char **envp)
     qemu_host_page_size = getpagesize();
     qemu_host_page_mask = -(intptr_t)qemu_host_page_size;
 
+    /*
+     * Match the target page size to the host (macOS uses 16K pages).
+     * Must be called before any page table operations.
+     */
+    set_preferred_target_page_bits(ctz32(qemu_host_page_size));
+    finalize_target_page_bits();
+
     optind = 1;
     for (;;) {
         if (optind >= argc) {
@@ -324,6 +332,15 @@ int main(int argc, char **argv, char **envp)
     const char *filename = argv[optind];
     target_argv = &argv[optind];
 
+    /* Set up guest address space limit */
+    if (reserved_va != 0) {
+        guest_addr_max = reserved_va;
+    } else if (MIN(TARGET_VIRT_ADDR_SPACE_BITS, TARGET_ABI_BITS) <= 32) {
+        guest_addr_max = UINT32_MAX;
+    } else {
+        guest_addr_max = ~0ul;
+    }
+
     /* Zero the BSS */
     memset(&info, 0, sizeof(info));
 
@@ -370,22 +387,29 @@ int main(int argc, char **argv, char **envp)
     }
 
     /* Setup stack */
-    abi_ulong stack_base = TARGET_PAGE_ALIGN(0x7ffffffff000ULL);
     abi_ulong stack_size = target_dflssiz;
 
-    /* Allocate stack */
-    void *stack = mmap((void *)(uintptr_t)(stack_base - stack_size),
+    /* Let the kernel pick a suitable address for the stack */
+    void *stack = mmap(NULL,
                       stack_size,
                       PROT_READ | PROT_WRITE,
-                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                      MAP_PRIVATE | MAP_ANONYMOUS,
                       -1, 0);
     if (stack == MAP_FAILED) {
         fprintf(stderr, "Unable to allocate stack\n");
         _exit(EXIT_FAILURE);
     }
 
+    abi_ulong stack_base = (abi_ulong)(uintptr_t)stack + stack_size;
+
     info.start_stack = stack_base;
     info.stack_limit = stack_base - stack_size;
+
+    /* Register stack pages with QEMU page table */
+    mmap_lock();
+    page_set_flags(stack_base - stack_size, stack_base - 1,
+                   PAGE_VALID | PAGE_READ | PAGE_WRITE, ~0);
+    mmap_unlock();
 
     /* Setup arguments on stack */
     regs.sp = setup_arg_pages(&info, stack_base, &regs, target_argv, envp);
