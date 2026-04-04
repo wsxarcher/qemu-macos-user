@@ -11,6 +11,8 @@
 #include <sys/random.h>
 #include <sys/sysctl.h>
 #include <sys/syscall.h>
+#include <sys/socket.h>
+#include <poll.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include "qemu.h"
@@ -1162,6 +1164,65 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
         ret = get_errno(kill(arg1, target_to_host_signal(arg2)));
         break;
 
+    case TARGET_MACOS_NR___pthread_kill:
+        /*
+         * __pthread_kill(pthread_t thread, int sig)
+         * We're single-threaded — the only thread is self.  Forward
+         * directly to the host kill(getpid(), sig).  If sig is 0 it
+         * is a validity check and always succeeds.
+         */
+        if (arg2 == 0) {
+            ret = 0;
+        } else {
+            ret = get_errno(kill(getpid(), target_to_host_signal(arg2)));
+        }
+        break;
+
+    case TARGET_MACOS_NR___pthread_sigmask:
+        /*
+         * __pthread_sigmask(int how, const sigset_t *set, sigset_t *oset)
+         * Same semantics as sigprocmask for a single-threaded process.
+         */
+        ret = do_bsd_sigprocmask(cpu_env, arg1, arg2, arg3);
+        break;
+
+    case TARGET_MACOS_NR___semwait_signal:
+    case TARGET_MACOS_NR___semwait_signal_nocancel:
+        /*
+         * __semwait_signal(int cond_sem, int mutex_sem, int timeout,
+         *                  int relative, int64_t tv_sec, int32_t tv_nsec)
+         * Used by pthread_cond_wait/timed-wait internals.  In our
+         * single-threaded model the condition can never be signalled
+         * by another thread, so return ETIMEDOUT for timed waits and
+         * EINTR for untimed ones to keep callers from blocking forever.
+         */
+        if (arg3 != 0) {
+            ret = -TARGET_ETIMEDOUT;
+        } else {
+            ret = -TARGET_EINTR;
+        }
+        break;
+
+    case TARGET_MACOS_NR_bsdthread_ctl:
+        /*
+         * bsdthread_ctl(uint32_t cmd, uint64_t arg1, ...)
+         * Thread control for QoS, scheduling, etc.  Return 0 for
+         * all sub-commands — we're single-threaded and don't enforce
+         * QoS.
+         */
+        ret = 0;
+        break;
+
+    case TARGET_MACOS_NR_bsdthread_register:
+        /*
+         * __bsdthread_register(threadstart, wqthread, pthsize, ...)
+         * Registers pthread callbacks with the kernel.  We're
+         * single-threaded and don't create kernel threads, so just
+         * return success.
+         */
+        ret = 0;
+        break;
+
     /*
      * Syscalls required by dyld and dynamically linked programs
      */
@@ -1179,6 +1240,14 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
             if (arg3) old_ptr = g2h_untagged(arg3);
             if (arg4) oldlen_ptr = (size_t *)g2h_untagged(arg4);
             if (arg5) new_ptr = g2h_untagged(arg5);
+
+            if (do_strace && name_ptr) {
+                fprintf(stderr, "  sysctl name=[");
+                for (u_int i = 0; i < (u_int)arg2; i++) {
+                    fprintf(stderr, "%s%d", i ? "." : "", name_ptr[i]);
+                }
+                fprintf(stderr, "]\n");
+            }
 
             ret = get_errno(sysctl(name_ptr, (u_int)arg2, old_ptr,
                                    oldlen_ptr, new_ptr, (size_t)arg6));
@@ -1483,6 +1552,111 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
          * Return ENOENT to force dyld's private mapping fallback.
          */
         ret = -TARGET_ENOENT;
+        break;
+
+    case TARGET_MACOS_NR_socket:
+        /* socket(domain, type, protocol) — pass through to host */
+        ret = get_errno(socket((int)arg1, (int)arg2, (int)arg3));
+        break;
+
+    case TARGET_MACOS_NR_connect:
+    case TARGET_MACOS_NR_connect_nocancel:
+        /* connect(fd, addr, addrlen) */
+        {
+            void *host_addr = g2h_untagged(arg2);
+            ret = get_errno(connect((int)arg1,
+                                    (struct sockaddr *)host_addr,
+                                    (socklen_t)arg3));
+        }
+        break;
+
+    case TARGET_MACOS_NR_sendto:
+    case TARGET_MACOS_NR_sendto_nocancel:
+        /* sendto(fd, buf, len, flags, dest_addr, addrlen) */
+        {
+            void *host_buf = g2h_untagged(arg2);
+            void *host_dest = arg5 ? g2h_untagged(arg5) : NULL;
+            ret = get_errno(sendto((int)arg1, host_buf, (size_t)arg3,
+                                   (int)arg4,
+                                   (struct sockaddr *)host_dest,
+                                   (socklen_t)arg6));
+        }
+        break;
+
+    case TARGET_MACOS_NR_sendmsg:
+    case TARGET_MACOS_NR_sendmsg_nocancel:
+        /* sendmsg(fd, msg, flags) — simplified: pass through */
+        {
+            struct msghdr *host_msg = g2h_untagged(arg2);
+            ret = get_errno(sendmsg((int)arg1, host_msg, (int)arg3));
+        }
+        break;
+
+    case TARGET_MACOS_NR_recvfrom:
+    case TARGET_MACOS_NR_recvfrom_nocancel:
+        /* recvfrom(fd, buf, len, flags, from, fromlen) */
+        {
+            void *host_buf = g2h_untagged(arg2);
+            void *host_from = arg5 ? g2h_untagged(arg5) : NULL;
+            void *host_fromlen = arg6 ? g2h_untagged(arg6) : NULL;
+            ret = get_errno(recvfrom((int)arg1, host_buf, (size_t)arg3,
+                                     (int)arg4,
+                                     (struct sockaddr *)host_from,
+                                     (socklen_t *)host_fromlen));
+        }
+        break;
+
+    case TARGET_MACOS_NR_recvmsg:
+    case TARGET_MACOS_NR_recvmsg_nocancel:
+        /* recvmsg(fd, msg, flags) — simplified: pass through */
+        {
+            struct msghdr *host_msg = g2h_untagged(arg2);
+            ret = get_errno(recvmsg((int)arg1, host_msg, (int)arg3));
+        }
+        break;
+
+    case TARGET_MACOS_NR_select:
+    case TARGET_MACOS_NR_select_nocancel:
+        /* select(nfds, readfds, writefds, exceptfds, timeout) */
+        {
+            fd_set *rfds = arg2 ? g2h_untagged(arg2) : NULL;
+            fd_set *wfds = arg3 ? g2h_untagged(arg3) : NULL;
+            fd_set *efds = arg4 ? g2h_untagged(arg4) : NULL;
+            struct timeval *tv = arg5 ? g2h_untagged(arg5) : NULL;
+            ret = get_errno(select((int)arg1, rfds, wfds, efds, tv));
+        }
+        break;
+
+    case TARGET_MACOS_NR_poll:
+    case TARGET_MACOS_NR_poll_nocancel:
+        /* poll(fds, nfds, timeout) */
+        {
+            struct pollfd *host_fds = g2h_untagged(arg1);
+            ret = get_errno(poll(host_fds, (nfds_t)arg2, (int)arg3));
+        }
+        break;
+
+    case TARGET_MACOS_NR_shm_open:
+        /* shm_open(name, oflag, mode) */
+        {
+            char *name = lock_user_string(arg1);
+            if (!name) {
+                ret = -TARGET_EFAULT;
+            } else {
+                ret = get_errno(shm_open(name, (int)arg2, (mode_t)arg3));
+                unlock_user(name, arg1, 0);
+            }
+        }
+        break;
+
+    case TARGET_MACOS_NR_abort_with_payload:
+    case TARGET_MACOS_NR_terminate_with_payload:
+        /*
+         * abort_with_payload / terminate_with_payload
+         * These terminate the process with a crash reason.
+         * Just exit with a non-zero status.
+         */
+        _exit(arg1 ? (int)arg1 : 1);
         break;
 
     default:

@@ -47,21 +47,6 @@ static inline G_NORETURN void target_cpu_loop(CPUARMState *env)
         cpu_exec_end(cs);
         loop_count++;
 
-        if (loop_count <= 50 || (loop_count & 0xFFF) == 0) {
-            fprintf(stderr, "qemu: loop#%llu trapnr=%d pc=0x%llx "
-                    "x16=0x%llx x0=0x%llx sp=0x%llx\n",
-                    (unsigned long long)loop_count, trapnr,
-                    (unsigned long long)env->pc,
-                    (unsigned long long)env->xregs[16],
-                    (unsigned long long)env->xregs[0],
-                    (unsigned long long)env->xregs[31]);
-        }
-        if (loop_count > 500000) {
-            fprintf(stderr, "qemu: stuck — aborting after %llu iterations\n",
-                    (unsigned long long)loop_count);
-            cpu_dump_state(cs, stderr, 0);
-            abort();
-        }
         qemu_process_cpu_events(cs);
 
         switch (trapnr) {

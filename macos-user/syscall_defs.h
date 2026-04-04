@@ -391,8 +391,8 @@
 #define TARGET_MACOS_NR_symlinkat           474
 #define TARGET_MACOS_NR_mkdirat             475
 #define TARGET_MACOS_NR_getattrlistat       476
-#define TARGET_MACOS_NR_proc_trace_self     477
-#define TARGET_MACOS_NR_proc_trace_control  478
+#define TARGET_MACOS_NR_proc_trace_log      477
+#define TARGET_MACOS_NR_bsdthread_ctl       478
 #define TARGET_MACOS_NR_getentropy          500
 #define TARGET_MACOS_NR_necp_open           480
 #define TARGET_MACOS_NR_necp_client_action  481

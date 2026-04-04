@@ -38,10 +38,13 @@ void *lock_user_string(abi_ulong guest_addr);
 /* Error handling */
 #define TARGET_EPERM        1
 #define TARGET_ENOENT       2
-#define TARGET_EFAULT       14
-#define TARGET_EINVAL       22
+#define TARGET_EINTR        4
 #define TARGET_ENOMEM       12
 #define TARGET_EACCES       13
+#define TARGET_EFAULT       14
+#define TARGET_EINVAL       22
+#define TARGET_ENOTSUP      45
+#define TARGET_ETIMEDOUT    60
 #define TARGET_ENOSYS       78
 
 static inline bool is_error(abi_long ret)

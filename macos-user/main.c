@@ -28,6 +28,7 @@
 #include "accel/accel-ops.h"
 #include "tcg/startup.h"
 #include "qemu/timer.h"
+#include <sys/random.h>
 #include "qemu/envlist.h"
 #include "qemu/cutils.h"
 #include "exec/log.h"
@@ -285,13 +286,37 @@ static abi_ulong setup_arg_pages(struct image_info *info,
         envc++;
     }
 
-    /* Build "apple" strings: just executable_path for now */
+    /* Build "apple" strings: kernel-provided parameters */
     char exec_path_str[PATH_MAX + 32];
     snprintf(exec_path_str, sizeof(exec_path_str),
              "executable_path=%s", argv[0]);
 
+    /*
+     * The XNU kernel provides random tokens on the initial stack.
+     * ptr_munge is used by libpthread for pointer obfuscation.
+     * stack_guard is the stack canary value.
+     * libpthread asserts that ptr_munge is non-zero.
+     */
+    char ptr_munge_str[64];
+    char stack_guard_str[64];
+    {
+        uint64_t ptr_munge_val = 0, stack_guard_val = 0;
+        getentropy(&ptr_munge_val, sizeof(ptr_munge_val));
+        getentropy(&stack_guard_val, sizeof(stack_guard_val));
+        if (ptr_munge_val == 0) {
+            ptr_munge_val = 0xDEADBEEF12345678ULL;
+        }
+        /* XNU format: "ptr_munge=0x<hex>" — note the 0x prefix */
+        snprintf(ptr_munge_str, sizeof(ptr_munge_str),
+                 "ptr_munge=0x%llx", (unsigned long long)ptr_munge_val);
+        snprintf(stack_guard_str, sizeof(stack_guard_str),
+                 "stack_guard=0x%llx", (unsigned long long)stack_guard_val);
+    }
+
     const char *apple_strings[] = {
         exec_path_str,
+        ptr_munge_str,
+        stack_guard_str,
         NULL
     };
     int applec = 0;
@@ -578,6 +603,24 @@ int main(int argc, char **argv, char **envp)
             envlist_setenv(envlist, "DYLD_SHARED_REGION=private");
 
             /*
+             * Provide a ptr_munge token via the environment fallback.
+             * libpthread checks PTHREAD_PTR_MUNGE_TOKEN in envp when
+             * the apple[] kernel token is missing or zero.
+             */
+            {
+                uint64_t munge_val = 0;
+                getentropy(&munge_val, sizeof(munge_val));
+                if (munge_val == 0) {
+                    munge_val = 0xDEADBEEF12345678ULL;
+                }
+                char munge_env[64];
+                snprintf(munge_env, sizeof(munge_env),
+                         "PTHREAD_PTR_MUNGE_TOKEN=%016llx",
+                         (unsigned long long)munge_val);
+                envlist_setenv(envlist, munge_env);
+            }
+
+            /*
              * Mirror the host commpage into the guest address space.
              * The commpage is a read-only page at a fixed address
              * containing timing and CPU feature constants.  dyld and
@@ -666,24 +709,34 @@ int main(int argc, char **argv, char **envp)
     /*
      * Set up TPIDRRO_EL0 with a minimal thread descriptor.
      * On macOS, the kernel initializes this register to point to a
-     * per-thread structure.  dyld reads TPIDRRO_EL0 to find the
-     * errno pointer (at offset 8) and other per-thread data.
-     * We allocate a small zeroed area so the errno-pointer check
-     * sees NULL and takes the fallback path.
+     * per-thread structure.  libsystem_pthread places the pthread_t
+     * at *negative* offsets from this pointer, and TLS slots at
+     * positive offsets.  We allocate a generous region around the
+     * pointer so both areas are writable.
      */
     {
-        size_t tsd_size = qemu_host_page_size;
-        abi_ulong guest_tsd = TARGET_PAGE_ALIGN(stack_top + 0x10000);
-        void *tsd = mmap(g2h_untagged(guest_tsd), tsd_size,
+        /*
+         * Allocate 8 pages: 4 pages below the TSD pointer (for the
+         * pthread struct, typically ~4 KB) and 4 pages above (for
+         * TLS slots and other per-thread data).
+         */
+        size_t page_sz = qemu_real_host_page_size();
+        size_t below = 4 * page_sz;  /* space below the pointer */
+        size_t above = 4 * page_sz;  /* space above the pointer */
+        size_t total = below + above;
+        abi_ulong region_start = ROUND_UP(stack_top + 0x10000, page_sz);
+        abi_ulong tsd_ptr = region_start + below;
+
+        void *tsd = mmap(g2h_untagged(region_start), total,
                          PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
                          -1, 0);
         if (tsd != MAP_FAILED) {
             mmap_lock();
-            page_set_flags(guest_tsd, guest_tsd + tsd_size - 1,
+            page_set_flags(region_start, region_start + total - 1,
                            PAGE_VALID | PAGE_READ | PAGE_WRITE, ~0);
             mmap_unlock();
-            env->cp15.tpidrro_el[0] = (uint64_t)guest_tsd;
+            env->cp15.tpidrro_el[0] = (uint64_t)tsd_ptr;
         }
     }
 

@@ -22,10 +22,525 @@
 #include "exec/mmap-lock.h"
 #include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <mach/clock.h>
 
 /* Functions not exposed in public headers but available at link time */
 extern mach_port_t mach_reply_port(void);
 extern mach_port_t thread_get_special_reply_port(void);
+
+/*
+ * Raw mach_msg2_trap via inline assembly.
+ * On modern macOS, the old mach_msg_trap (-31) is killed by message
+ * filters.  All Mach IPC must go through mach_msg2_trap (-47).
+ */
+static kern_return_t host_mach_msg2_trap(
+    void *data, uint64_t options,
+    uint64_t msgh_bits_and_send_size,
+    uint64_t msgh_remote_and_local_port,
+    uint64_t msgh_voucher_and_id,
+    uint64_t desc_count_and_rcv_name,
+    uint64_t rcv_size_and_priority,
+    uint64_t timeout)
+{
+    register uint64_t x0 __asm__("x0") = (uint64_t)data;
+    register uint64_t x1 __asm__("x1") = options;
+    register uint64_t x2 __asm__("x2") = msgh_bits_and_send_size;
+    register uint64_t x3 __asm__("x3") = msgh_remote_and_local_port;
+    register uint64_t x4 __asm__("x4") = msgh_voucher_and_id;
+    register uint64_t x5 __asm__("x5") = desc_count_and_rcv_name;
+    register uint64_t x6 __asm__("x6") = rcv_size_and_priority;
+    register uint64_t x7 __asm__("x7") = timeout;
+    register int x16 __asm__("x16") = -47;
+
+    __asm__ volatile(
+        "svc #0x80"
+        : "+r"(x0)
+        : "r"(x1), "r"(x2), "r"(x3), "r"(x4),
+          "r"(x5), "r"(x6), "r"(x7), "r"(x16)
+        : "memory", "cc"
+    );
+    return (kern_return_t)x0;
+}
+
+/*
+ * Handle well-known MIG messages in-process.
+ *
+ * Modern macOS message filters SIGKILL processes that send raw Mach
+ * messages to privileged ports.  We intercept common MIG RPCs and
+ * service them using the host's library functions, then pack the
+ * reply directly into the caller's buffer.
+ *
+ * Returns true if the message was handled, with *ret_out set.
+ */
+static bool handle_mig_message(void *buf, uint64_t options,
+                               uint64_t bits_and_size,
+                               kern_return_t *ret_out)
+{
+    mach_msg_header_t *hdr = (mach_msg_header_t *)buf;
+    if (!hdr) {
+        return false;
+    }
+
+    /* Only intercept SEND+RECEIVE (RPC) messages */
+    if ((options & 0x3) != 0x3) {
+        return false;
+    }
+
+    mach_msg_id_t msg_id = hdr->msgh_id;
+
+    switch (msg_id) {
+    case 200: {
+        /* host_info — MIG subsystem host, routine 0.
+         * Request:  header(24) + NDR(8) + flavor(4) + count(4) = 40
+         * Reply:    header(24) + NDR(8) + retval(4) + count(4) + data(var)
+         */
+        struct __attribute__((packed)) {
+            mach_msg_header_t hdr;
+            NDR_record_t NDR;
+            int flavor;
+            mach_msg_type_number_t count;
+        } *req = buf;
+
+        int flavor = req->flavor;
+        mach_msg_type_number_t count = req->count;
+
+        /* Enough space for the largest host_info_t */
+        int info_buf[HOST_BASIC_INFO_COUNT + 16];
+        kern_return_t kr = host_info(mach_host_self(), flavor,
+                                     (host_info_t)info_buf, &count);
+
+        /* Pack MIG reply into the same buffer */
+        struct __attribute__((packed)) {
+            mach_msg_header_t hdr;
+            NDR_record_t NDR;
+            kern_return_t retval;
+            mach_msg_type_number_t count;
+            int data[64];
+        } *reply = buf;
+
+        reply->hdr.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+        reply->hdr.msgh_size = sizeof(mach_msg_header_t) +
+                               sizeof(NDR_record_t) + 8 +
+                               count * sizeof(int);
+        reply->hdr.msgh_remote_port = hdr->msgh_local_port;
+        reply->hdr.msgh_local_port = MACH_PORT_NULL;
+        reply->hdr.msgh_id = msg_id + 100;
+        reply->NDR = NDR_record;
+        reply->retval = kr;
+        reply->count = count;
+        if (count > 0 && count <= 64) {
+            memcpy(reply->data, info_buf, count * sizeof(int));
+        }
+
+        *ret_out = KERN_SUCCESS;
+        return true;
+    }
+    case 206: {
+        /*
+         * host_get_clock_service — MIG subsystem host, routine 6.
+         * Request:  header(24) + NDR(8) + clock_id(4) = 36
+         * Reply:    header(24) + body(4) + port_descriptor(12) = 40
+         *
+         * The reply is a COMPLEX message carrying a port right.
+         */
+        struct __attribute__((packed)) {
+            mach_msg_header_t hdr;
+            NDR_record_t NDR;
+            clock_id_t clock_id;
+        } *req = buf;
+
+        clock_serv_t clock_serv = MACH_PORT_NULL;
+        kern_return_t kr = host_get_clock_service(mach_host_self(),
+                                                  req->clock_id,
+                                                  &clock_serv);
+
+        struct __attribute__((packed)) {
+            mach_msg_header_t hdr;
+            mach_msg_body_t body;
+            mach_msg_port_descriptor_t clock_port;
+        } *reply = buf;
+
+        reply->hdr.msgh_bits = MACH_MSGH_BITS_COMPLEX |
+                               MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+        reply->hdr.msgh_size = sizeof(*reply);
+        reply->hdr.msgh_remote_port = hdr->msgh_local_port;
+        reply->hdr.msgh_local_port = MACH_PORT_NULL;
+        reply->hdr.msgh_id = msg_id + 100;  /* 306 */
+        reply->body.msgh_descriptor_count = 1;
+        reply->clock_port.name = clock_serv;
+        reply->clock_port.disposition = MACH_MSG_TYPE_MOVE_SEND;
+        reply->clock_port.type = MACH_MSG_PORT_DESCRIPTOR;
+
+        *ret_out = kr;
+        return true;
+    }
+    case 1000: {
+        /*
+         * clock_get_time — MIG subsystem clock, routine 0.
+         * Request:  header(24) only
+         * Reply:    header(24) + NDR(8) + retval(4) + mach_timespec(8) = 44
+         */
+        mach_port_t clock_port = hdr->msgh_remote_port;
+        mach_timespec_t cur_time;
+        kern_return_t kr = clock_get_time(clock_port, &cur_time);
+
+        struct __attribute__((packed)) {
+            mach_msg_header_t hdr;
+            NDR_record_t NDR;
+            kern_return_t retval;
+            mach_timespec_t cur_time;
+        } *reply = buf;
+
+        reply->hdr.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+        reply->hdr.msgh_size = sizeof(*reply);
+        reply->hdr.msgh_remote_port = hdr->msgh_local_port;
+        reply->hdr.msgh_local_port = MACH_PORT_NULL;
+        reply->hdr.msgh_id = msg_id + 100;  /* 1100 */
+        reply->NDR = NDR_record;
+        reply->retval = kr;
+        reply->cur_time = cur_time;
+
+        *ret_out = KERN_SUCCESS;
+        return true;
+    }
+    case 3418: {
+        /*
+         * semaphore_create — MIG subsystem task, routine 18.
+         * Request:  header(24) + NDR(8) + policy(4) + value(4) = 40
+         * Reply:    header(24) + body(4) + port_descriptor(12) = 40
+         */
+        struct __attribute__((packed)) {
+            mach_msg_header_t hdr;
+            NDR_record_t NDR;
+            int policy;
+            int value;
+        } *req = buf;
+
+        semaphore_t sem = MACH_PORT_NULL;
+        kern_return_t kr = semaphore_create(mach_task_self(),
+                                            &sem,
+                                            req->policy,
+                                            req->value);
+
+        struct __attribute__((packed)) {
+            mach_msg_header_t hdr;
+            mach_msg_body_t body;
+            mach_msg_port_descriptor_t semaphore;
+        } *reply = buf;
+
+        reply->hdr.msgh_bits = MACH_MSGH_BITS_COMPLEX |
+                               MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+        reply->hdr.msgh_size = sizeof(*reply);
+        reply->hdr.msgh_remote_port = hdr->msgh_local_port;
+        reply->hdr.msgh_local_port = MACH_PORT_NULL;
+        reply->hdr.msgh_id = msg_id + 100;  /* 3518 */
+        reply->body.msgh_descriptor_count = 1;
+        reply->semaphore.name = sem;
+        reply->semaphore.disposition = MACH_MSG_TYPE_MOVE_SEND;
+        reply->semaphore.type = MACH_MSG_PORT_DESCRIPTOR;
+
+        *ret_out = kr;
+        return true;
+    }
+    case 4811: {
+        /*
+         * mach_vm_map — MIG subsystem mach_vm, routine 11.
+         * Maps memory into the task's address space.  We translate this
+         * into a guest mmap via target_mmap.
+         *
+         * Request (COMPLEX): header(24) + body(4) + port_desc(12) +
+         *   NDR(8) + address(8) + size(8) + mask(8) + flags(4) +
+         *   offset(8) + copy(4) + cur_prot(4) + max_prot(4) +
+         *   inherit(4) = 100
+         * Reply: header(24) + NDR(8) + retcode(4) + address(8) = 44
+         */        struct __attribute__((packed)) {
+            mach_msg_header_t hdr;
+            mach_msg_body_t body;
+            mach_msg_port_descriptor_t object;
+            NDR_record_t NDR;
+            uint64_t address;
+            uint64_t size;
+            uint64_t mask;
+            int flags;
+            uint64_t offset;
+            int copy;
+            int cur_protection;
+            int max_protection;
+            int inheritance;
+        } *req = buf;
+
+        uint64_t addr = req->address;
+        uint64_t size = req->size;
+        int flags = req->flags;
+        int cur_prot = req->cur_protection;
+
+        int host_prot = 0;
+        if (cur_prot & VM_PROT_READ)    host_prot |= PROT_READ;
+        if (cur_prot & VM_PROT_WRITE)   host_prot |= PROT_WRITE;
+        if (cur_prot & VM_PROT_EXECUTE) host_prot |= PROT_EXEC;
+
+        int mflags = MAP_PRIVATE | MAP_ANONYMOUS;
+        abi_ulong guest_start;
+        if (flags & VM_FLAGS_ANYWHERE) {
+            guest_start = 0;
+        } else {
+            guest_start = (abi_ulong)addr;
+            /*
+             * Only use MAP_FIXED if VM_FLAGS_OVERWRITE (0x4000) is set.
+             * Without it, the kernel refuses to clobber existing mappings.
+             * We emulate this: try to map at the address but don't force it.
+             */
+            if (flags & 0x4000) {
+                mflags |= MAP_FIXED;
+            }
+        }
+
+        abi_long result;
+
+        /*
+         * For PROT_NONE reservations at a fixed address (no OVERWRITE),
+         * the guest is declaring an address-space reservation.  Check
+         * that the range doesn't overlap existing mappings and simply
+         * record it in the guest page table without allocating real
+         * host memory.  Sub-regions will be mapped later with
+         * mprotect / vm_map as needed.
+         */
+        if (host_prot == PROT_NONE && guest_start != 0 &&
+            !(flags & 0x4000)) {
+            /* Just mark pages valid with no permissions */
+            mmap_lock();
+            page_set_flags(guest_start, guest_start + size - 1,
+                           PAGE_VALID, ~0);
+            mmap_unlock();
+            result = guest_start;
+        } else {
+            result = target_mmap(guest_start, size,
+                                 host_prot, mflags, -1, 0);
+
+            /*
+             * If we didn't use MAP_FIXED and got a different address than
+             * requested, return KERN_NO_SPACE (the region was occupied).
+             */
+            if (result >= 0 && guest_start != 0 &&
+                !(mflags & MAP_FIXED) &&
+                (abi_ulong)result != guest_start) {
+                target_munmap(result, size);
+                result = -1;
+            }
+        }
+
+        if (do_strace) {
+            fprintf(stderr, "  MIG mach_vm_map: addr=0x%llx size=0x%llx "
+                    "flags=0x%x prot=%d → result=0x%llx\n",
+                    (unsigned long long)addr, (unsigned long long)size,
+                    flags, cur_prot, (unsigned long long)result);
+        }
+
+        struct __attribute__((packed)) {
+            mach_msg_header_t hdr;
+            NDR_record_t NDR;
+            kern_return_t retval;
+            uint64_t address;
+        } *reply = buf;
+
+        kern_return_t kr;
+        if (result < 0) {
+            kr = KERN_NO_SPACE;
+            reply->address = 0;
+        } else {
+            kr = KERN_SUCCESS;
+            reply->address = (uint64_t)result;
+        }
+
+        reply->hdr.msgh_bits =
+            MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+        reply->hdr.msgh_size = sizeof(*reply);
+        reply->hdr.msgh_remote_port = hdr->msgh_local_port;
+        reply->hdr.msgh_local_port = MACH_PORT_NULL;
+        reply->hdr.msgh_id = msg_id + 100;  /* 4911 */
+        reply->NDR = NDR_record;
+        reply->retval = kr;
+
+        *ret_out = KERN_SUCCESS;
+        return true;
+    }
+    case 8000: {
+        /*
+         * task_restartable_ranges_register — private MIG.
+         * Used by ObjC runtime to register restartable code ranges
+         * for thread-safe operations.  Not critical for correctness
+         * in our single-threaded emulator; return KERN_SUCCESS.
+         *
+         * Reply: header(24) + NDR(8) + retval(4) = 36
+         */
+        struct __attribute__((packed)) {
+            mach_msg_header_t hdr;
+            NDR_record_t NDR;
+            kern_return_t retval;
+        } *reply = buf;
+
+        reply->hdr.msgh_bits =
+            MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+        reply->hdr.msgh_size = sizeof(*reply);
+        reply->hdr.msgh_remote_port = hdr->msgh_local_port;
+        reply->hdr.msgh_local_port = MACH_PORT_NULL;
+        reply->hdr.msgh_id = msg_id + 100;  /* 8100 */
+        reply->NDR = NDR_record;
+        reply->retval = KERN_SUCCESS;
+
+        *ret_out = KERN_SUCCESS;
+        return true;
+    }
+    case 8001: {
+        /*
+         * task_restartable_ranges_synchronize — private MIG.
+         * Synchronizes restartable ranges with the kernel.
+         * Like 8000, not critical; return success.
+         *
+         * Reply: header(24) + NDR(8) + retval(4) = 36
+         */
+        struct __attribute__((packed)) {
+            mach_msg_header_t hdr;
+            NDR_record_t NDR;
+            kern_return_t retval;
+        } *reply = buf;
+
+        reply->hdr.msgh_bits =
+            MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+        reply->hdr.msgh_size = sizeof(*reply);
+        reply->hdr.msgh_remote_port = hdr->msgh_local_port;
+        reply->hdr.msgh_local_port = MACH_PORT_NULL;
+        reply->hdr.msgh_id = msg_id + 100;  /* 8101 */
+        reply->NDR = NDR_record;
+        reply->retval = KERN_SUCCESS;
+
+        *ret_out = KERN_SUCCESS;
+        return true;
+    }
+    case 3409: {
+        /*
+         * task_get_special_port — MIG subsystem task, routine 9.
+         * Request:  header(24) + NDR(8) + which_port(4) = 36
+         * Reply:    header(24) + body(4) + port_descriptor(12) = 40
+         */
+        struct __attribute__((packed)) {
+            mach_msg_header_t hdr;
+            NDR_record_t NDR;
+            int which_port;
+        } *req = buf;
+
+        mach_port_t port = MACH_PORT_NULL;
+        kern_return_t kr = task_get_special_port(mach_task_self(),
+                                                 req->which_port,
+                                                 &port);
+
+        struct __attribute__((packed)) {
+            mach_msg_header_t hdr;
+            mach_msg_body_t body;
+            mach_msg_port_descriptor_t special_port;
+        } *reply = buf;
+
+        reply->hdr.msgh_bits = MACH_MSGH_BITS_COMPLEX |
+                               MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+        reply->hdr.msgh_size = sizeof(*reply);
+        reply->hdr.msgh_remote_port = hdr->msgh_local_port;
+        reply->hdr.msgh_local_port = MACH_PORT_NULL;
+        reply->hdr.msgh_id = msg_id + 100;  /* 3509 */
+        reply->body.msgh_descriptor_count = 1;
+        reply->special_port.name = port;
+        reply->special_port.disposition = MACH_MSG_TYPE_MOVE_SEND;
+        reply->special_port.type = MACH_MSG_PORT_DESCRIPTOR;
+
+        *ret_out = kr;
+        return true;
+    }
+    case 3405: {
+        /*
+         * task_info — MIG subsystem task, routine 5.
+         * Request:  header(24) + NDR(8) + flavor(4) + count(4) = 40
+         * Reply:    header(24) + NDR(8) + retval(4) + count(4) + data(var)
+         */
+        struct __attribute__((packed)) {
+            mach_msg_header_t hdr;
+            NDR_record_t NDR;
+            task_flavor_t flavor;
+            mach_msg_type_number_t count;
+        } *req = buf;
+
+        task_flavor_t flavor = req->flavor;
+        mach_msg_type_number_t count = req->count;
+
+        integer_t info_buf[94];
+        kern_return_t kr = task_info(mach_task_self(), flavor,
+                                     (task_info_t)info_buf, &count);
+
+        struct __attribute__((packed)) {
+            mach_msg_header_t hdr;
+            NDR_record_t NDR;
+            kern_return_t retval;
+            mach_msg_type_number_t count;
+            integer_t data[94];
+        } *reply = buf;
+
+        reply->hdr.msgh_bits =
+            MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+        reply->hdr.msgh_size = sizeof(mach_msg_header_t) +
+                               sizeof(NDR_record_t) + 8 +
+                               count * sizeof(integer_t);
+        reply->hdr.msgh_remote_port = hdr->msgh_local_port;
+        reply->hdr.msgh_local_port = MACH_PORT_NULL;
+        reply->hdr.msgh_id = msg_id + 100;  /* 3505 */
+        reply->NDR = NDR_record;
+        reply->retval = kr;
+        reply->count = count;
+        if (count > 0 && count <= 94) {
+            memcpy(reply->data, info_buf, count * sizeof(integer_t));
+        }
+
+        *ret_out = KERN_SUCCESS;
+        return true;
+    }
+    case 3410: {
+        /*
+         * task_set_special_port — MIG subsystem task, routine 10.
+         * Request (COMPLEX): header(24) + body(4) + port_desc(12) +
+         *   NDR(8) + which_port(4) = 52
+         * Reply: header(24) + NDR(8) + retval(4) = 36
+         */
+        struct __attribute__((packed)) {
+            mach_msg_header_t hdr;
+            mach_msg_body_t body;
+            mach_msg_port_descriptor_t special_port;
+            NDR_record_t NDR;
+            int which_port;
+        } *req = buf;
+
+        kern_return_t kr = task_set_special_port(mach_task_self(),
+                                                  req->which_port,
+                                                  req->special_port.name);
+
+        struct __attribute__((packed)) {
+            mach_msg_header_t hdr;
+            NDR_record_t NDR;
+            kern_return_t retval;
+        } *reply = buf;
+
+        reply->hdr.msgh_bits =
+            MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+        reply->hdr.msgh_size = sizeof(*reply);
+        reply->hdr.msgh_remote_port = hdr->msgh_local_port;
+        reply->hdr.msgh_local_port = MACH_PORT_NULL;
+        reply->hdr.msgh_id = msg_id + 100;  /* 3510 */
+        reply->NDR = NDR_record;
+        reply->retval = kr;
+
+        *ret_out = KERN_SUCCESS;
+        return true;
+    }
+    default:
+        return false;
+    }
+}
 
 /* Mach trap numbers (negated x16 values) */
 #define MACH_TRAP_ABSTIME                       (-3)
@@ -81,9 +596,9 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
 
     if (do_strace && trap_num != MACH_TRAP_ABSTIME &&
         trap_num != MACH_TRAP_CONTTIME) {
-        fprintf(stderr, "mach_trap[%d] = %lx, %lx, %lx, %lx, %lx\n",
+        fprintf(stderr, "mach_trap[%d] = %lx, %lx, %lx, %lx, %lx, %lx\n",
                 trap_num, (long)arg1, (long)arg2, (long)arg3,
-                (long)arg4, (long)arg5);
+                (long)arg4, (long)arg5, (long)arg6);
     }
 
     switch (trap_num) {
@@ -251,6 +766,12 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                 ret = KERN_NO_SPACE;
             } else {
                 addr = (mach_vm_address_t)result;
+                if (do_strace) {
+                    fprintf(stderr, "  vm_map: allocated at 0x%llx "
+                            "(host=%p, prot=%d)\n",
+                            (unsigned long long)addr,
+                            g2h_untagged(addr), host_prot);
+                }
                 if (arg2) {
                     memcpy(g2h_untagged(arg2), &addr, sizeof(addr));
                 }
@@ -316,44 +837,76 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
     case MACH_TRAP_MACH_MSG:
     case MACH_TRAP_MACH_MSG_OVERWRITE:
         /*
-         * mach_msg_trap — the core Mach IPC primitive.
-         * Forward directly to host kernel.
-         *
-         * arg1 = msg pointer, arg2 = option, arg3 = send_size,
-         * arg4 = rcv_size, arg5 = rcv_name, arg6 = timeout, arg7 = notify
+         * mach_msg_trap — legacy Mach IPC.
+         * Convert to mach_msg2_trap to avoid SIGKILL from message
+         * filters on modern macOS.
          */
         {
-            mach_msg_header_t *msg = NULL;
-            if (arg1) {
-                msg = (mach_msg_header_t *)g2h_untagged(arg1);
+            void *host_data = arg1 ? g2h_untagged(arg1) : NULL;
+            mach_msg_header_t *hdr = (mach_msg_header_t *)host_data;
+
+            /* Pack into mach_msg2 format */
+            uint64_t options = (uint64_t)(uint32_t)arg2 | 0x200000000ULL;
+            uint64_t bits_and_size = 0;
+            uint64_t remote_and_local = 0;
+            uint64_t voucher_and_id = 0;
+            if (hdr) {
+                bits_and_size = ((uint64_t)(uint32_t)arg3 << 32) |
+                                hdr->msgh_bits;
+                remote_and_local = ((uint64_t)hdr->msgh_local_port << 32) |
+                                   hdr->msgh_remote_port;
+                voucher_and_id = ((uint64_t)hdr->msgh_id << 32) |
+                                 hdr->msgh_voucher_port;
             }
-            ret = mach_msg(msg,
-                           (mach_msg_option_t)arg2,
-                           (mach_msg_size_t)arg3,
-                           (mach_msg_size_t)arg4,
-                           (mach_port_name_t)arg5,
-                           (mach_msg_timeout_t)arg6,
-                           (mach_port_name_t)arg7);
+            uint64_t desc_and_rcv = ((uint64_t)(uint32_t)arg5 << 32);
+            uint64_t rcv_and_pri = (uint64_t)(uint32_t)arg4;
+            uint64_t timeout = (uint64_t)(uint32_t)arg6;
+
+            ret = host_mach_msg2_trap(host_data, options,
+                                      bits_and_size, remote_and_local,
+                                      voucher_and_id, desc_and_rcv,
+                                      rcv_and_pri, timeout);
         }
         break;
 
     case MACH_TRAP_MACH_MSG2:
         /*
-         * mach_msg2_trap — newer IPC variant.
-         * For now, treat like mach_msg with the data pointer in arg1.
+         * mach_msg2_trap — forward to host kernel via raw trap.
+         *
+         * On modern macOS the old mach_msg_trap is SIGKILL'd by
+         * message filters.  We must use mach_msg2_trap directly.
+         * Only the data pointer needs guest→host translation;
+         * all other packed arguments pass through unchanged.
+         *
+         * Ensure MACH64_SEND_FILTER_NONFATAL (bit 33) is set so
+         * that filtered messages return an error instead of killing
+         * the process.
          */
         {
-            mach_msg_header_t *msg = NULL;
-            if (arg1) {
-                msg = (mach_msg_header_t *)g2h_untagged(arg1);
+            void *host_data = arg1 ? g2h_untagged(arg1) : NULL;
+            uint64_t options = (uint64_t)arg2 | 0x200000000ULL;
+
+            if (do_strace && host_data) {
+                mach_msg_header_t *hdr = (mach_msg_header_t *)host_data;
+                fprintf(stderr,
+                    "  mach_msg2: bits=0x%x size=%u remote=0x%x "
+                    "local=0x%x id=%u\n",
+                    hdr->msgh_bits, hdr->msgh_size,
+                    hdr->msgh_remote_port, hdr->msgh_local_port,
+                    hdr->msgh_id);
             }
-            ret = mach_msg(msg,
-                           (mach_msg_option_t)arg2,
-                           (mach_msg_size_t)arg3,
-                           (mach_msg_size_t)arg4,
-                           (mach_port_name_t)arg5,
-                           (mach_msg_timeout_t)arg6,
-                           (mach_port_name_t)arg7);
+
+            /* Try handling common MIG messages in-process first */
+            kern_return_t mig_ret;
+            if (handle_mig_message(host_data, options,
+                                   (uint64_t)arg3, &mig_ret)) {
+                ret = mig_ret;
+            } else {
+                ret = host_mach_msg2_trap(host_data, options,
+                                          (uint64_t)arg3, (uint64_t)arg4,
+                                          (uint64_t)arg5, (uint64_t)arg6,
+                                          (uint64_t)arg7, (uint64_t)arg8);
+            }
         }
         break;
 
