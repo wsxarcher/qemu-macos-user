@@ -45,6 +45,123 @@ static const char *redirect_path(const char *path, char *buf, size_t bufsz)
     return path;
 }
 
+/*
+ * PAC signing helpers — declared in target/arm/tcg/pauth_helper.c.
+ * We use these to PAC-sign shared-cache pointers during fixup
+ * processing so that the guest's autda/autia instructions can
+ * successfully authenticate them at runtime.
+ */
+uint64_t helper_pacia(CPUARMState *env, uint64_t x, uint64_t y);
+uint64_t helper_pacda(CPUARMState *env, uint64_t x, uint64_t y);
+
+/*
+ * Process ARM64e chained fixups (slide info v5) for a shared cache
+ * mapping.  This replicates what XNU's vm_shared_region_slide_page_v5()
+ * does: walk the fixup chains page by page, rebase every pointer by
+ * (value_add + slide), and PAC-sign authenticated pointers using the
+ * guest CPU's keys.
+ *
+ * @env:         guest CPU state (carries PAC keys)
+ * @slide_buf:   slide info data read from the cache file
+ * @slide_len:   length of slide_buf in bytes
+ * @mapped_host: host pointer to the mapped region
+ * @guest_addr:  guest base address of the mapped region
+ * @region_size: size of the mapped region
+ * @slide:       ASLR slide amount (0 for private caches)
+ */
+static void apply_slide_info_v5(CPUARMState *env,
+                                const uint8_t *slide_buf,
+                                uint64_t slide_len,
+                                void *mapped_host,
+                                uint64_t guest_addr,
+                                uint64_t region_size,
+                                uint32_t slide)
+{
+    /* dyld_cache_slide_info5 header (20 bytes) */
+    if (slide_len < 20) {
+        return;
+    }
+    uint32_t version, page_size, page_starts_count;
+    uint64_t value_add;
+    memcpy(&version, slide_buf, 4);
+    memcpy(&page_size, slide_buf + 4, 4);
+    memcpy(&page_starts_count, slide_buf + 8, 4);
+    /* 4 bytes padding at offset 12 */
+    memcpy(&value_add, slide_buf + 16, 8);
+
+    if (version != 5 || page_size == 0 || page_starts_count == 0) {
+        if (do_strace) {
+            fprintf(stderr, "qemu: slide info version %u (expected 5), skipping\n",
+                    version);
+        }
+        return;
+    }
+
+    /* page_starts array follows the header (uint16_t each) */
+    const uint16_t *page_starts =
+        (const uint16_t *)(slide_buf + 24);
+    uint64_t needed = 24 + (uint64_t)page_starts_count * 2;
+    if (needed > slide_len) {
+        return;
+    }
+
+    for (uint32_t pi = 0; pi < page_starts_count; pi++) {
+        uint16_t start = page_starts[pi];
+        if (start == 0xFFFF) {
+            continue; /* DYLD_CACHE_SLIDE_V5_PAGE_ATTR_NO_REBASE */
+        }
+
+        uint64_t page_off = (uint64_t)pi * page_size;
+        if (page_off + start >= region_size) {
+            break;
+        }
+
+        uint8_t *loc = (uint8_t *)mapped_host + page_off;
+        uint64_t delta = start;
+
+        do {
+            loc += delta;
+            uint64_t raw;
+            memcpy(&raw, loc, 8);
+
+            /* Extract chain-next delta (bits 62:52, in 8-byte units) */
+            delta = ((raw & 0x7FF0000000000000ULL) >> 52) * 8;
+
+            bool is_auth = (raw & (1ULL << 63)) != 0;
+            uint64_t runtime_offset = raw & 0x3FFFFFFFFULL;
+            uint64_t target = runtime_offset + value_add + slide;
+
+            if (is_auth) {
+                uint16_t diversity = (uint16_t)((raw >> 34) & 0xFFFF);
+                bool addr_div = (raw & (1ULL << 50)) != 0;
+                bool key_is_data = (raw & (1ULL << 51)) != 0;
+
+                uint64_t modifier;
+                if (addr_div) {
+                    uint64_t slot_addr = guest_addr +
+                        (uint64_t)((uint8_t *)loc - (uint8_t *)mapped_host);
+                    modifier = ((uint64_t)diversity << 48) |
+                               (slot_addr & 0x0000FFFFFFFFFFFFULL);
+                } else {
+                    modifier = (uint64_t)diversity;
+                }
+
+                if (key_is_data) {
+                    target = helper_pacda(env, target, modifier);
+                } else {
+                    target = helper_pacia(env, target, modifier);
+                }
+            } else {
+                /* Non-auth rebase: add high8 bits */
+                uint64_t high8 = (raw << 22) & 0xFF00000000000000ULL;
+                target |= high8;
+            }
+
+            memcpy(loc, &target, 8);
+        } while (delta != 0);
+    }
+}
+
 /* Syscall implementation */
 
 /* Guest address of the mapped shared cache (0 = not yet mapped) */
@@ -1182,10 +1299,13 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
          * shared_region_map_and_slide_2_np(files_count, files,
          *                                  mappings_count, mappings)
          *
-         * Emulate the XNU shared-region syscall: for each mapping
-         * descriptor, mmap the file segment at the requested guest
-         * address.  Slide/rebase info is ignored — the cache is
-         * mapped at its preferred address (no ASLR slide).
+         * Two-pass emulation of the XNU shared-region syscall:
+         *  Pass 1 - mmap every segment (with PROT_WRITE for those
+         *           needing fixups).
+         *  Pass 2 - read the slide info from the now-mapped memory
+         *           (sms_slide_start is a guest VA, like the kernel's
+         *           copyin), apply chained fixups + PAC signing, then
+         *           set final protection.
          */
         {
             uint32_t files_count = (uint32_t)arg1;
@@ -1196,27 +1316,12 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                 break;
             }
 
-            /*
-             * shared_file_np: { int sf_fd; uint32_t sf_mappings_count;
-             *                   uint32_t sf_slide; }  = 12 bytes
-             */
             struct {
                 int32_t  sf_fd;
                 uint32_t sf_mappings_count;
                 uint32_t sf_slide;
             } *files_arr = g2h_untagged(arg2);
 
-            /*
-             * shared_file_mapping_slide_np:
-             *   mach_vm_address_t  sms_address;        (8)
-             *   mach_vm_size_t     sms_size;           (8)
-             *   mach_vm_offset_t   sms_file_offset;    (8)
-             *   user_addr_t        sms_slide_size;     (8)
-             *   user_addr_t        sms_slide_start;    (8)
-             *   vm_prot_t          sms_max_prot;       (4)
-             *   vm_prot_t          sms_init_prot;      (4)
-             *                                          = 48 bytes
-             */
             struct {
                 uint64_t sms_address;
                 uint64_t sms_size;
@@ -1227,7 +1332,24 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                 int32_t  sms_init_prot;
             } *maps_arr = g2h_untagged(arg4);
 
-            /* Walk files to build fd-per-mapping index */
+            /*
+             * Build a per-mapping slide value from the per-file slide.
+             * We need this in pass 2, so compute it now.
+             */
+            uint32_t *slide_per_map = g_new0(uint32_t, mappings_count);
+            {
+                uint32_t mi2 = 0;
+                for (uint32_t fi = 0;
+                     fi < files_count && mi2 < mappings_count; fi++) {
+                    uint32_t cnt = files_arr[fi].sf_mappings_count;
+                    for (uint32_t j = 0;
+                         j < cnt && mi2 < mappings_count; j++, mi2++) {
+                        slide_per_map[mi2] = files_arr[fi].sf_slide;
+                    }
+                }
+            }
+
+            /* ---- Pass 1: map every segment ---- */
             uint32_t mi = 0;
             ret = 0;
             for (uint32_t fi = 0; fi < files_count && mi < mappings_count; fi++) {
@@ -1238,52 +1360,48 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                     uint64_t size = maps_arr[mi].sms_size;
                     uint64_t off  = maps_arr[mi].sms_file_offset;
                     int iprot     = maps_arr[mi].sms_init_prot;
+                    bool has_slide = (maps_arr[mi].sms_slide_size > 0 &&
+                                     maps_arr[mi].sms_slide_start > 0);
 
                     int host_prot = 0;
                     if (iprot & 1) host_prot |= PROT_READ;
                     if (iprot & 2) host_prot |= PROT_WRITE;
                     if (iprot & 4) host_prot |= PROT_EXEC;
 
+                    /* Need PROT_WRITE to apply fixups in pass 2 */
+                    int map_prot = has_slide ?
+                        (host_prot | PROT_WRITE) : host_prot;
+
                     void *host_addr = g2h_untagged(addr);
                     void *p;
 
-                    /* Zero-fill or anonymous mapping (fd == -1 or VM_PROT_ZF) */
-                    if ((iprot & 0x10) || fd < 0) { /* VM_PROT_ZF or no fd */
+                    if ((iprot & 0x10) || fd < 0) {
                         p = mmap(host_addr, size,
                                  PROT_READ | PROT_WRITE,
                                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
                                  -1, 0);
-                        /*
-                         * When fd=-1 and file_offset is non-zero, the kernel
-                         * copies data from the userspace buffer at that address
-                         * into the mapped region (used for dynamic config data).
-                         */
                         if (p != MAP_FAILED && fd < 0 && off != 0) {
                             void *src = g2h_untagged(off);
                             memcpy(p, src, size);
                         }
-                        /* Set final protection if not RW */
                         if (p != MAP_FAILED && host_prot &&
                             host_prot != (PROT_READ | PROT_WRITE)) {
                             mprotect(p, size, host_prot);
                         }
                     } else {
-                        p = mmap(host_addr, size,
-                                 host_prot,
-                                 MAP_PRIVATE | MAP_FIXED,
-                                 fd, off);
+                        p = mmap(host_addr, size, map_prot,
+                                 MAP_PRIVATE | MAP_FIXED, fd, off);
                     }
 
                     if (p == MAP_FAILED) {
                         fprintf(stderr, "qemu: shared_region mmap failed: "
-                                "fi=%u mi=%u addr=0x%llx size=0x%llx "
-                                "off=0x%llx fd=%d prot=0x%x host=%p "
-                                "errno=%d\n",
-                                fi, mi,
+                                "mi=%u addr=0x%llx size=0x%llx "
+                                "off=0x%llx fd=%d prot=0x%x errno=%d\n",
+                                mi,
                                 (unsigned long long)addr,
                                 (unsigned long long)size,
                                 (unsigned long long)off,
-                                fd, iprot, host_addr, errno);
+                                fd, iprot, errno);
                         ret = -TARGET_ENOMEM;
                         break;
                     }
@@ -1297,6 +1415,60 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                     mmap_unlock();
                 }
             }
+
+            /*
+             * ---- Pass 2: apply chained fixups ----
+             * sms_slide_start is a guest VA (the kernel uses copyin).
+             * All mappings are now established so we can read the
+             * slide info via g2h.
+             */
+            if (ret == 0) {
+                for (mi = 0; mi < mappings_count; mi++) {
+                    uint64_t slide_info_addr =
+                        maps_arr[mi].sms_slide_start;
+                    uint64_t slide_info_size =
+                        maps_arr[mi].sms_slide_size;
+
+                    if (slide_info_size == 0 || slide_info_addr == 0) {
+                        continue;
+                    }
+
+                    void *slide_buf = g2h_untagged(slide_info_addr);
+                    void *mapped = g2h_untagged(
+                        maps_arr[mi].sms_address);
+
+                    apply_slide_info_v5(
+                        (CPUARMState *)cpu_env,
+                        slide_buf, slide_info_size,
+                        mapped,
+                        maps_arr[mi].sms_address,
+                        maps_arr[mi].sms_size,
+                        slide_per_map[mi]);
+
+                    if (do_strace) {
+                        fprintf(stderr,
+                                "qemu: applied slide fixups at "
+                                "0x%llx (size=0x%llx)\n",
+                                (unsigned long long)
+                                    maps_arr[mi].sms_address,
+                                (unsigned long long)
+                                    maps_arr[mi].sms_size);
+                    }
+
+                    /* Restore read-only protection if needed */
+                    int iprot = maps_arr[mi].sms_init_prot;
+                    int host_prot = 0;
+                    if (iprot & 1) host_prot |= PROT_READ;
+                    if (iprot & 2) host_prot |= PROT_WRITE;
+                    if (iprot & 4) host_prot |= PROT_EXEC;
+                    if (!(host_prot & PROT_WRITE)) {
+                        mprotect(mapped, maps_arr[mi].sms_size,
+                                 host_prot);
+                    }
+                }
+            }
+
+            g_free(slide_per_map);
 
             /* Record the cache base for shared_region_check_np */
             if (ret == 0 && mappings_count > 0) {
