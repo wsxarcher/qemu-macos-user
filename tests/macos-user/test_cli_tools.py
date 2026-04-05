@@ -506,6 +506,237 @@ class TestSystemBinaries(unittest.TestCase):
             ["/usr/bin/grep", "localhost", "/etc/hosts"])
 
 
+class TestFrameworks(unittest.TestCase):
+    """Test Apple framework support under qemu-macos-user emulation.
+
+    These tests compile dynamic arm64 binaries that link Apple frameworks
+    (CoreFoundation, Foundation) and verify they produce correct output.
+    """
+
+    _CF_HELLO_SRC = r'''
+#include <CoreFoundation/CoreFoundation.h>
+#include <stdio.h>
+int main(void) {
+    CFStringRef s = CFSTR("Hello from CoreFoundation");
+    char buf[128];
+    CFStringGetCString(s, buf, sizeof(buf), kCFStringEncodingUTF8);
+    printf("%s\n", buf);
+    return 0;
+}
+'''
+
+    _CF_ARRAY_SRC = r'''
+#include <CoreFoundation/CoreFoundation.h>
+#include <stdio.h>
+int main(void) {
+    CFStringRef vals[] = {CFSTR("alpha"), CFSTR("beta"), CFSTR("gamma")};
+    CFArrayRef arr = CFArrayCreate(NULL, (const void **)vals, 3,
+                                   &kCFTypeArrayCallBacks);
+    printf("count=%ld\n", CFArrayGetCount(arr));
+    CFRelease(arr);
+    return 0;
+}
+'''
+
+    _CF_DICT_SRC = r'''
+#include <CoreFoundation/CoreFoundation.h>
+#include <stdio.h>
+int main(void) {
+    CFStringRef key = CFSTR("greeting");
+    CFStringRef val = CFSTR("hello");
+    CFDictionaryRef d = CFDictionaryCreate(NULL,
+        (const void **)&key, (const void **)&val, 1,
+        &kCFTypeDictionaryKeyCallBacks,
+        &kCFTypeDictionaryValueCallBacks);
+    char buf[64];
+    CFStringRef got = CFDictionaryGetValue(d, key);
+    CFStringGetCString(got, buf, sizeof(buf), kCFStringEncodingUTF8);
+    printf("val=%s\n", buf);
+    CFRelease(d);
+    return 0;
+}
+'''
+
+    _CF_NUMBER_SRC = r'''
+#include <CoreFoundation/CoreFoundation.h>
+#include <stdio.h>
+int main(void) {
+    int v = 42;
+    CFNumberRef n = CFNumberCreate(NULL, kCFNumberIntType, &v);
+    int out = 0;
+    CFNumberGetValue(n, kCFNumberIntType, &out);
+    printf("num=%d\n", out);
+    CFRelease(n);
+    return 0;
+}
+'''
+
+    _FOUNDATION_BASIC_SRC = r'''
+#import <Foundation/Foundation.h>
+#include <stdio.h>
+int main(void) {
+    @autoreleasepool {
+        NSString *s = @"Foundation works";
+        NSArray *a = @[@"x", @"y", @"z"];
+        NSDictionary *d = @{@"k": @"v"};
+        printf("str=%s\n", [s UTF8String]);
+        printf("count=%lu\n", (unsigned long)[a count]);
+        printf("val=%s\n", [[d objectForKey:@"k"] UTF8String]);
+    }
+    return 0;
+}
+'''
+
+    _FOUNDATION_DATE_SRC = r'''
+#import <Foundation/Foundation.h>
+#include <stdio.h>
+int main(void) {
+    @autoreleasepool {
+        NSDate *d = [NSDate date];
+        NSTimeInterval ti = [d timeIntervalSince1970];
+        printf("epoch=%.0f\n", ti);
+    }
+    return 0;
+}
+'''
+
+    _FOUNDATION_DATA_SRC = r'''
+#import <Foundation/Foundation.h>
+#include <stdio.h>
+int main(void) {
+    @autoreleasepool {
+        const char *bytes = "hello data";
+        NSData *data = [NSData dataWithBytes:bytes length:10];
+        printf("len=%lu\n", (unsigned long)[data length]);
+        char buf[16] = {0};
+        [data getBytes:buf length:10];
+        printf("content=%s\n", buf);
+    }
+    return 0;
+}
+'''
+
+    _FOUNDATION_FILEMANAGER_SRC = r'''
+#import <Foundation/Foundation.h>
+#include <stdio.h>
+int main(void) {
+    @autoreleasepool {
+        NSFileManager *fm = [NSFileManager defaultManager];
+        BOOL exists = [fm fileExistsAtPath:@"/etc/hosts"];
+        printf("hosts_exists=%s\n", exists ? "YES" : "NO");
+    }
+    return 0;
+}
+'''
+
+    # --- CoreFoundation tests ---
+
+    def test_cf_hello(self):
+        """CoreFoundation CFString basic usage."""
+        exe = _compile_framework_test("cf_hello", self._CF_HELLO_SRC,
+                                      ["CoreFoundation"], "c")
+        rc, out, _ = _run_emulated(exe)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"Hello from CoreFoundation", out)
+
+    def test_cf_array(self):
+        """CoreFoundation CFArray creation and count."""
+        exe = _compile_framework_test("cf_array", self._CF_ARRAY_SRC,
+                                      ["CoreFoundation"], "c")
+        rc, out, _ = _run_emulated(exe)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"count=3", out)
+
+    def test_cf_dictionary(self):
+        """CoreFoundation CFDictionary create and lookup."""
+        exe = _compile_framework_test("cf_dict", self._CF_DICT_SRC,
+                                      ["CoreFoundation"], "c")
+        rc, out, _ = _run_emulated(exe)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"val=hello", out)
+
+    def test_cf_number(self):
+        """CoreFoundation CFNumber round-trip."""
+        exe = _compile_framework_test("cf_number", self._CF_NUMBER_SRC,
+                                      ["CoreFoundation"], "c")
+        rc, out, _ = _run_emulated(exe)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"num=42", out)
+
+    # --- Foundation tests ---
+
+    def test_foundation_basic(self):
+        """Foundation NSString, NSArray, NSDictionary."""
+        exe = _compile_framework_test("foundation_basic",
+                                      self._FOUNDATION_BASIC_SRC,
+                                      ["Foundation"])
+        rc, out, _ = _run_emulated(exe)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"str=Foundation works", out)
+        self.assertIn(b"count=3", out)
+        self.assertIn(b"val=v", out)
+
+    def test_foundation_date(self):
+        """Foundation NSDate epoch time."""
+        exe = _compile_framework_test("foundation_date",
+                                      self._FOUNDATION_DATE_SRC,
+                                      ["Foundation"])
+        rc, out, _ = _run_emulated(exe)
+        self.assertEqual(rc, 0)
+        # Epoch should be a recent timestamp (> year 2024)
+        line = out.decode().strip()
+        self.assertTrue(line.startswith("epoch="))
+        epoch = float(line.split("=")[1])
+        self.assertGreater(epoch, 1700000000)
+
+    def test_foundation_data(self):
+        """Foundation NSData bytes round-trip."""
+        exe = _compile_framework_test("foundation_data",
+                                      self._FOUNDATION_DATA_SRC,
+                                      ["Foundation"])
+        rc, out, _ = _run_emulated(exe)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"len=10", out)
+        self.assertIn(b"content=hello data", out)
+
+    def test_foundation_filemanager(self):
+        """Foundation NSFileManager file existence check."""
+        exe = _compile_framework_test("foundation_fm",
+                                      self._FOUNDATION_FILEMANAGER_SRC,
+                                      ["Foundation"])
+        rc, out, _ = _run_emulated(exe)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"hosts_exists=YES", out)
+
+
+# ---------------------------------------------------------------------------
+# Helper: compile Objective-C / C test programs from source strings
+# ---------------------------------------------------------------------------
+
+_fw_build_cache: dict[str, Path] = {}
+
+
+def _compile_framework_test(name, source, frameworks=None, language="objc"):
+    """Compile a C/ObjC source string into a dynamic arm64 binary."""
+    if name in _fw_build_cache:
+        return _fw_build_cache[name]
+
+    build_dir = _get_build_dir()
+    ext = ".m" if language == "objc" else ".c"
+    src_path = build_dir / f"{name}{ext}"
+    exe_path = build_dir / name
+
+    src_path.write_text(source)
+
+    cmd = ["clang", "-arch", "arm64", "-o", str(exe_path), str(src_path)]
+    for fw in (frameworks or []):
+        cmd += ["-framework", fw]
+
+    subprocess.run(cmd, check=True, capture_output=True)
+    _fw_build_cache[name] = exe_path
+    return exe_path
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
