@@ -664,18 +664,36 @@ int main(int argc, char **argv, char **envp)
     abi_ulong stack_size = target_dflssiz;
 
     /*
-     * Allocate the guest stack.  Pick a guest address above the loaded
-     * segments and mmap at the corresponding host address.
+     * Allocate the guest stack via target_mmap which handles both
+     * guest_base != 0 (dynamic) and guest_base == 0 (static) cases.
+     * For static binaries, target_mmap will pick a host address
+     * itself rather than trying to MAP_FIXED at a low guest address
+     * that macOS won't allow.
      */
-    abi_ulong guest_stack_base = TARGET_PAGE_ALIGN(info.start_mmap);
-    void *stack = mmap(g2h_untagged(guest_stack_base),
-                      stack_size,
-                      PROT_READ | PROT_WRITE,
-                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
-                      -1, 0);
-    if (stack == MAP_FAILED) {
-        fprintf(stderr, "Unable to allocate stack\n");
-        _exit(EXIT_FAILURE);
+    abi_ulong guest_stack_base;
+    if (have_guest_base) {
+        /* Dynamic: allocate at a known guest address above loaded segments */
+        guest_stack_base = TARGET_PAGE_ALIGN(info.start_mmap);
+        void *stack = mmap(g2h_untagged(guest_stack_base),
+                          stack_size,
+                          PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                          -1, 0);
+        if (stack == MAP_FAILED) {
+            fprintf(stderr, "Unable to allocate stack\n");
+            _exit(EXIT_FAILURE);
+        }
+    } else {
+        /* Static: let target_mmap find a suitable address */
+        abi_long result = target_mmap(0, stack_size,
+                                       PROT_READ | PROT_WRITE,
+                                       MAP_PRIVATE | MAP_ANONYMOUS,
+                                       -1, 0);
+        if (result == -1) {
+            fprintf(stderr, "Unable to allocate stack\n");
+            _exit(EXIT_FAILURE);
+        }
+        guest_stack_base = (abi_ulong)result;
     }
 
     abi_ulong stack_top = guest_stack_base + stack_size;
