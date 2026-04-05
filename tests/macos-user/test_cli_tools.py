@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Test suite for qemu-macos-user: verify emulation of static ARM64 binaries.
+Test suite for qemu-macos-user: verify emulation of static ARM64 binaries
+and system (arm64e) command-line tools.
 
-Each test compiles a small ARM64 assembly program, runs it both natively
-and under qemu-macos-user, and compares the output.  All test programs
-use raw macOS syscalls (SVC #0x80) so they do not require dyld.
+Static tests compile small ARM64 assembly programs and verify output.
+System binary tests run real macOS /bin and /usr/bin tools under emulation
+and compare output against native execution.
 """
 
 import os
@@ -235,6 +236,249 @@ class TestStaticBinaries(unittest.TestCase):
         self.assertEqual(emulated[0], 0)
         emulated_pid = int(emulated[1].strip())
         self.assertGreater(emulated_pid, 0, "emulated PID should be positive")
+
+
+# ---------------------------------------------------------------------------
+# System binary tests — run real macOS arm64e tools under emulation
+# ---------------------------------------------------------------------------
+
+
+class TestSystemBinaries(unittest.TestCase):
+    """Test real macOS system binaries (arm64e FAT) under emulation.
+
+    These tests run /bin and /usr/bin tools under qemu-macos-user and
+    verify output against native execution or known expected values.
+    A temporary directory is created per-class for file operation tests.
+    """
+
+    _tmpdir: tempfile.TemporaryDirectory | None = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmpdir = tempfile.TemporaryDirectory(prefix="qemu_sys_test_")
+        cls.tmpdir = Path(cls._tmpdir.name)
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls._tmpdir:
+            cls._tmpdir.cleanup()
+
+    # -- Helpers -----------------------------------------------------------
+
+    def _native(self, args, **kwargs):
+        """Run a command natively."""
+        return _run(args, **kwargs)
+
+    def _emulated(self, args, **kwargs):
+        """Run a command under QEMU."""
+        return _run([str(QEMU_BINARY)] + args, timeout=120, **kwargs)
+
+    def _assert_same_output(self, args, msg=None, **kwargs):
+        """Assert emulated output matches native output."""
+        native = self._native(args, **kwargs)
+        emulated = self._emulated(args, **kwargs)
+        self.assertEqual(native[0], emulated[0],
+                         f"{msg or args}: exit code differs "
+                         f"(native={native[0]}, emulated={emulated[0]})")
+        self.assertEqual(native[1], emulated[1],
+                         f"{msg or args}: stdout differs")
+
+    # -- /bin/echo ---------------------------------------------------------
+
+    def test_echo_simple(self):
+        """echo prints its arguments."""
+        rc, out, _ = self._emulated(["/bin/echo", "hello", "world"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.strip(), b"hello world")
+
+    def test_echo_no_args(self):
+        """echo with no args prints a blank line."""
+        self._assert_same_output(["/bin/echo"])
+
+    def test_echo_special_chars(self):
+        """echo with special characters."""
+        self._assert_same_output(["/bin/echo", "a b  c", "d\te"])
+
+    # -- /bin/ls -----------------------------------------------------------
+
+    def test_ls_root(self):
+        """/bin/ls / lists root directory entries."""
+        rc, out, _ = self._emulated(["/bin/ls", "/"])
+        self.assertEqual(rc, 0)
+        entries = out.decode().split()
+        for expected in ["Applications", "System", "Users", "bin", "usr"]:
+            self.assertIn(expected, entries,
+                          f"'{expected}' missing from ls / output")
+
+    def test_ls_one_per_line(self):
+        """/bin/ls -1 produces one entry per line."""
+        rc, out, _ = self._emulated(["/bin/ls", "-1", "/etc"])
+        self.assertEqual(rc, 0)
+        lines = out.decode().strip().split("\n")
+        self.assertGreater(len(lines), 5)
+        self.assertIn("hosts", lines)
+
+    def test_ls_hidden(self):
+        """/bin/ls -a shows hidden entries."""
+        self._assert_same_output(["/bin/ls", "-a", "/tmp"])
+
+    # -- /bin/hostname -----------------------------------------------------
+
+    def test_hostname(self):
+        """hostname matches native output."""
+        self._assert_same_output(["/bin/hostname"])
+
+    # -- /bin/pwd ----------------------------------------------------------
+
+    def test_pwd(self):
+        """pwd prints current working directory."""
+        rc, out, _ = self._emulated(["/bin/pwd"])
+        self.assertEqual(rc, 0)
+        cwd = out.decode().strip()
+        self.assertTrue(cwd.startswith("/"), f"bad cwd: {cwd}")
+
+    # -- /usr/bin/basename & dirname ---------------------------------------
+
+    def test_basename(self):
+        """basename extracts filename from path."""
+        self._assert_same_output(["/usr/bin/basename", "/usr/bin/sort"])
+
+    def test_basename_with_suffix(self):
+        """basename strips suffix."""
+        self._assert_same_output(["/usr/bin/basename", "file.txt", ".txt"])
+
+    def test_dirname(self):
+        """dirname extracts directory from path."""
+        self._assert_same_output(["/usr/bin/dirname", "/usr/bin/sort"])
+
+    # -- /usr/bin/printenv -------------------------------------------------
+
+    def test_printenv_home(self):
+        """printenv HOME returns home directory."""
+        rc, out, _ = self._emulated(["/usr/bin/printenv", "HOME"])
+        self.assertEqual(rc, 0)
+        self.assertTrue(out.decode().strip().startswith("/"))
+
+    def test_printenv_missing(self):
+        """printenv with undefined var returns non-zero."""
+        rc, _, _ = self._emulated(
+            ["/usr/bin/printenv", "QEMU_NONEXISTENT_VAR_XYZ"])
+        self.assertNotEqual(rc, 0)
+
+    # -- /usr/bin/sort -----------------------------------------------------
+
+    def test_sort_basic(self):
+        """sort orders lines alphabetically."""
+        data = b"banana\napple\ncherry\n"
+        self._assert_same_output(["/usr/bin/sort"], stdin_data=data)
+
+    # -- /usr/bin/grep -----------------------------------------------------
+
+    def test_grep_match(self):
+        """grep finds matching lines."""
+        data = b"apple\nbanana\napricot\ncherry\n"
+        self._assert_same_output(["/usr/bin/grep", "ap"], stdin_data=data)
+
+    def test_grep_no_match(self):
+        """grep returns 1 when no match."""
+        data = b"hello\nworld\n"
+        rc, out, _ = self._emulated(
+            ["/usr/bin/grep", "zzzzz"], stdin_data=data)
+        self.assertEqual(rc, 1)
+        self.assertEqual(out, b"")
+
+    def test_grep_count(self):
+        """grep -c counts matches."""
+        data = b"aa\nbb\naa\ncc\naa\n"
+        self._assert_same_output(
+            ["/usr/bin/grep", "-c", "aa"], stdin_data=data)
+
+    def test_grep_ignore_case(self):
+        """grep -i does case-insensitive match."""
+        data = b"Hello\nHELLO\nhello\nworld\n"
+        self._assert_same_output(
+            ["/usr/bin/grep", "-i", "hello"], stdin_data=data)
+
+    def test_grep_invert(self):
+        """grep -v shows non-matching lines."""
+        data = b"apple\nbanana\napricot\ncherry\n"
+        self._assert_same_output(
+            ["/usr/bin/grep", "-v", "ap"], stdin_data=data)
+
+    def test_grep_file(self):
+        """grep in a file."""
+        rc, out, _ = self._emulated(
+            ["/usr/bin/grep", "localhost", "/etc/hosts"])
+        self.assertEqual(rc, 0)
+        self.assertIn(b"localhost", out)
+
+    # -- /usr/bin/find -----------------------------------------------------
+
+    def test_find_name(self):
+        """find -name locates a file."""
+        rc, out, _ = self._emulated(
+            ["/usr/bin/find", "/private/etc", "-name", "hosts",
+             "-maxdepth", "1"])
+        self.assertEqual(rc, 0)
+        self.assertIn(b"/private/etc/hosts", out)
+
+    def test_find_type(self):
+        """find -type d lists directories."""
+        rc, out, _ = self._emulated(
+            ["/usr/bin/find", "/usr", "-maxdepth", "1", "-type", "d"])
+        self.assertEqual(rc, 0)
+        self.assertIn(b"/usr/bin", out)
+
+    # -- /usr/bin/tr -------------------------------------------------------
+
+    def test_tr_lowercase_to_upper(self):
+        """tr translates characters."""
+        data = b"hello world\n"
+        self._assert_same_output(
+            ["/usr/bin/tr", "a-z", "A-Z"], stdin_data=data)
+
+    def test_tr_delete(self):
+        """tr -d deletes characters."""
+        data = b"h-e-l-l-o\n"
+        self._assert_same_output(
+            ["/usr/bin/tr", "-d", "-"], stdin_data=data)
+
+    def test_tr_squeeze(self):
+        """tr -s squeezes repeated characters."""
+        data = b"heeelllo\n"
+        self._assert_same_output(
+            ["/usr/bin/tr", "-s", "el"], stdin_data=data)
+
+    # -- /usr/bin/head -----------------------------------------------------
+
+    def test_head_default(self):
+        """head shows first 10 lines."""
+        data = b"".join(f"line{i}\n".encode() for i in range(20))
+        self._assert_same_output(["/usr/bin/head"], stdin_data=data)
+
+    def test_head_n(self):
+        """head -n 3 shows first 3 lines."""
+        data = b"a\nb\nc\nd\ne\n"
+        self._assert_same_output(["/usr/bin/head", "-3"], stdin_data=data)
+
+    # -- /usr/bin/touch (file creation) ------------------------------------
+
+    def test_touch_creates_file(self):
+        """touch creates an empty file."""
+        target = self.tmpdir / "touch_test"
+        rc, _, _ = self._emulated(["/usr/bin/touch", str(target)])
+        self.assertEqual(rc, 0)
+        self.assertTrue(target.exists(), "touch did not create file")
+        self.assertEqual(target.stat().st_size, 0)
+
+    # -- Pipeline-style: sort | grep | head --------------------------------
+
+    def test_ls_pipe_grep(self):
+        """/bin/ls piped through grep finds expected entries."""
+        rc, out, _ = self._emulated(["/bin/ls", "/usr"])
+        self.assertEqual(rc, 0)
+        lines = out.decode().split()
+        self.assertIn("bin", lines)
 
 
 # ---------------------------------------------------------------------------
