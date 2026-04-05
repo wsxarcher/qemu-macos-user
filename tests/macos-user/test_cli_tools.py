@@ -480,6 +480,31 @@ class TestSystemBinaries(unittest.TestCase):
         lines = out.decode().split()
         self.assertIn("bin", lines)
 
+    # -- Symlink handling --------------------------------------------------
+
+    def test_find_symlink_default(self):
+        """find with default flags does not follow symlinks (matches native)."""
+        self._assert_same_output(
+            ["/usr/bin/find", "/etc", "-maxdepth", "0"])
+
+    def test_find_symlink_H_flag(self):
+        """find -H follows command-line symlinks into /etc."""
+        self._assert_same_output(
+            ["/usr/bin/find", "-H", "/etc", "-maxdepth", "1",
+             "-name", "hosts"])
+
+    def test_ls_symlink_etc(self):
+        """ls /etc lists the contents (ls follows symlinks by default)."""
+        rc, out, _ = self._emulated(["/bin/ls", "/etc"])
+        self.assertEqual(rc, 0)
+        self.assertIn(b"hosts", out)
+
+    def test_cat_through_symlink(self):
+        """Reading a file through the /etc symlink works."""
+        # Use grep instead of cat (cat with file args crashes on locale init)
+        self._assert_same_output(
+            ["/usr/bin/grep", "localhost", "/etc/hosts"])
+
 
 # ---------------------------------------------------------------------------
 # Main
