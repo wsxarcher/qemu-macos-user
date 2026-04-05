@@ -1212,6 +1212,18 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
         }
         break;
 
+    case TARGET_MACOS_NR_gettid:
+        /* gettid(uint64_t *thread_id, int who) — get thread ID */
+        {
+            uint64_t tid;
+            pthread_threadid_np(NULL, &tid);
+            if (arg1) {
+                *(uint64_t *)g2h_untagged(arg1) = tid;
+            }
+            ret = 0;
+        }
+        break;
+
     case TARGET_MACOS_NR_issetugid:
         /* issetugid() - always return 0 for now */
         ret = 0;

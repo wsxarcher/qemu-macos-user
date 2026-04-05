@@ -1112,6 +1112,25 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                  * Return status with all zeroes.
                  */
                 ret = KERN_SUCCESS;
+            } else if (trap_num == MACH_TRAP_PORT_INSERT_MEMBER) {
+                ret = mach_port_insert_member(mach_task_self(),
+                                              (mach_port_name_t)arg2,
+                                              (mach_port_name_t)arg3);
+            } else if (trap_num == MACH_TRAP_PORT_EXTRACT_MEMBER) {
+                ret = mach_port_extract_member(mach_task_self(),
+                                               (mach_port_name_t)arg2,
+                                               (mach_port_name_t)arg3);
+            } else if (trap_num == MACH_TRAP_PORT_MOVE_MEMBER) {
+                ret = mach_port_move_member(mach_task_self(),
+                                            (mach_port_name_t)arg2,
+                                            (mach_port_name_t)arg3);
+            } else if (trap_num == MACH_TRAP_PORT_TYPE) {
+                mach_port_type_t type = 0;
+                ret = mach_port_type(mach_task_self(),
+                                     (mach_port_name_t)arg2, &type);
+                if (ret == KERN_SUCCESS && arg3) {
+                    memcpy(g2h_untagged(arg3), &type, sizeof(type));
+                }
             } else {
                 ret = KERN_SUCCESS;
             }

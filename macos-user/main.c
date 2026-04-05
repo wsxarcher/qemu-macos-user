@@ -543,6 +543,20 @@ int main(int argc, char **argv, char **envp)
     env = cpu_env(cpu);
     cpu_reset(cpu);
 
+    /*
+     * Set the counter frequency to match the host's real timer (24 MHz
+     * on Apple Silicon).  The commpage contains timebase_info {125, 3}
+     * which converts CNTVCT ticks to nanoseconds assuming a 24 MHz
+     * counter.  Without this, the QEMU default (1 GHz) gives tick
+     * values ~42x too large, breaking CFAbsoluteTime ↔ mach_absolute_time
+     * conversion and making all timers fire in the far future.
+     */
+    {
+        ARMCPU *arm_cpu = ARM_CPU(cpu);
+        arm_cpu->gt_cntfrq_hz = 24000000;  /* Apple Silicon CNTFRQ */
+        env->cp15.c14_cntfrq = 24000000;
+    }
+
     thread_cpu = cpu;
 
     /* Initialize task state */
