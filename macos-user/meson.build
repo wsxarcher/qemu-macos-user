@@ -7,6 +7,7 @@ macos_user_ss = ss.source_set()
 common_user_inc += include_directories('include')
 
 macos_user_ss.add(files(
+  'mach_traps.c',
   'machload.c',
   'main.c',
   'mmap.c',

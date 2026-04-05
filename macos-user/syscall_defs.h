@@ -47,6 +47,7 @@
 #define TARGET_MACOS_NR_fchflags            35
 #define TARGET_MACOS_NR_sync                36
 #define TARGET_MACOS_NR_kill                37
+#define TARGET_MACOS_NR_crossarch_trap      38
 #define TARGET_MACOS_NR_getppid             39
 #define TARGET_MACOS_NR_dup                 41
 #define TARGET_MACOS_NR_pipe                42
@@ -390,9 +391,9 @@
 #define TARGET_MACOS_NR_symlinkat           474
 #define TARGET_MACOS_NR_mkdirat             475
 #define TARGET_MACOS_NR_getattrlistat       476
-#define TARGET_MACOS_NR_proc_trace_self     477
-#define TARGET_MACOS_NR_proc_trace_control  478
-#define TARGET_MACOS_NR_getentropy          479
+#define TARGET_MACOS_NR_proc_trace_log      477
+#define TARGET_MACOS_NR_bsdthread_ctl       478
+#define TARGET_MACOS_NR_getentropy          500
 #define TARGET_MACOS_NR_necp_open           480
 #define TARGET_MACOS_NR_necp_client_action  481
 #define TARGET_MACOS_NR___nexus_open        482
