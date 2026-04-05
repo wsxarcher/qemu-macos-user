@@ -1149,38 +1149,173 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
          *
          * On modern macOS the old mach_msg_trap is SIGKILL'd by
          * message filters.  We must use mach_msg2_trap directly.
-         * Only the data pointer needs guest→host translation;
-         * all other packed arguments pass through unchanged.
+         *
+         * When MACH64_MSG_VECTOR (bit 32 of options) is set, arg1
+         * points to a mach_msg_vector_t array whose msgv_data fields
+         * contain guest pointers that need translation.  Otherwise
+         * arg1 is a direct mach_msg_header_t pointer.
          *
          * Ensure MACH_SEND_FILTER_NONFATAL (0x10000) is set so
          * that filtered messages return an error instead of killing
          * the process.
          */
         {
-            void *host_data = arg1 ? g2h_untagged(arg1) : NULL;
+#define MACH64_MSG_VECTOR          0x100000000ULL
+#define MACH64_SEND_KOBJECT_CALL   0x200000000ULL
+#define MACH64_SEND_MQ_CALL        0x400000000ULL
+#define MACH64_SEND_ANY            0x800000000ULL
+
+            /*
+             * mach_msg_vector_t: used when MACH64_MSG_VECTOR is set.
+             * Each entry has a data pointer, receive address, and sizes.
+             */
+            typedef struct {
+                uint64_t msgv_data;
+                uint64_t msgv_rcv_addr;
+                uint32_t msgv_send_size;
+                uint32_t msgv_rcv_size;
+            } mach_msg_vector_t;
+
             uint64_t options = (uint64_t)arg2 | 0x10000ULL;
-            /* MACH_SEND_FILTER_NONFATAL: return error on filtered msgs */
+            void *host_data;
 
-            if (do_strace && host_data) {
-                mach_msg_header_t *hdr = (mach_msg_header_t *)host_data;
-                fprintf(stderr,
-                    "  mach_msg2: bits=0x%x size=%u remote=0x%x "
-                    "local=0x%x id=%u\n",
-                    hdr->msgh_bits, hdr->msgh_size,
-                    hdr->msgh_remote_port, hdr->msgh_local_port,
-                    hdr->msgh_id);
-            }
+            /*
+             * Strip MACH64_SEND_KOBJECT_CALL and MACH64_SEND_MQ_CALL.
+             * These are kernel optimization hints telling the kernel
+             * the target is a kernel object or MQ port.  When forwarding
+             * guest messages through the host, these hints can cause
+             * MACH_SEND_INVALID_DATA because the emulator's port
+             * namespace doesn't match what the kernel expects for
+             * these fast-paths.  Keep them for now — stripping them
+             * causes SIGKILL from message filters.
+             */
 
-            /* Try handling common MIG messages in-process first */
-            kern_return_t mig_ret;
-            if (handle_mig_message(host_data, options,
-                                   (uint64_t)arg3, &mig_ret)) {
-                ret = mig_ret;
+            if (options & MACH64_MSG_VECTOR) {
+                /*
+                 * Vector mode: arg1 points to guest mach_msg_vector_t.
+                 * Translate the vector pointer, then translate each
+                 * msgv_data guest pointer inside to a host pointer.
+                 * Save original guest pointers to restore after the
+                 * trap (the guest may reuse the vector).
+                 */
+                mach_msg_vector_t *vec =
+                    (mach_msg_vector_t *)g2h_untagged(arg1);
+                host_data = vec;
+
+                /*
+                 * The send count comes from the lower 32 bits of arg3
+                 * (packed as send_size | (send_count << 0) for vectors).
+                 * For MACH64_MSG_VECTOR, the lower 32 bits of arg3 is
+                 * actually the count of vector entries for send.
+                 * There can be 1 send entry and optionally 1 receive entry.
+                 * We translate msgv_data for all entries that have nonzero
+                 * send or receive sizes.
+                 */
+                uint64_t save_data[2] = {0, 0};
+                uint64_t save_rcv[2] = {0, 0};
+                int nentries = 0;
+
+                /* Typically 1-2 entries */
+                if (vec[0].msgv_send_size || vec[0].msgv_rcv_size) {
+                    save_data[0] = vec[0].msgv_data;
+                    save_rcv[0] = vec[0].msgv_rcv_addr;
+                    if (vec[0].msgv_data) {
+                        vec[0].msgv_data =
+                            (uint64_t)g2h_untagged(vec[0].msgv_data);
+                    }
+                    if (vec[0].msgv_rcv_addr) {
+                        vec[0].msgv_rcv_addr =
+                            (uint64_t)g2h_untagged(vec[0].msgv_rcv_addr);
+                    }
+                    nentries = 1;
+                }
+                if ((vec[0].msgv_send_size && vec[0].msgv_rcv_size) ||
+                    vec[1].msgv_send_size || vec[1].msgv_rcv_size) {
+                    save_data[1] = vec[1].msgv_data;
+                    save_rcv[1] = vec[1].msgv_rcv_addr;
+                    if (vec[1].msgv_data) {
+                        vec[1].msgv_data =
+                            (uint64_t)g2h_untagged(vec[1].msgv_data);
+                    }
+                    if (vec[1].msgv_rcv_addr) {
+                        vec[1].msgv_rcv_addr =
+                            (uint64_t)g2h_untagged(vec[1].msgv_rcv_addr);
+                    }
+                    nentries = 2;
+                }
+
+                if (do_strace) {
+                    /* Log the actual message header from the first vector */
+                    void *msg = (void *)(uintptr_t)vec[0].msgv_data;
+                    if (msg) {
+                        mach_msg_header_t *hdr = (mach_msg_header_t *)msg;
+                        fprintf(stderr,
+                            "  mach_msg2[vec]: bits=0x%x size=%u "
+                            "remote=0x%x local=0x%x id=%u "
+                            "opts=0x%llx\n",
+                            hdr->msgh_bits, hdr->msgh_size,
+                            hdr->msgh_remote_port,
+                            hdr->msgh_local_port,
+                            hdr->msgh_id, options);
+                    }
+                }
+
+                /* MIG handling for vector messages */
+                kern_return_t mig_ret;
+                void *msg_buf =
+                    (void *)(uintptr_t)vec[0].msgv_data;
+                if (msg_buf && handle_mig_message(msg_buf, options,
+                                                  (uint64_t)arg3,
+                                                  &mig_ret)) {
+                    ret = mig_ret;
+                } else {
+                    ret = host_mach_msg2_trap(host_data, options,
+                                              (uint64_t)arg3,
+                                              (uint64_t)arg4,
+                                              (uint64_t)arg5,
+                                              (uint64_t)arg6,
+                                              (uint64_t)arg7,
+                                              (uint64_t)arg8);
+                }
+
+                /* Restore guest pointers */
+                if (nentries >= 1) {
+                    vec[0].msgv_data = save_data[0];
+                    vec[0].msgv_rcv_addr = save_rcv[0];
+                }
+                if (nentries >= 2) {
+                    vec[1].msgv_data = save_data[1];
+                    vec[1].msgv_rcv_addr = save_rcv[1];
+                }
             } else {
-                ret = host_mach_msg2_trap(host_data, options,
-                                          (uint64_t)arg3, (uint64_t)arg4,
-                                          (uint64_t)arg5, (uint64_t)arg6,
-                                          (uint64_t)arg7, (uint64_t)arg8);
+                /* Direct message pointer mode */
+                host_data = arg1 ? g2h_untagged(arg1) : NULL;
+
+                if (do_strace && host_data) {
+                    mach_msg_header_t *hdr =
+                        (mach_msg_header_t *)host_data;
+                    fprintf(stderr,
+                        "  mach_msg2: bits=0x%x size=%u remote=0x%x "
+                        "local=0x%x id=%u opts=0x%llx\n",
+                        hdr->msgh_bits, hdr->msgh_size,
+                        hdr->msgh_remote_port,
+                        hdr->msgh_local_port,
+                        hdr->msgh_id, options);
+                }
+
+                kern_return_t mig_ret;
+                if (handle_mig_message(host_data, options,
+                                       (uint64_t)arg3, &mig_ret)) {
+                    ret = mig_ret;
+                } else {
+                    ret = host_mach_msg2_trap(host_data, options,
+                                              (uint64_t)arg3,
+                                              (uint64_t)arg4,
+                                              (uint64_t)arg5,
+                                              (uint64_t)arg6,
+                                              (uint64_t)arg7,
+                                              (uint64_t)arg8);
+                }
             }
         }
         break;
