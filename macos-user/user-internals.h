@@ -7,6 +7,7 @@
 
 #include "qemu/osdep.h"
 #include "user/abitypes.h"
+#include "user/guest-host.h"
 #include <sys/ioctl.h>
 
 /* Environment list */
@@ -36,10 +37,14 @@ void *lock_user_string(abi_ulong guest_addr);
 
 /* Error handling */
 #define TARGET_EPERM        1
-#define TARGET_EFAULT       14
-#define TARGET_EINVAL       22
+#define TARGET_ENOENT       2
+#define TARGET_EINTR        4
 #define TARGET_ENOMEM       12
 #define TARGET_EACCES       13
+#define TARGET_EFAULT       14
+#define TARGET_EINVAL       22
+#define TARGET_ENOTSUP      45
+#define TARGET_ETIMEDOUT    60
 #define TARGET_ENOSYS       78
 
 static inline bool is_error(abi_long ret)
@@ -87,10 +92,35 @@ static inline int safe_open(const char *path, int flags, mode_t mode)
  * TARGET_PAGE_SIZE, TARGET_PAGE_MASK, and TARGET_PAGE_ALIGN are provided
  * by include/exec/target_page.h and must not be redefined here. */
 
-/* BSD-style helpers (TODO: implement properly) */
+/* BSD-style helpers */
 static inline abi_long do_bsd_fcntl(int fd, int cmd, abi_ulong arg)
 {
-    return get_errno(fcntl(fd, cmd, arg));
+    switch (cmd) {
+    case F_GETPATH:
+#ifdef F_GETPATH_NOFIRMLINK
+    case F_GETPATH_NOFIRMLINK:
+#endif
+    case F_ADDFILESIGS:
+    case F_ADDFILESIGS_RETURN:
+#ifdef F_ADDFILESIGS_FOR_DYLD_SIM
+    case F_ADDFILESIGS_FOR_DYLD_SIM:
+#endif
+#ifdef F_ADDFILESIGS_INFO
+    case F_ADDFILESIGS_INFO:
+#endif
+    case F_ADDSIGS:
+    case F_FINDSIGS:
+    case F_GETLK:
+    case F_SETLK:
+    case F_SETLKW:
+    {
+        /* arg is a guest pointer to a struct — translate to host */
+        void *p = g2h_untagged(arg);
+        return get_errno(fcntl(fd, cmd, p));
+    }
+    default:
+        return get_errno(fcntl(fd, cmd, arg));
+    }
 }
 
 static inline abi_long do_bsd_ioctl(int fd, int cmd, abi_ulong arg)
@@ -106,13 +136,17 @@ abi_long do_sigaltstack(abi_ulong ss, abi_ulong old_ss, abi_ulong sp);
 /* Conversion functions (stubs for now) */
 static inline int host_to_target_stat(abi_ulong target_addr, struct stat *host_st)
 {
-    /* TODO: Implement proper stat conversion */
+    /*
+     * macOS target and host share the same stat layout (both arm64),
+     * so just memcpy the struct into the guest buffer.
+     */
+    memcpy(g2h_untagged(target_addr), host_st, sizeof(struct stat));
     return 0;
 }
 
 static inline int copy_to_user_timeval(abi_ulong target_addr, const struct timeval *tv)
 {
-    /* TODO: Implement proper timeval copy */
+    memcpy(g2h_untagged(target_addr), tv, sizeof(struct timeval));
     return 0;
 }
 

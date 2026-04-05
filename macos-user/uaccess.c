@@ -5,6 +5,7 @@
 #include "qemu/osdep.h"
 #include "qemu.h"
 #include "user-internals.h"
+#include "user/guest-host.h"
 
 struct envlist *envlist;
 const char *cpu_model;
@@ -18,7 +19,7 @@ void *lock_user(int type, abi_ulong guest_addr, size_t len, bool copy)
     if (!guest_addr) {
         return NULL;
     }
-    return (void *)(uintptr_t)guest_addr;
+    return g2h_untagged(guest_addr);
 }
 
 void unlock_user(void *host_ptr, abi_ulong guest_addr, size_t len)
@@ -31,10 +32,17 @@ void *lock_user_string(abi_ulong guest_addr)
     if (!guest_addr) {
         return NULL;
     }
-    return (void *)(uintptr_t)guest_addr;
+    return g2h_untagged(guest_addr);
 }
 
 void dump_core_and_abort(int sig)
 {
+    CPUState *cpu = thread_cpu;
+    if (cpu) {
+        CPUArchState *env = cpu_env(cpu);
+        fprintf(stderr, "dump_core_and_abort: sig=%d, guest PC=0x%lx\n",
+                sig, (unsigned long)env->pc);
+        cpu_dump_state(cpu, stderr, 0);
+    }
     abort();
 }

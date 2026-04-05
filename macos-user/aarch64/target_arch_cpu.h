@@ -39,11 +39,14 @@ static inline G_NORETURN void target_cpu_loop(CPUARMState *env)
     int trapnr, ec, fsc, si_code, si_signo;
     uint64_t code, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8;
     abi_long ret;
+    uint64_t loop_count = 0;
 
     for (;;) {
         cpu_exec_start(cs);
         trapnr = cpu_exec(cs);
         cpu_exec_end(cs);
+        loop_count++;
+
         qemu_process_cpu_events(cs);
 
         switch (trapnr) {
@@ -54,6 +57,10 @@ static inline G_NORETURN void target_cpu_loop(CPUARMState *env)
              * arguments in X0-X7
              * return value in X0
              * error indicated by carry flag
+             *
+             * Negative X16 = Mach trap (index = -X16)
+             * Positive X16 = BSD syscall
+             * Special: -3 = mach_absolute_time, -4 = mach_continuous_time
              */
             code = env->xregs[16];
             arg1 = env->xregs[0];
@@ -65,8 +72,33 @@ static inline G_NORETURN void target_cpu_loop(CPUARMState *env)
             arg7 = env->xregs[6];
             arg8 = env->xregs[7];
 
-            ret = do_macos_syscall(env, code, arg1, arg2, arg3,
+            if (code == 0x80000000U) {
+                /*
+                 * Platform syscall (PLATFORM_SYSCALL_TRAP_NO).
+                 * Operation code in x3:
+                 *   2 = set cthread self (TLS pointer), value in x0
+                 *   3 = get cthread self, returned in x0
+                 */
+                uint32_t plat_op = (uint32_t)arg4; /* x3 */
+                if (plat_op == 2) {
+                    /* set cthread self -> write TPIDR_EL0 */
+                    env->cp15.tpidr_el[0] = arg1;
+                } else if (plat_op == 3) {
+                    /* get cthread self -> read TPIDR_EL0 */
+                    env->xregs[0] = env->cp15.tpidr_el[0];
+                }
+                break;
+            }
+
+            if ((int64_t)code < 0) {
+                /* Mach trap */
+                ret = do_mach_trap(env, (int64_t)code, arg1, arg2, arg3,
                                    arg4, arg5, arg6, arg7, arg8);
+            } else {
+                /* BSD syscall */
+                ret = do_macos_syscall(env, code, arg1, arg2, arg3,
+                                       arg4, arg5, arg6, arg7, arg8);
+            }
 
             /*
              * macOS syscall return convention:
@@ -92,6 +124,8 @@ static inline G_NORETURN void target_cpu_loop(CPUARMState *env)
             break;
 
         case EXCP_UDEF:
+            qemu_log("Guest UDEF (illegal insn) at PC=0x%lx\n",
+                     (unsigned long)env->pc);
             force_sig_fault(TARGET_SIGILL, TARGET_ILL_ILLOPC, env->pc);
             break;
 
@@ -125,6 +159,7 @@ static inline G_NORETURN void target_cpu_loop(CPUARMState *env)
 
         case EXCP_DEBUG:
         case EXCP_BKPT:
+            qemu_log("Guest BRK/trap at PC=0x%lx\n", (unsigned long)env->pc);
             force_sig_fault(TARGET_SIGTRAP, TARGET_TRAP_BRKPT, env->pc);
             break;
 
