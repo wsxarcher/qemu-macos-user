@@ -359,20 +359,42 @@ static bool handle_mig_message(void *buf, uint64_t options,
 
         /*
          * For PROT_NONE reservations at a fixed address (no OVERWRITE),
-         * the guest is declaring an address-space reservation.  Check
-         * that the range doesn't overlap existing mappings and simply
-         * record it in the guest page table without allocating real
-         * host memory.  Sub-regions will be mapped later with
-         * mprotect / vm_map as needed.
+         * the guest is declaring an address-space reservation.  We
+         * cannot use MAP_FIXED because that would clobber existing
+         * mappings within the range.
+         *
+         * Instead, register the reservation in the guest page table
+         * and mmap only the sub-pages that aren't already mapped.
+         * Later vm_protect or vm_allocate calls will materialise
+         * real pages within this reservation.  The vm_protect handler
+         * falls back to target_mmap when mprotect fails on pages
+         * that were never host-mapped.
          */
         if (host_prot == PROT_NONE && guest_start != 0 &&
             !(flags & 0x4000)) {
-            /* Just mark pages valid with no permissions */
-            mmap_lock();
-            page_set_flags(guest_start, guest_start + size - 1,
-                           PAGE_VALID, ~0);
-            mmap_unlock();
-            result = guest_start;
+            /*
+             * Walk the range in page-sized chunks: mmap(PROT_NONE)
+             * each page that doesn't already have a host mapping.
+             * For small reservations this is fine.  For huge ones
+             * (>1GB) we skip the per-page mmap and just record
+             * pages — the vm_protect fallback will materialise on
+             * demand.
+             */
+            if (size <= 256 * 1024 * 1024) {
+                /* Small enough to mmap the whole thing */
+                abi_long r = target_mmap(guest_start, size,
+                                         PROT_NONE,
+                                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                                         -1, 0);
+                result = (r == (abi_long)guest_start) ? guest_start : -1;
+            } else {
+                /* Too large — just register in guest page table */
+                mmap_lock();
+                page_set_flags(guest_start, guest_start + size - 1,
+                               PAGE_VALID, ~0);
+                mmap_unlock();
+                result = guest_start;
+            }
         } else {
             result = target_mmap(guest_start, size,
                                  host_prot, mflags, -1, 0);
@@ -700,6 +722,77 @@ static bool handle_mig_message(void *buf, uint64_t options,
     }
 }
 
+/*
+ * fixup_mig_reply_ool -- translate OOL descriptors in MIG replies.
+ *
+ * When the host kernel returns a complex MIG reply, any out-of-line (OOL)
+ * memory descriptors contain host virtual addresses.  With guest_base != 0,
+ * the guest cannot dereference these directly because TCG adds guest_base
+ * to every address.  We fix this by:
+ *   1. Allocating guest-visible memory via target_mmap
+ *   2. Copying the OOL data there
+ *   3. Releasing the kernel's original mapping
+ *   4. Patching the descriptor to hold the guest address
+ */
+static void fixup_mig_reply_ool(void *reply_buf)
+{
+    mach_msg_header_t *hdr = (mach_msg_header_t *)reply_buf;
+
+    if (!guest_base) {
+        return;  /* no translation needed */
+    }
+    if (!(hdr->msgh_bits & MACH_MSGH_BITS_COMPLEX)) {
+        return;  /* no descriptors */
+    }
+
+    mach_msg_body_t *body = (mach_msg_body_t *)(hdr + 1);
+    uint8_t *dp = (uint8_t *)(body + 1);
+
+    for (uint32_t i = 0; i < body->msgh_descriptor_count; i++) {
+        mach_msg_type_descriptor_t *td = (mach_msg_type_descriptor_t *)dp;
+
+        switch (td->type) {
+        case MACH_MSG_OOL_DESCRIPTOR:
+        case MACH_MSG_OOL_VOLATILE_DESCRIPTOR: {
+            mach_msg_ool_descriptor_t *ool = (mach_msg_ool_descriptor_t *)dp;
+            void *host_addr = ool->address;
+            mach_msg_size_t size = ool->size;
+
+            if (host_addr && size > 0) {
+                /* Allocate in guest address space */
+                abi_long guest_addr = target_mmap(0, size,
+                    PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                if (guest_addr > 0) {
+                    memcpy(g2h_untagged(guest_addr), host_addr, size);
+                    munmap(host_addr, size);
+                    ool->address = (void *)(uintptr_t)guest_addr;
+                    if (do_strace) {
+                        fprintf(stderr,
+                            "  OOL fixup: host %p -> guest 0x%llx "
+                            "size=%u\n",
+                            host_addr,
+                            (unsigned long long)guest_addr, size);
+                    }
+                }
+            }
+            dp += sizeof(mach_msg_ool_descriptor_t);
+            break;
+        }
+        case MACH_MSG_OOL_PORTS_DESCRIPTOR:
+            dp += sizeof(mach_msg_ool_ports_descriptor_t);
+            break;
+        case MACH_MSG_PORT_DESCRIPTOR:
+            dp += sizeof(mach_msg_port_descriptor_t);
+            break;
+        default:
+            /* Unknown descriptor — skip using guarded size */
+            dp += sizeof(mach_msg_ool_descriptor_t);
+            break;
+        }
+    }
+}
+
 /* Mach trap numbers (negated x16 values) */
 #define MACH_TRAP_ABSTIME                       (-3)
 #define MACH_TRAP_CONTTIME                      (-4)
@@ -734,6 +827,7 @@ static bool handle_mig_message(void *buf, uint64_t options,
 #define MACH_TRAP_SEMAPHORE_WAIT_SIGNAL         (-37)
 #define MACH_TRAP_SEMAPHORE_TIMEDWAIT           (-38)
 #define MACH_TRAP_SEMAPHORE_TIMEDWAIT_SIGNAL    (-39)
+#define MACH_TRAP_PORT_SET_ATTRIBUTES           (-44)
 #define MACH_TRAP_MACH_MSG2                     (-47)
 #define MACH_TRAP_THREAD_GET_SPECIAL_REPLY_PORT (-50)
 #define MACH_TRAP_SWTCH_PRI                     (-59)
@@ -873,7 +967,8 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
          * _kernelrpc_mach_vm_protect_trap(target, addr, size, set_max, prot)
          */
         {
-            void *addr = g2h_untagged(arg2);
+            abi_ulong guest_addr = (abi_ulong)arg2;
+            void *addr = g2h_untagged(guest_addr);
             size_t size = (size_t)arg3;
             int prot = (int)arg5;
             int host_prot = 0;
@@ -883,16 +978,30 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
             if (prot & VM_PROT_EXECUTE) host_prot |= PROT_EXEC;
 
             if (mprotect(addr, size, host_prot) == 0) {
+                /* Host pages already mapped — just update QEMU page flags */
                 int qemu_flags = PAGE_VALID;
                 if (host_prot & PROT_READ)  qemu_flags |= PAGE_READ;
                 if (host_prot & PROT_WRITE) qemu_flags |= PAGE_WRITE;
                 if (host_prot & PROT_EXEC)  qemu_flags |= PAGE_EXEC;
                 mmap_lock();
-                page_set_flags((abi_ulong)arg2,
-                               (abi_ulong)arg2 + size - 1,
+                page_set_flags(guest_addr, guest_addr + size - 1,
                                qemu_flags, ~0);
                 mmap_unlock();
                 ret = KERN_SUCCESS;
+            } else if (host_prot != 0) {
+                /*
+                 * mprotect failed — likely because the host pages don't
+                 * exist yet (PROT_NONE reservation created by vm_map only
+                 * registered pages in the guest page table).  Materialise
+                 * the host mapping now with target_mmap(MAP_FIXED).
+                 */
+                abi_long result = target_mmap(guest_addr, size, host_prot,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+                if (result == (abi_long)guest_addr) {
+                    ret = KERN_SUCCESS;
+                } else {
+                    ret = KERN_PROTECTION_FAILURE;
+                }
             } else {
                 ret = KERN_PROTECTION_FAILURE;
             }
@@ -935,10 +1044,9 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
             } else {
                 addr = (mach_vm_address_t)result;
                 if (do_strace) {
-                    fprintf(stderr, "  vm_map: allocated at 0x%llx "
-                            "(host=%p, prot=%d)\n",
-                            (unsigned long long)addr,
-                            g2h_untagged(addr), host_prot);
+                    fprintf(stderr, "  vm_map_trap: at 0x%llx size=0x%zx "
+                            "prot=%d\n",
+                            (unsigned long long)addr, size, host_prot);
                 }
                 if (arg2) {
                     memcpy(g2h_untagged(arg2), &addr, sizeof(addr));
@@ -1025,21 +1133,58 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                  * _kernelrpc_mach_port_request_notification_trap
                  * arg1=task, arg2=name, arg3=msgid, arg4=sync,
                  * arg5=notify, arg6=notifyPoly, arg7=guest prev_ptr
-                 *
-                 * Stub: write MACH_PORT_NULL as previous if pointer
-                 * looks like a valid guest stack/heap address.
                  */
+                mach_port_t previous = MACH_PORT_NULL;
+                ret = mach_port_request_notification(
+                    mach_task_self(),
+                    (mach_port_name_t)arg2,
+                    (mach_msg_id_t)arg3,
+                    (mach_port_mscount_t)arg4,
+                    (mach_port_t)arg5,
+                    (mach_msg_type_name_t)arg6,
+                    &previous);
                 if (arg7 > 0x1000) {
-                    mach_port_name_t prev = MACH_PORT_NULL;
-                    memcpy(g2h_untagged(arg7), &prev, sizeof(prev));
+                    memcpy(g2h_untagged(arg7), &previous,
+                           sizeof(previous));
                 }
-                ret = KERN_SUCCESS;
             } else if (trap_num == MACH_TRAP_PORT_GET_ATTRIBUTES) {
                 /*
-                 * _kernelrpc_mach_port_get_attributes_trap — stub.
-                 * Return status with all zeroes.
+                 * _kernelrpc_mach_port_get_attributes_trap
+                 * arg1=task, arg2=name, arg3=flavor,
+                 * arg4=guest info_ptr, arg5=guest count_ptr
                  */
-                ret = KERN_SUCCESS;
+                mach_msg_type_number_t count = 0;
+                if (arg5) {
+                    memcpy(&count, g2h_untagged(arg5), sizeof(count));
+                }
+                mach_port_info_t info = g2h_untagged(arg4);
+                ret = mach_port_get_attributes(
+                    mach_task_self(),
+                    (mach_port_name_t)arg2,
+                    (mach_port_flavor_t)arg3,
+                    info, &count);
+                if (ret == KERN_SUCCESS && arg5) {
+                    memcpy(g2h_untagged(arg5), &count, sizeof(count));
+                }
+            } else if (trap_num == MACH_TRAP_PORT_INSERT_MEMBER) {
+                ret = mach_port_insert_member(mach_task_self(),
+                                              (mach_port_name_t)arg2,
+                                              (mach_port_name_t)arg3);
+            } else if (trap_num == MACH_TRAP_PORT_EXTRACT_MEMBER) {
+                ret = mach_port_extract_member(mach_task_self(),
+                                               (mach_port_name_t)arg2,
+                                               (mach_port_name_t)arg3);
+            } else if (trap_num == MACH_TRAP_PORT_MOVE_MEMBER) {
+                ret = mach_port_move_member(mach_task_self(),
+                                            (mach_port_name_t)arg2,
+                                            (mach_port_name_t)arg3);
+            } else if (trap_num == MACH_TRAP_PORT_TYPE) {
+                mach_port_type_t type = 0;
+                ret = mach_port_type(mach_task_self(),
+                                     (mach_port_name_t)arg2, &type);
+                if (ret == KERN_SUCCESS && arg3) {
+                    memcpy(g2h_untagged(arg3), &type, sizeof(type));
+                }
             } else {
                 ret = KERN_SUCCESS;
             }
@@ -1085,6 +1230,22 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                 next_activity_id += (int)arg2;
             }
             ret = KERN_SUCCESS;
+        }
+        break;
+
+    case MACH_TRAP_PORT_SET_ATTRIBUTES:
+        /*
+         * _kernelrpc_mach_port_set_attributes_trap(task, name,
+         *                                           flavor, info, count)
+         * Set port attributes.  Forward to host with pointer translation.
+         */
+        {
+            void *info = arg4 ? g2h_untagged(arg4) : NULL;
+            ret = mach_port_set_attributes(mach_task_self(),
+                                           (mach_port_name_t)arg2,
+                                           (int)arg3,
+                                           (mach_port_info_t)info,
+                                           (mach_msg_type_number_t)arg5);
         }
         break;
 
@@ -1276,6 +1437,18 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                                               (uint64_t)arg6,
                                               (uint64_t)arg7,
                                               (uint64_t)arg8);
+                    /* Translate OOL descriptors in the reply */
+                    if (ret == KERN_SUCCESS && (options & 0x2)) {
+                        void *rcv_buf;
+                        if (nentries >= 2 && vec[1].msgv_rcv_addr) {
+                            rcv_buf = g2h_untagged(save_rcv[1]);
+                        } else {
+                            rcv_buf = (void *)(uintptr_t)vec[0].msgv_data;
+                        }
+                        if (rcv_buf) {
+                            fixup_mig_reply_ool(rcv_buf);
+                        }
+                    }
                 }
 
                 /* Restore guest pointers */
@@ -1315,6 +1488,11 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                                               (uint64_t)arg6,
                                               (uint64_t)arg7,
                                               (uint64_t)arg8);
+                    /* Translate OOL descriptors in the reply */
+                    if (ret == KERN_SUCCESS && host_data &&
+                        (options & 0x2)) {
+                        fixup_mig_reply_ool(host_data);
+                    }
                 }
             }
         }

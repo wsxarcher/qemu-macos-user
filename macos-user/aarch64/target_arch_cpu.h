@@ -104,15 +104,21 @@ static inline G_NORETURN void target_cpu_loop(CPUARMState *env)
              * macOS syscall return convention:
              * Success: carry clear, result in X0
              * Error: carry set, errno in X0
+             *
+             * EJUSTRETURN: don't touch registers at all (used when
+             * the syscall handler set up registers itself, e.g.
+             * for workqueue thread re-dispatch).
              */
-            if (ret >= 0) {
-                env->CF = 0;
-                env->xregs[0] = ret;
+            if (ret == -TARGET_EJUSTRETURN) {
+                /* Already set up — don't touch registers */
             } else if (ret == -TARGET_ERESTART) {
                 /* Restart the syscall */
                 env->pc -= 4;
                 break;
-            } else if (ret != -TARGET_EJUSTRETURN) {
+            } else if (ret >= 0) {
+                env->CF = 0;
+                env->xregs[0] = ret;
+            } else {
                 /* Error case */
                 env->CF = 1;
                 env->xregs[0] = -ret;

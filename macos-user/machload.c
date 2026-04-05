@@ -238,7 +238,30 @@ static int load_macho_image(const char *filename, int fd,
                         mprotect((void *)(uintptr_t)seg_start,
                                  seg_end - seg_start, prot);
                     }
+                } else if (seg->vmsize > 0) {
+                    /*
+                     * Zero-fill segment (BSS / __DATA with filesize=0).
+                     * Must still be mapped so the guest can access it.
+                     */
+                    void *mapped = mmap(
+                        (void *)(uintptr_t)seg_start,
+                        seg_end - seg_start,
+                        PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                        -1, 0);
 
+                    if (mapped == MAP_FAILED) {
+                        perror("mmap zerofill segment");
+                        goto exit_read;
+                    }
+
+                    if (prot != (PROT_READ | PROT_WRITE)) {
+                        mprotect((void *)(uintptr_t)seg_start,
+                                 seg_end - seg_start, prot);
+                    }
+                }
+
+                if (seg->vmsize > 0) {
                     /*
                      * Register the mapping with QEMU's software page
                      * table so TCG can translate/access guest code+data.
