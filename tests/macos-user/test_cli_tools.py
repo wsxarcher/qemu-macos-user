@@ -1107,6 +1107,61 @@ int main(void) {
         self.assertEqual(rc, 0)
         self.assertIn(b"timer_fired=1", out)
 
+    # -- dlsym function pointer test (validates PAC disabled for arm64) -----
+    _DLSYM_FUNCPTR_SRC = r'''
+#include <stdio.h>
+#include <dlfcn.h>
+int main(void) {
+    void *cg = dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", RTLD_NOW);
+    if (!cg) { printf("FAIL: dlopen\n"); return 1; }
+    typedef int (*CGSMainConnFn)(void);
+    CGSMainConnFn fn = (CGSMainConnFn)dlsym(cg, "CGSMainConnectionID");
+    if (!fn) { printf("FAIL: dlsym\n"); return 1; }
+    printf("sym=%p\n", (void*)fn);
+    int cid = fn();
+    printf("cid=%d\n", cid);
+    printf("ok=%d\n", cid > 0);
+    return cid > 0 ? 0 : 1;
+}
+'''
+
+    def test_dlsym_function_pointer(self):
+        """dlsym returns callable function pointers (validates PAC disabled)."""
+        exe = _compile_framework_test("dlsym_funcptr",
+                                      self._DLSYM_FUNCPTR_SRC,
+                                      ["CoreGraphics"],
+                                      language="c")
+        rc, out, _ = _run_emulated(exe, timeout=10)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"ok=1", out)
+
+    # -- dispatch_async test (validates GCD workqueue threading) -------------
+    _DISPATCH_ASYNC_SRC = r'''
+#include <stdio.h>
+#include <unistd.h>
+#include <dispatch/dispatch.h>
+int main(void) {
+    __block int done = 0;
+    dispatch_queue_t q = dispatch_get_global_queue(0, 0);
+    dispatch_async(q, ^{
+        done = 1;
+    });
+    for (int i = 0; i < 50 && !done; i++) usleep(100000);
+    printf("dispatched=%d\n", done);
+    return done ? 0 : 1;
+}
+'''
+
+    def test_dispatch_async(self):
+        """GCD dispatch_async executes block on worker thread."""
+        exe = _compile_framework_test("dispatch_async",
+                                      self._DISPATCH_ASYNC_SRC,
+                                      [],
+                                      language="c")
+        rc, out, _ = _run_emulated(exe, timeout=10)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"dispatched=1", out)
+
 
 # ---------------------------------------------------------------------------
 # Helper: compile Objective-C / C test programs from source strings

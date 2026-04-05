@@ -557,6 +557,22 @@ int main(int argc, char **argv, char **envp)
         env->cp15.c14_cntfrq = 24000000;
     }
 
+    /*
+     * Disable Pointer Authentication (PAC) to match macOS arm64 behavior.
+     *
+     * The macOS kernel disables PAC for arm64 (non-arm64e) processes by
+     * clearing SCTLR_EL1.{EnIA,EnIB,EnDA,EnDB}.  This makes PACIA/PACIB
+     * instructions behave as NOPs — pointers are never signed.
+     *
+     * Without this, the arm64e shared cache code signs function pointers
+     * via PACIA/PACIB, and our arm64 guest code (which uses plain BLR
+     * without authentication) jumps to corrupted addresses with PAC bits
+     * still set in bits 48-55.
+     */
+    env->cp15.sctlr_el[1] &= ~(SCTLR_EnIA | SCTLR_EnIB |
+                                SCTLR_EnDA | SCTLR_EnDB);
+    arm_rebuild_hflags(env);
+
     thread_cpu = cpu;
 
     /* Initialize task state */
