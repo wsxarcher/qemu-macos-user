@@ -99,6 +99,13 @@ struct TaskState {
 
     /* This thread's sigaltstack, if it has one */
     struct target_sigaltstack sigaltstack_used;
+
+    /* Workqueue thread stack geometry (for thread parking/reuse) */
+    bool is_wq_thread;
+    abi_ulong wq_self_addr;
+    abi_ulong wq_stack_top;
+    abi_ulong wq_stack_bottom;
+    abi_ulong wq_tsd_base;
 } __attribute__((aligned(16)));
 
 abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,

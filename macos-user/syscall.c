@@ -107,6 +107,32 @@ static pthread_mutex_t workq_lock = PTHREAD_MUTEX_INITIALIZER;
 #define WQ_FLAG_THREAD_EVENT_MANAGER   0x00100000
 #define WQ_FLAG_THREAD_TSD_BASE_SET    0x00200000
 
+/*
+ * Parked workqueue thread — waiting to be re-dispatched.
+ *
+ * When a wq thread calls WQOPS_THREAD_RETURN, the real kernel parks
+ * it (blocks) rather than destroying it.  When new work arrives the
+ * kernel wakes a parked thread, sets up its registers, and returns
+ * to the wqthread entry point.  We emulate this with a condvar.
+ */
+typedef struct parked_wq_thread {
+    CPUArchState *env;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    bool has_work;
+    /* Stack geometry from original creation */
+    abi_ulong self_addr;
+    abi_ulong stack_top;
+    abi_ulong stack_bottom;
+    abi_ulong tsd_base;
+    /* New work parameters (set by dispatcher) */
+    uint32_t new_flags;
+    struct parked_wq_thread *next;
+} parked_wq_thread;
+
+static parked_wq_thread *parked_list = NULL;
+static pthread_mutex_t parked_lock = PTHREAD_MUTEX_INITIALIZER;
+
 typedef struct {
     CPUArchState *env;
     pthread_mutex_t mutex;
@@ -121,6 +147,10 @@ typedef struct {
     /* For workqueue threads */
     bool is_workqueue;
     int wq_flags;
+    abi_ulong wq_self_addr;
+    abi_ulong wq_stack_top;
+    abi_ulong wq_stack_bottom;
+    abi_ulong wq_tsd_base;
 } new_thread_info;
 
 static pthread_mutex_t clone_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -166,6 +196,28 @@ static void *guest_thread_func(void *arg)
     ts = get_task_state(cpu);
     ts->ts_tid = qemu_get_thread_id();
 
+    /*
+     * Save workqueue thread stack geometry in TaskState so
+     * WQOPS_THREAD_RETURN can park and later re-dispatch this thread
+     * without needing to remember the original creation parameters.
+     */
+    if (info->is_workqueue) {
+        ts->is_wq_thread = true;
+        ts->wq_self_addr = info->wq_self_addr;
+        ts->wq_stack_top = info->wq_stack_top;
+        ts->wq_stack_bottom = info->wq_stack_bottom;
+        ts->wq_tsd_base = info->wq_tsd_base;
+    }
+
+    /*
+     * Set x1 = mach_thread_self() for this thread.
+     * XNU sets kport to the new thread's own Mach port.
+     * We must call mach_thread_self() here (on the worker thread)
+     * rather than from the parent, otherwise os_unfair_lock sees the
+     * main thread's port and falsely detects recursion.
+     */
+    env->xregs[1] = (abi_ulong)mach_thread_self();
+
     /* Signal parent that we're ready */
     pthread_mutex_lock(&info->mutex);
     pthread_cond_broadcast(&info->cond);
@@ -191,7 +243,10 @@ static int create_guest_thread(CPUArchState *parent_env,
                                abi_ulong arg2, abi_ulong arg3,
                                abi_ulong arg4, abi_ulong arg5,
                                abi_ulong tsd_base,
-                               TaskState *parent_ts)
+                               TaskState *parent_ts,
+                               bool is_workqueue,
+                               abi_ulong wq_self, abi_ulong wq_stop,
+                               abi_ulong wq_sbot, abi_ulong wq_tsd)
 {
     CPUState *parent_cpu = env_cpu(parent_env);
     CPUArchState *new_env;
@@ -247,6 +302,11 @@ static int create_guest_thread(CPUArchState *parent_env,
     pthread_cond_init(&info.cond, NULL);
     info.env = new_env;
     info.parent_ts = parent_ts;
+    info.is_workqueue = is_workqueue;
+    info.wq_self_addr = wq_self;
+    info.wq_stack_top = wq_stop;
+    info.wq_stack_bottom = wq_sbot;
+    info.wq_tsd_base = wq_tsd;
 
     /* Create host thread */
     pthread_t thread_id;
@@ -1465,6 +1525,43 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
         }
         break;
 
+    /*
+     * ulock_wait / ulock_wake / ulock_wait2
+     *
+     * These implement os_unfair_lock and other user-space locking
+     * primitives.  The addr argument is a guest pointer to the lock
+     * word; we translate to a host address and forward to the real
+     * kernel so the futex-like wait/wake mechanism works correctly.
+     */
+    case TARGET_MACOS_NR_ulock_wait:
+        /* __ulock_wait(uint32_t op, void *addr, uint64_t value,
+         *              uint32_t timeout_us) */
+        ret = get_errno(syscall(SYS_ulock_wait,
+                                (uint32_t)arg1,
+                                g2h_untagged(arg2),
+                                (uint64_t)arg3,
+                                (uint32_t)arg4));
+        break;
+
+    case TARGET_MACOS_NR_ulock_wake:
+        /* __ulock_wake(uint32_t op, void *addr, uint64_t wake_value) */
+        ret = get_errno(syscall(SYS_ulock_wake,
+                                (uint32_t)arg1,
+                                g2h_untagged(arg2),
+                                (uint64_t)arg3));
+        break;
+
+    case TARGET_MACOS_NR_ulock_wait2:
+        /* __ulock_wait2(uint32_t op, void *addr, uint64_t value,
+         *               uint64_t timeout_ns, uint64_t value2) */
+        ret = get_errno(syscall(SYS_ulock_wait2,
+                                (uint32_t)arg1,
+                                g2h_untagged(arg2),
+                                (uint64_t)arg3,
+                                (uint64_t)arg4,
+                                (uint64_t)arg5));
+        break;
+
     case TARGET_MACOS_NR_bsdthread_ctl:
         /*
          * bsdthread_ctl(uint32_t cmd, uint64_t arg1, ...)
@@ -1518,13 +1615,14 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                 saved_threadstart,  /* PC = threadstart callback */
                 sp,
                 arg4 ? arg4 : stack_bottom, /* x0 = pthread_self */
-                mach_thread_self(),         /* x1 = kport */
+                0,                          /* x1 = kport (set by worker) */
                 arg1,                       /* x2 = start func */
                 arg2,                       /* x3 = start arg */
                 WQ_STACK_SIZE,              /* x4 = stacksize */
                 arg5,                       /* x5 = flags */
                 arg4 ? arg4 : stack_bottom, /* tsd_base = self */
-                parent_ts);
+                parent_ts,
+                false, 0, 0, 0, 0);        /* not a wq thread */
 
             if (rc < 0) {
                 ret = rc;
@@ -1771,40 +1869,74 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                 TaskState *parent_ts = get_task_state(
                     env_cpu((CPUArchState *)cpu_env));
 
-                if (do_strace) {
-                    fprintf(stderr, "  WQOPS_QUEUE_REQTHREADS: "
-                            "wqthread=0x%lx self=0x%lx "
-                            "sp=0x%lx stacklow=0x%lx "
-                            "tsd_base=0x%lx flags=0x%x\n",
-                            (unsigned long)saved_wqthread,
-                            (unsigned long)self_addr,
-                            (unsigned long)stack_top,
-                            (unsigned long)stack_bottom,
-                            (unsigned long)tsd_base,
-                            flags);
+                /*
+                 * Try to wake a parked thread first (reuse).
+                 * If none available, create a new one.
+                 */
+                parked_wq_thread *pw = NULL;
+                pthread_mutex_lock(&parked_lock);
+                if (parked_list) {
+                    pw = parked_list;
+                    parked_list = pw->next;
+                    pw->next = NULL;
                 }
+                pthread_mutex_unlock(&parked_lock);
 
-                int rc = create_guest_thread(
-                    (CPUArchState *)cpu_env,
-                    saved_wqthread,  /* PC = wqthread callback */
-                    stack_top,       /* SP */
-                    self_addr,       /* x0 = pthread_self */
-                    mach_thread_self(), /* x1 = kport */
-                    stack_bottom,    /* x2 = stacklowaddr */
-                    0,               /* x3 = keventlist (NULL) */
-                    flags,           /* x4 = flags */
-                    0,               /* x5 = nkevents */
-                    tsd_base,        /* TPIDRRO_EL0 */
-                    parent_ts);
-
-                if (do_strace) {
-                    fprintf(stderr, "  create_guest_thread: rc=%d\n", rc);
-                }
-
-                if (rc < 0) {
-                    ret = rc;
-                } else {
+                if (pw) {
+                    /* Reuse parked thread — use REUSE flag */
+                    uint32_t reuse_flags = (flags & ~WQ_FLAG_THREAD_TSD_BASE_SET)
+                                         | WQ_FLAG_THREAD_REUSE;
+                    if (do_strace) {
+                        fprintf(stderr, "  WQOPS_QUEUE_REQTHREADS: "
+                                "reuse parked thread "
+                                "self=0x%lx flags=0x%x\n",
+                                (unsigned long)pw->self_addr,
+                                reuse_flags);
+                    }
+                    pthread_mutex_lock(&pw->mutex);
+                    pw->new_flags = reuse_flags;
+                    pw->has_work = true;
+                    pthread_cond_signal(&pw->cond);
+                    pthread_mutex_unlock(&pw->mutex);
                     ret = 0;
+                } else {
+                    if (do_strace) {
+                        fprintf(stderr, "  WQOPS_QUEUE_REQTHREADS: "
+                                "wqthread=0x%lx self=0x%lx "
+                                "sp=0x%lx stacklow=0x%lx "
+                                "tsd_base=0x%lx flags=0x%x\n",
+                                (unsigned long)saved_wqthread,
+                                (unsigned long)self_addr,
+                                (unsigned long)stack_top,
+                                (unsigned long)stack_bottom,
+                                (unsigned long)tsd_base,
+                                flags);
+                    }
+
+                    int rc = create_guest_thread(
+                        (CPUArchState *)cpu_env,
+                        saved_wqthread,  /* PC = wqthread callback */
+                        stack_top,       /* SP */
+                        self_addr,       /* x0 = pthread_self */
+                        0,               /* x1 = kport (set by worker) */
+                        stack_bottom,    /* x2 = stacklowaddr */
+                        0,               /* x3 = keventlist (NULL) */
+                        flags,           /* x4 = flags */
+                        0,               /* x5 = nkevents */
+                        tsd_base,        /* TPIDRRO_EL0 */
+                        parent_ts,
+                        true, self_addr, stack_top,
+                        stack_bottom, tsd_base);
+
+                    if (do_strace) {
+                        fprintf(stderr, "  create_guest_thread: rc=%d\n", rc);
+                    }
+
+                    if (rc < 0) {
+                        ret = rc;
+                    } else {
+                        ret = 0;
+                    }
                 }
                 break;
             }
@@ -1812,17 +1944,69 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
             case WQOPS_THREAD_RETURN:
             case WQOPS_THREAD_KEVENT_RETURN:
             case WQOPS_THREAD_WORKLOOP_RETURN:
+            {
                 /*
-                 * Thread is done with work.  In a real kernel this
-                 * would park the thread or redirect it to new work.
-                 * The syscall never returns normally — libpthread has
-                 * a BRK (trap) right after the syscall as a safety net.
+                 * Thread is done with work.  The real kernel parks the
+                 * thread (blocks it) until new work arrives, rather than
+                 * destroying it.  We emulate this with a condvar wait.
                  *
-                 * We simply exit the host thread since a new one will
-                 * be created if more work arrives via WQOPS_QUEUE_REQTHREADS.
+                 * When WQOPS_QUEUE_REQTHREADS finds a parked thread,
+                 * it fills in new_flags and signals the condvar.  The
+                 * thread then re-enters the wqthread entry point with
+                 * WQ_FLAG_THREAD_REUSE set.
                  */
-                pthread_exit(NULL);
-                __builtin_unreachable();
+                parked_wq_thread pw;
+                memset(&pw, 0, sizeof(pw));
+                pthread_mutex_init(&pw.mutex, NULL);
+                pthread_cond_init(&pw.cond, NULL);
+                pw.env = (CPUArchState *)cpu_env;
+                pw.has_work = false;
+
+                /* Read stack geometry from TaskState */
+                TaskState *ts = get_task_state(
+                    env_cpu((CPUArchState *)cpu_env));
+                pw.self_addr = ts->wq_self_addr;
+                pw.stack_top = ts->wq_stack_top;
+                pw.stack_bottom = ts->wq_stack_bottom;
+                pw.tsd_base = ts->wq_tsd_base;
+
+                /* Add to parked list */
+                pthread_mutex_lock(&parked_lock);
+                pw.next = parked_list;
+                parked_list = &pw;
+                pthread_mutex_unlock(&parked_lock);
+
+                /* Wait for new work */
+                pthread_mutex_lock(&pw.mutex);
+                while (!pw.has_work) {
+                    pthread_cond_wait(&pw.cond, &pw.mutex);
+                }
+                pthread_mutex_unlock(&pw.mutex);
+
+                /* Re-dispatch: set up registers for wqthread re-entry */
+                CPUArchState *env = (CPUArchState *)cpu_env;
+                env->pc = saved_wqthread;
+                env->xregs[31] = pw.stack_top;
+                env->xregs[0] = pw.self_addr;
+                env->xregs[1] = (abi_ulong)mach_thread_self();
+                env->xregs[2] = pw.stack_bottom;
+                env->xregs[3] = 0;  /* keventlist */
+                env->xregs[4] = pw.new_flags;
+                env->xregs[5] = 0;  /* nkevents */
+                env->xregs[29] = 0; /* FP */
+                env->xregs[30] = 0; /* LR */
+
+                pthread_mutex_destroy(&pw.mutex);
+                pthread_cond_destroy(&pw.cond);
+
+                /*
+                 * Return EJUSTRETURN so the syscall return path does
+                 * not clobber our carefully set-up registers.
+                 * cpu_loop will resume at the new PC (wqthread entry).
+                 */
+                ret = -TARGET_EJUSTRETURN;
+                break;
+            }
 
             case WQOPS_SHOULD_NARROW:
                 /* Should we reduce thread count?  No. */
@@ -2011,6 +2195,18 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
             ret = get_errno(sysctlbyname(name_str, old_ptr,
                                          oldlen_ptr, new_ptr, (size_t)arg6));
         }
+        break;
+
+    case TARGET_MACOS_NR_getaudit_addr:
+        /*
+         * getaudit_addr(auditinfo_addr_t *auditinfo_addr, u_int length)
+         *
+         * Retrieve audit session state.  LaunchServices needs the
+         * audit session ID (ai_asid) to determine the login session.
+         * Forward to host kernel with guest→host pointer translation.
+         */
+        ret = get_errno(syscall(SYS_getaudit_addr,
+                                g2h_untagged(arg1), (unsigned int)arg2));
         break;
 
     case TARGET_MACOS_NR_csops:
