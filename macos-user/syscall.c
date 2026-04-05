@@ -12,6 +12,8 @@
 #include <sys/sysctl.h>
 #include <sys/syscall.h>
 #include <sys/socket.h>
+#include <sys/attr.h>
+#include <sys/mount.h>
 #include <poll.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
@@ -1645,6 +1647,152 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
             } else {
                 ret = get_errno(shm_open(name, (int)arg2, (mode_t)arg3));
                 unlock_user(name, arg1, 0);
+            }
+        }
+        break;
+
+    case TARGET_MACOS_NR_getdirentries64:
+        /*
+         * getdirentries64(fd, buf, bufsize, position)
+         * Returns directory entries in struct dirent format.
+         */
+        {
+            void *buf = lock_user(VERIFY_WRITE, arg2, arg3, 0);
+            if (!buf) {
+                ret = -TARGET_EFAULT;
+            } else {
+                /*
+                 * macOS getdirentries is __getdirentries64 under the hood.
+                 * Use the SYS_getdirentries64 syscall directly.
+                 */
+                off_t basep = 0;
+                ret = get_errno(syscall(SYS_getdirentries64,
+                                        (int)arg1, buf, arg3, &basep));
+                if (arg4 && ret >= 0) {
+                    *(uint64_t *)g2h_untagged(arg4) = basep;
+                }
+                unlock_user(buf, arg2, ret > 0 ? ret : 0);
+            }
+        }
+        break;
+
+    case TARGET_MACOS_NR_getattrlist:
+        /*
+         * getattrlist(path, attrlist, attrbuf, attrbufsize, options)
+         * Used by libc for various file operations.
+         */
+        {
+            char *path = lock_user_string(arg1);
+            void *attrlist = g2h_untagged(arg2);
+            void *attrbuf = lock_user(VERIFY_WRITE, arg3, arg4, 0);
+            if (!path || !attrbuf) {
+                ret = -TARGET_EFAULT;
+            } else {
+                ret = get_errno(getattrlist(path, attrlist,
+                                            attrbuf, arg4,
+                                            (unsigned int)arg5));
+            }
+            if (path) {
+                unlock_user(path, arg1, 0);
+            }
+            if (attrbuf) {
+                unlock_user(attrbuf, arg3, ret == 0 ? arg4 : 0);
+            }
+        }
+        break;
+
+    case TARGET_MACOS_NR_fgetattrlist:
+        /*
+         * fgetattrlist(fd, attrlist, attrbuf, attrbufsize, options)
+         */
+        {
+            void *attrlist = g2h_untagged(arg2);
+            void *attrbuf = lock_user(VERIFY_WRITE, arg3, arg4, 0);
+            if (!attrbuf) {
+                ret = -TARGET_EFAULT;
+            } else {
+                ret = get_errno(fgetattrlist((int)arg1, attrlist,
+                                             attrbuf, arg4,
+                                             (unsigned int)arg5));
+                unlock_user(attrbuf, arg3, ret == 0 ? arg4 : 0);
+            }
+        }
+        break;
+
+    case TARGET_MACOS_NR_setattrlist:
+        /*
+         * setattrlist(path, attrlist, attrbuf, attrbufsize, options)
+         */
+        {
+            char *path = lock_user_string(arg1);
+            void *attrlist = g2h_untagged(arg2);
+            void *attrbuf = g2h_untagged(arg3);
+            if (!path) {
+                ret = -TARGET_EFAULT;
+            } else {
+                ret = get_errno(setattrlist(path, attrlist,
+                                            attrbuf, arg4,
+                                            (unsigned int)arg5));
+                unlock_user(path, arg1, 0);
+            }
+        }
+        break;
+
+    case TARGET_MACOS_NR_getattrlistbulk:
+        /*
+         * getattrlistbulk(dirfd, attrlist, attrbuf, attrbufsize, options)
+         * Returns multiple directory entries with attributes.
+         */
+        {
+            void *attrlist = g2h_untagged(arg2);
+            void *attrbuf = lock_user(VERIFY_WRITE, arg3, arg4, 0);
+            if (!attrbuf) {
+                ret = -TARGET_EFAULT;
+            } else {
+                ret = get_errno(getattrlistbulk((int)arg1, attrlist,
+                                                attrbuf, arg4,
+                                                (uint64_t)arg5));
+                unlock_user(attrbuf, arg3, ret > 0 ? arg4 : 0);
+            }
+        }
+        break;
+
+    case TARGET_MACOS_NR_fstatfs64:
+        /*
+         * fstatfs64(fd, buf)
+         */
+        {
+            struct statfs host_buf;
+            ret = get_errno(fstatfs((int)arg1, &host_buf));
+            if (ret == 0) {
+                void *buf = lock_user(VERIFY_WRITE, arg2,
+                                      sizeof(struct statfs), 0);
+                if (!buf) {
+                    ret = -TARGET_EFAULT;
+                } else {
+                    memcpy(buf, &host_buf, sizeof(struct statfs));
+                    unlock_user(buf, arg2, sizeof(struct statfs));
+                }
+            }
+        }
+        break;
+
+    case TARGET_MACOS_NR_getfsstat64:
+        /*
+         * getfsstat64(buf, bufsize, flags)
+         */
+        {
+            if (arg1 == 0) {
+                /* Query count only */
+                ret = get_errno(getfsstat(NULL, 0, (int)arg3));
+            } else {
+                void *buf = lock_user(VERIFY_WRITE, arg1, arg2, 0);
+                if (!buf) {
+                    ret = -TARGET_EFAULT;
+                } else {
+                    ret = get_errno(getfsstat(buf, (int)arg2, (int)arg3));
+                    unlock_user(buf, arg1, arg2);
+                }
             }
         }
         break;
