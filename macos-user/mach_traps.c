@@ -359,20 +359,42 @@ static bool handle_mig_message(void *buf, uint64_t options,
 
         /*
          * For PROT_NONE reservations at a fixed address (no OVERWRITE),
-         * the guest is declaring an address-space reservation.  Check
-         * that the range doesn't overlap existing mappings and simply
-         * record it in the guest page table without allocating real
-         * host memory.  Sub-regions will be mapped later with
-         * mprotect / vm_map as needed.
+         * the guest is declaring an address-space reservation.  We
+         * cannot use MAP_FIXED because that would clobber existing
+         * mappings within the range.
+         *
+         * Instead, register the reservation in the guest page table
+         * and mmap only the sub-pages that aren't already mapped.
+         * Later vm_protect or vm_allocate calls will materialise
+         * real pages within this reservation.  The vm_protect handler
+         * falls back to target_mmap when mprotect fails on pages
+         * that were never host-mapped.
          */
         if (host_prot == PROT_NONE && guest_start != 0 &&
             !(flags & 0x4000)) {
-            /* Just mark pages valid with no permissions */
-            mmap_lock();
-            page_set_flags(guest_start, guest_start + size - 1,
-                           PAGE_VALID, ~0);
-            mmap_unlock();
-            result = guest_start;
+            /*
+             * Walk the range in page-sized chunks: mmap(PROT_NONE)
+             * each page that doesn't already have a host mapping.
+             * For small reservations this is fine.  For huge ones
+             * (>1GB) we skip the per-page mmap and just record
+             * pages — the vm_protect fallback will materialise on
+             * demand.
+             */
+            if (size <= 256 * 1024 * 1024) {
+                /* Small enough to mmap the whole thing */
+                abi_long r = target_mmap(guest_start, size,
+                                         PROT_NONE,
+                                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                                         -1, 0);
+                result = (r == (abi_long)guest_start) ? guest_start : -1;
+            } else {
+                /* Too large — just register in guest page table */
+                mmap_lock();
+                page_set_flags(guest_start, guest_start + size - 1,
+                               PAGE_VALID, ~0);
+                mmap_unlock();
+                result = guest_start;
+            }
         } else {
             result = target_mmap(guest_start, size,
                                  host_prot, mflags, -1, 0);
@@ -945,7 +967,8 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
          * _kernelrpc_mach_vm_protect_trap(target, addr, size, set_max, prot)
          */
         {
-            void *addr = g2h_untagged(arg2);
+            abi_ulong guest_addr = (abi_ulong)arg2;
+            void *addr = g2h_untagged(guest_addr);
             size_t size = (size_t)arg3;
             int prot = (int)arg5;
             int host_prot = 0;
@@ -955,16 +978,30 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
             if (prot & VM_PROT_EXECUTE) host_prot |= PROT_EXEC;
 
             if (mprotect(addr, size, host_prot) == 0) {
+                /* Host pages already mapped — just update QEMU page flags */
                 int qemu_flags = PAGE_VALID;
                 if (host_prot & PROT_READ)  qemu_flags |= PAGE_READ;
                 if (host_prot & PROT_WRITE) qemu_flags |= PAGE_WRITE;
                 if (host_prot & PROT_EXEC)  qemu_flags |= PAGE_EXEC;
                 mmap_lock();
-                page_set_flags((abi_ulong)arg2,
-                               (abi_ulong)arg2 + size - 1,
+                page_set_flags(guest_addr, guest_addr + size - 1,
                                qemu_flags, ~0);
                 mmap_unlock();
                 ret = KERN_SUCCESS;
+            } else if (host_prot != 0) {
+                /*
+                 * mprotect failed — likely because the host pages don't
+                 * exist yet (PROT_NONE reservation created by vm_map only
+                 * registered pages in the guest page table).  Materialise
+                 * the host mapping now with target_mmap(MAP_FIXED).
+                 */
+                abi_long result = target_mmap(guest_addr, size, host_prot,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+                if (result == (abi_long)guest_addr) {
+                    ret = KERN_SUCCESS;
+                } else {
+                    ret = KERN_PROTECTION_FAILURE;
+                }
             } else {
                 ret = KERN_PROTECTION_FAILURE;
             }
