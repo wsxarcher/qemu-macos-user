@@ -700,6 +700,77 @@ static bool handle_mig_message(void *buf, uint64_t options,
     }
 }
 
+/*
+ * fixup_mig_reply_ool -- translate OOL descriptors in MIG replies.
+ *
+ * When the host kernel returns a complex MIG reply, any out-of-line (OOL)
+ * memory descriptors contain host virtual addresses.  With guest_base != 0,
+ * the guest cannot dereference these directly because TCG adds guest_base
+ * to every address.  We fix this by:
+ *   1. Allocating guest-visible memory via target_mmap
+ *   2. Copying the OOL data there
+ *   3. Releasing the kernel's original mapping
+ *   4. Patching the descriptor to hold the guest address
+ */
+static void fixup_mig_reply_ool(void *reply_buf)
+{
+    mach_msg_header_t *hdr = (mach_msg_header_t *)reply_buf;
+
+    if (!guest_base) {
+        return;  /* no translation needed */
+    }
+    if (!(hdr->msgh_bits & MACH_MSGH_BITS_COMPLEX)) {
+        return;  /* no descriptors */
+    }
+
+    mach_msg_body_t *body = (mach_msg_body_t *)(hdr + 1);
+    uint8_t *dp = (uint8_t *)(body + 1);
+
+    for (uint32_t i = 0; i < body->msgh_descriptor_count; i++) {
+        mach_msg_type_descriptor_t *td = (mach_msg_type_descriptor_t *)dp;
+
+        switch (td->type) {
+        case MACH_MSG_OOL_DESCRIPTOR:
+        case MACH_MSG_OOL_VOLATILE_DESCRIPTOR: {
+            mach_msg_ool_descriptor_t *ool = (mach_msg_ool_descriptor_t *)dp;
+            void *host_addr = ool->address;
+            mach_msg_size_t size = ool->size;
+
+            if (host_addr && size > 0) {
+                /* Allocate in guest address space */
+                abi_long guest_addr = target_mmap(0, size,
+                    PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                if (guest_addr > 0) {
+                    memcpy(g2h_untagged(guest_addr), host_addr, size);
+                    munmap(host_addr, size);
+                    ool->address = (void *)(uintptr_t)guest_addr;
+                    if (do_strace) {
+                        fprintf(stderr,
+                            "  OOL fixup: host %p -> guest 0x%llx "
+                            "size=%u\n",
+                            host_addr,
+                            (unsigned long long)guest_addr, size);
+                    }
+                }
+            }
+            dp += sizeof(mach_msg_ool_descriptor_t);
+            break;
+        }
+        case MACH_MSG_OOL_PORTS_DESCRIPTOR:
+            dp += sizeof(mach_msg_ool_ports_descriptor_t);
+            break;
+        case MACH_MSG_PORT_DESCRIPTOR:
+            dp += sizeof(mach_msg_port_descriptor_t);
+            break;
+        default:
+            /* Unknown descriptor — skip using guarded size */
+            dp += sizeof(mach_msg_ool_descriptor_t);
+            break;
+        }
+    }
+}
+
 /* Mach trap numbers (negated x16 values) */
 #define MACH_TRAP_ABSTIME                       (-3)
 #define MACH_TRAP_CONTTIME                      (-4)
@@ -734,6 +805,7 @@ static bool handle_mig_message(void *buf, uint64_t options,
 #define MACH_TRAP_SEMAPHORE_WAIT_SIGNAL         (-37)
 #define MACH_TRAP_SEMAPHORE_TIMEDWAIT           (-38)
 #define MACH_TRAP_SEMAPHORE_TIMEDWAIT_SIGNAL    (-39)
+#define MACH_TRAP_PORT_SET_ATTRIBUTES           (-44)
 #define MACH_TRAP_MACH_MSG2                     (-47)
 #define MACH_TRAP_THREAD_GET_SPECIAL_REPLY_PORT (-50)
 #define MACH_TRAP_SWTCH_PRI                     (-59)
@@ -1088,6 +1160,22 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
         }
         break;
 
+    case MACH_TRAP_PORT_SET_ATTRIBUTES:
+        /*
+         * _kernelrpc_mach_port_set_attributes_trap(task, name,
+         *                                           flavor, info, count)
+         * Set port attributes.  Forward to host with pointer translation.
+         */
+        {
+            void *info = arg4 ? g2h_untagged(arg4) : NULL;
+            ret = mach_port_set_attributes(mach_task_self(),
+                                           (mach_port_name_t)arg2,
+                                           (int)arg3,
+                                           (mach_port_info_t)info,
+                                           (mach_msg_type_number_t)arg5);
+        }
+        break;
+
     case MACH_TRAP_HOST_CREATE_MACH_VOUCHER:
         /*
          * host_create_mach_voucher_trap(host, recipes, recipes_size,
@@ -1276,6 +1364,18 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                                               (uint64_t)arg6,
                                               (uint64_t)arg7,
                                               (uint64_t)arg8);
+                    /* Translate OOL descriptors in the reply */
+                    if (ret == KERN_SUCCESS && (options & 0x2)) {
+                        void *rcv_buf;
+                        if (nentries >= 2 && vec[1].msgv_rcv_addr) {
+                            rcv_buf = g2h_untagged(save_rcv[1]);
+                        } else {
+                            rcv_buf = (void *)(uintptr_t)vec[0].msgv_data;
+                        }
+                        if (rcv_buf) {
+                            fixup_mig_reply_ool(rcv_buf);
+                        }
+                    }
                 }
 
                 /* Restore guest pointers */
@@ -1315,6 +1415,11 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                                               (uint64_t)arg6,
                                               (uint64_t)arg7,
                                               (uint64_t)arg8);
+                    /* Translate OOL descriptors in the reply */
+                    if (ret == KERN_SUCCESS && host_data &&
+                        (options & 0x2)) {
+                        fixup_mig_reply_ool(host_data);
+                    }
                 }
             }
         }
