@@ -902,6 +902,114 @@ int main(void) {
         self.assertEqual(rc, 0)
         self.assertIn(b"graceful=YES", out)
 
+    # --- AppKit tests ---
+
+    _APPKIT_COLOR_SRC = r'''
+#import <AppKit/AppKit.h>
+#include <stdio.h>
+int main(void) {
+    @autoreleasepool {
+        NSColor *c = [NSColor colorWithRed:0.2 green:0.4 blue:0.6 alpha:0.8];
+        NSColor *rgb = [c colorUsingColorSpace:[NSColorSpace sRGBColorSpace]];
+        CGFloat r, g, b, a;
+        [rgb getRed:&r green:&g blue:&b alpha:&a];
+        printf("r=%.1f g=%.1f b=%.1f a=%.1f\n", r, g, b, a);
+    }
+    return 0;
+}
+'''
+
+    _APPKIT_BEZIERPATH_SRC = r'''
+#import <AppKit/AppKit.h>
+#include <stdio.h>
+int main(void) {
+    @autoreleasepool {
+        NSBezierPath *path = [NSBezierPath bezierPath];
+        [path moveToPoint:NSMakePoint(0, 0)];
+        [path lineToPoint:NSMakePoint(100, 100)];
+        [path lineToPoint:NSMakePoint(200, 0)];
+        [path closePath];
+        printf("elements=%ld\n", [path elementCount]);
+        printf("bounds=%.0f,%.0f,%.0f,%.0f\n",
+               [path bounds].origin.x, [path bounds].origin.y,
+               [path bounds].size.width, [path bounds].size.height);
+    }
+    return 0;
+}
+'''
+
+    _APPKIT_IMAGE_SRC = r'''
+#import <AppKit/AppKit.h>
+#include <stdio.h>
+int main(void) {
+    @autoreleasepool {
+        /* Trigger AppKit class initialization */
+        (void)[NSColor redColor];
+        NSImage *img = [[NSImage alloc] initWithSize:NSMakeSize(64, 64)];
+        printf("size=%.0fx%.0f\n", [img size].width, [img size].height);
+    }
+    return 0;
+}
+'''
+
+    _APPKIT_ATTRSTRING_SRC = r'''
+#import <AppKit/AppKit.h>
+#include <stdio.h>
+int main(void) {
+    @autoreleasepool {
+        /* Initialize AppKit subsystem first via NSColor */
+        (void)[NSColor redColor];
+        NSDictionary *attrs = @{
+            NSForegroundColorAttributeName: [NSColor redColor]
+        };
+        NSAttributedString *as = [[NSAttributedString alloc]
+            initWithString:@"Hello QEMU" attributes:attrs];
+        printf("len=%lu\n", (unsigned long)[as length]);
+        printf("str=%s\n", [[as string] UTF8String]);
+    }
+    return 0;
+}
+'''
+
+    def test_appkit_color(self):
+        """AppKit NSColor creation and color space conversion."""
+        exe = _compile_framework_test("appkit_color",
+                                      self._APPKIT_COLOR_SRC,
+                                      ["AppKit"])
+        rc, out, _ = _run_emulated(exe)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"r=0.2 g=0.4 b=0.6 a=0.8", out)
+
+    def test_appkit_bezierpath(self):
+        """AppKit NSBezierPath construction and bounds."""
+        exe = _compile_framework_test("appkit_bezierpath",
+                                      self._APPKIT_BEZIERPATH_SRC,
+                                      ["AppKit"])
+        rc, out, _ = _run_emulated(exe)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"elements=5", out)
+        # Path from (0,0)→(100,100)→(200,0) should have bounds 0,0,200,100
+        self.assertIn(b"bounds=0,0,200,100", out)
+
+    def test_appkit_image(self):
+        """AppKit NSImage creation."""
+        exe = _compile_framework_test("appkit_image",
+                                      self._APPKIT_IMAGE_SRC,
+                                      ["AppKit"])
+        rc, out, _ = _run_emulated(exe)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"size=64x64", out)
+
+    def test_appkit_attributedstring(self):
+        """AppKit NSAttributedString with color attribute."""
+        exe = _compile_framework_test("appkit_attrstr",
+                                      self._APPKIT_ATTRSTRING_SRC,
+                                      ["AppKit"])
+        rc, out, _ = _run_emulated(exe)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"len=10", out)
+        self.assertIn(b"str=Hello QEMU", out)
+
 
 # ---------------------------------------------------------------------------
 # Helper: compile Objective-C / C test programs from source strings
