@@ -64,6 +64,214 @@ static int get_workq_kqueue(void)
 }
 
 /*
+ * Workqueue thread support.
+ *
+ * macOS GCD (libdispatch) needs real threads to process async work.
+ * When dispatch_async is called, libdispatch registers kevent_qos
+ * events and requests threads via workq_kernreturn.  We create host
+ * threads using pthread_create, each running its own QEMU cpu_loop
+ * with a cloned CPU state.
+ *
+ * bsdthread_register saves the wqthread and threadstart callbacks.
+ * bsdthread_create spawns a thread calling threadstart.
+ * workq_kernreturn(WQOPS_QUEUE_REQTHREADS) spawns workqueue threads
+ * calling wqthread.
+ */
+#include "tcg/startup.h"
+#include "qemu/guest-random.h"
+
+static abi_ulong saved_threadstart;  /* from bsdthread_register arg1 */
+static abi_ulong saved_wqthread;     /* from bsdthread_register arg2 */
+static abi_ulong saved_pthsize;      /* from bsdthread_register arg3 */
+static uint32_t saved_tsd_offset;    /* from registration data +24 */
+static pthread_mutex_t workq_lock = PTHREAD_MUTEX_INITIALIZER;
+
+#define WQ_STACK_SIZE    (512 * 1024)  /* 512 KB per workqueue thread */
+
+#define WQOPS_THREAD_RETURN            0x004
+#define WQOPS_QUEUE_NEWSPISUPP         0x010
+#define WQOPS_QUEUE_REQTHREADS         0x020
+#define WQOPS_QUEUE_REQTHREADS2        0x030
+#define WQOPS_THREAD_KEVENT_RETURN     0x040
+#define WQOPS_SET_EVENT_MANAGER_PRIORITY 0x080
+#define WQOPS_THREAD_WORKLOOP_RETURN   0x100
+#define WQOPS_SHOULD_NARROW            0x200
+#define WQOPS_SETUP_DISPATCH           0x400
+
+/* WQ flags passed to wqthread */
+#define WQ_FLAG_THREAD_PRIO_QOS        0x00004000
+#define WQ_FLAG_THREAD_OVERCOMMIT      0x00010000
+#define WQ_FLAG_THREAD_REUSE           0x00020000
+#define WQ_FLAG_THREAD_NEWSPI          0x00040000
+#define WQ_FLAG_THREAD_KEVENT          0x00080000
+#define WQ_FLAG_THREAD_EVENT_MANAGER   0x00100000
+#define WQ_FLAG_THREAD_TSD_BASE_SET    0x00200000
+
+typedef struct {
+    CPUArchState *env;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    TaskState *parent_ts;
+    /* For bsdthread_create */
+    abi_ulong start_func;
+    abi_ulong func_arg;
+    abi_ulong stack;
+    abi_ulong pthread_self;
+    uint32_t flags;
+    /* For workqueue threads */
+    bool is_workqueue;
+    int wq_flags;
+} new_thread_info;
+
+static pthread_mutex_t clone_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/*
+ * Allocate a guest stack for a new thread.
+ * Returns the stack top (highest address, SP-aligned).
+ */
+static abi_ulong alloc_thread_stack(size_t size)
+{
+    abi_ulong addr;
+
+    mmap_lock();
+    addr = target_mmap(0, size, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    mmap_unlock();
+
+    if (addr == (abi_ulong)-1) {
+        return 0;
+    }
+    /* Stack grows down: return top of allocation */
+    return addr + size;
+}
+
+/*
+ * Host thread function for new guest threads.
+ * Clones CPU state and enters cpu_loop.
+ */
+static void *guest_thread_func(void *arg)
+{
+    new_thread_info *info = arg;
+    CPUArchState *env;
+    CPUState *cpu;
+    TaskState *ts;
+
+    rcu_register_thread();
+    tcg_register_thread();
+
+    env = info->env;
+    cpu = env_cpu(env);
+    thread_cpu = cpu;
+
+    ts = get_task_state(cpu);
+    ts->ts_tid = qemu_get_thread_id();
+
+    /* Signal parent that we're ready */
+    pthread_mutex_lock(&info->mutex);
+    pthread_cond_broadcast(&info->cond);
+    pthread_mutex_unlock(&info->mutex);
+
+    /* Wait for parent to finish setup */
+    pthread_mutex_lock(&clone_lock);
+    pthread_mutex_unlock(&clone_lock);
+
+    cpu_loop(env);
+    /* NOTREACHED */
+    return NULL;
+}
+
+/*
+ * Create a new guest thread.
+ * Sets up a cloned CPU with pc/sp/args and spawns a host thread.
+ * Returns 0 on success, -errno on failure.
+ */
+static int create_guest_thread(CPUArchState *parent_env,
+                               abi_ulong pc, abi_ulong sp,
+                               abi_ulong arg0, abi_ulong arg1,
+                               abi_ulong arg2, abi_ulong arg3,
+                               abi_ulong arg4, abi_ulong arg5,
+                               abi_ulong tsd_base,
+                               TaskState *parent_ts)
+{
+    CPUState *parent_cpu = env_cpu(parent_env);
+    CPUArchState *new_env;
+    CPUState *new_cpu;
+    TaskState *ts;
+    new_thread_info info;
+    pthread_attr_t attr;
+    int ret;
+
+    /* Grab clone lock so thread setup is atomic */
+    pthread_mutex_lock(&clone_lock);
+
+    /* Switch to parallel code generation on first additional thread */
+    begin_parallel_context(parent_cpu);
+
+    /* Clone the CPU */
+    new_env = cpu_copy(parent_env);
+    new_cpu = env_cpu(new_env);
+
+    /* Set up new task state */
+    ts = g_new0(TaskState, 1);
+    init_task_state(ts);
+    ts->bprm = parent_ts->bprm;
+    ts->info = parent_ts->info;
+    ts->signal_mask = parent_ts->signal_mask;
+    new_cpu->opaque = ts;
+
+    /* Set up the new thread's registers */
+    new_env->pc = pc;
+    new_env->xregs[0] = arg0;
+    new_env->xregs[1] = arg1;
+    new_env->xregs[2] = arg2;
+    new_env->xregs[3] = arg3;
+    new_env->xregs[4] = arg4;
+    new_env->xregs[5] = arg5;
+    new_env->xregs[29] = 0;  /* FP */
+    new_env->xregs[30] = 0;  /* LR — thread should never return */
+    if (sp) {
+        new_env->xregs[31] = sp;
+    }
+
+    /*
+     * Set up TPIDRRO_EL0 for the new thread.
+     * For workqueue threads, tsd_base = self + tsd_offset.
+     * The kernel sets this via thread_set_tsd_base().
+     */
+    new_env->cp15.tpidrro_el[0] = tsd_base;
+
+    /* Prepare thread info for synchronization */
+    memset(&info, 0, sizeof(info));
+    pthread_mutex_init(&info.mutex, NULL);
+    pthread_mutex_lock(&info.mutex);
+    pthread_cond_init(&info.cond, NULL);
+    info.env = new_env;
+    info.parent_ts = parent_ts;
+
+    /* Create host thread */
+    pthread_t thread_id;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 1024 * 1024);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+
+    ret = pthread_create(&thread_id, &attr, guest_thread_func, &info);
+    pthread_attr_destroy(&attr);
+
+    if (ret != 0) {
+        g_free(ts);
+        pthread_mutex_unlock(&clone_lock);
+        return -ret;
+    }
+
+    /* Wait for child to initialize */
+    pthread_cond_wait(&info.cond, &info.mutex);
+    pthread_mutex_unlock(&info.mutex);
+    pthread_mutex_unlock(&clone_lock);
+
+    return 0;
+}
+
+/*
  * On macOS with Cryptex volumes (macOS 13+), /System/Library/dyld/ does
  * not exist on the root volume.  The shared cache files live under the
  * Cryptex prefix.  dyld hardcodes the traditional path, so we redirect
@@ -1228,26 +1436,123 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
         /*
          * __semwait_signal(int cond_sem, int mutex_sem, int timeout,
          *                  int relative, int64_t tv_sec, int32_t tv_nsec)
-         * Used by pthread_cond_wait/timed-wait internals.  In our
-         * single-threaded model the condition can never be signalled
-         * by another thread, so return ETIMEDOUT for timed waits and
-         * EINTR for untimed ones to keep callers from blocking forever.
+         *
+         * Used by pthread_cond_wait/timed-wait internals.  The semaphore
+         * arguments are Mach port names.  We can't forward these to the
+         * host kernel because the port namespace is guest-local.
+         *
+         * If there's a timeout, sleep for the requested duration and
+         * return ETIMEDOUT.  Otherwise do a short sleep and return EINTR
+         * to let the caller retry.
          */
-        if (arg3 != 0) {
-            ret = -TARGET_ETIMEDOUT;
-        } else {
-            ret = -TARGET_EINTR;
+        {
+            int has_timeout = (int)arg3;
+            int64_t tv_sec = (int64_t)arg5;
+            int32_t tv_nsec = (int32_t)arg6;
+
+            if (has_timeout && (tv_sec > 0 || tv_nsec > 0)) {
+                struct timespec ts;
+                ts.tv_sec = tv_sec;
+                ts.tv_nsec = tv_nsec;
+                nanosleep(&ts, NULL);
+                ret = -TARGET_ETIMEDOUT;
+            } else {
+                /* Tiny sleep to avoid busy-spinning */
+                struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 };
+                nanosleep(&ts, NULL);
+                ret = -TARGET_EINTR;
+            }
         }
         break;
 
     case TARGET_MACOS_NR_bsdthread_ctl:
         /*
          * bsdthread_ctl(uint32_t cmd, uint64_t arg1, ...)
-         * Thread control for QoS, scheduling, etc.  Return 0 for
-         * all sub-commands — we're single-threaded and don't enforce
-         * QoS.
+         * Thread control for QoS, scheduling, etc.
          */
         ret = 0;
+        break;
+
+    case TARGET_MACOS_NR_bsdthread_create:
+        /*
+         * bsdthread_create(void *func, void *func_arg,
+         *                  void *stack, pthread_t thread, uint32_t flags)
+         *
+         * Creates a new BSD thread.  This is what pthread_create calls
+         * underneath.  The kernel creates a thread that enters at the
+         * threadstart callback (registered via bsdthread_register).
+         *
+         * threadstart(pthread_t self, mach_port_t kport,
+         *             void *(*start)(void *), void *arg,
+         *             size_t stacksize, unsigned int flags)
+         */
+        {
+            if (!saved_threadstart) {
+                ret = -TARGET_ENOTSUP;
+                break;
+            }
+
+            /* Allocate a guest stack */
+            abi_ulong stack_top = alloc_thread_stack(WQ_STACK_SIZE);
+            if (!stack_top) {
+                ret = -TARGET_ENOMEM;
+                break;
+            }
+            abi_ulong stack_bottom = stack_top - WQ_STACK_SIZE;
+            abi_ulong sp = stack_top & ~0xFULL;
+
+            TaskState *parent_ts = get_task_state(
+                env_cpu((CPUArchState *)cpu_env));
+
+            /*
+             * threadstart calling convention:
+             *   x0 = pthread_self (use the thread pointer arg4)
+             *   x1 = mach_thread_self port
+             *   x2 = start function (arg1)
+             *   x3 = start arg (arg2)
+             *   x4 = stacksize
+             *   x5 = flags (arg5)
+             */
+            int rc = create_guest_thread(
+                (CPUArchState *)cpu_env,
+                saved_threadstart,  /* PC = threadstart callback */
+                sp,
+                arg4 ? arg4 : stack_bottom, /* x0 = pthread_self */
+                mach_thread_self(),         /* x1 = kport */
+                arg1,                       /* x2 = start func */
+                arg2,                       /* x3 = start arg */
+                WQ_STACK_SIZE,              /* x4 = stacksize */
+                arg5,                       /* x5 = flags */
+                arg4 ? arg4 : stack_bottom, /* tsd_base = self */
+                parent_ts);
+
+            if (rc < 0) {
+                ret = rc;
+            } else {
+                /* Return the thread pointer to caller */
+                ret = 0;
+            }
+        }
+        break;
+
+    case TARGET_MACOS_NR_bsdthread_terminate:
+        /*
+         * bsdthread_terminate(void *stackaddr, size_t freesize,
+         *                     mach_port_t kport, mach_port_t joinsem)
+         *
+         * Thread termination.  Free the stack and exit the thread.
+         * For the main thread, this would exit the process.
+         */
+        {
+            /* Free the thread's stack if provided */
+            if (arg1 && arg2) {
+                mmap_lock();
+                target_munmap(arg1, arg2);
+                mmap_unlock();
+            }
+            /* Exit this thread (not the whole process) */
+            pthread_exit(NULL);
+        }
         break;
 
     case TARGET_MACOS_NR_bsdthread_register:
@@ -1255,8 +1560,10 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
          * __bsdthread_register(threadstart, wqthread, pthsize,
          *                      data, data_size, dispatch_queue_offset)
          *
-         * Registers pthread callbacks with the kernel.  We don't
-         * create kernel threads, but we must:
+         * Registers pthread callbacks with the kernel.  We save the
+         * callback pointers for use when creating workqueue threads.
+         *
+         * We must:
          *   1. Return the feature-flag bitmap (rv > 0).
          *   2. Fill in the "copy-out" fields of the registration struct.
          *
@@ -1272,6 +1579,21 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
          *  0x40000000  PTHREAD_FEATURE_QOS_DEFAULT
          */
         {
+            /* Save callback pointers for thread creation.
+             * Strip PAC bits — shared cache functions have upper-bit
+             * signatures on arm64e.  Keep only the lower 48 bits.
+             */
+            saved_threadstart = arg1 & 0x0000FFFFFFFFFFFFULL;
+            saved_wqthread = arg2 & 0x0000FFFFFFFFFFFFULL;
+            saved_pthsize = arg3;
+
+            if (do_strace) {
+                fprintf(stderr, "  bsdthread_register: threadstart=0x%lx "
+                        "wqthread=0x%lx pthsize=0x%lx\n",
+                        (unsigned long)arg1, (unsigned long)arg2,
+                        (unsigned long)arg3);
+            }
+
             /* Fill in copy-out fields if a data pointer was provided */
             if (arg4 && arg5 >= 24) {
                 /*
@@ -1289,6 +1611,15 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                  */
                 uint8_t *data = (uint8_t *)g2h_untagged(arg4);
                 uint64_t datasz = arg5;
+
+                /* Read tsd_offset from copy-in data */
+                if (datasz >= 28) {
+                    memcpy(&saved_tsd_offset, data + 24, 4);
+                    if (do_strace) {
+                        fprintf(stderr, "  bsdthread_register: "
+                                "tsd_offset=%u\n", saved_tsd_offset);
+                    }
+                }
 
                 /* main_qos = 0 (THREAD_QOS_UNSPECIFIED) */
                 if (datasz >= 24) {
@@ -1321,11 +1652,225 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
     case TARGET_MACOS_NR_workq_kernreturn:
         /*
          * workq_kernreturn(int options, void *item, int affinity, int prio)
-         * Kernel return for workqueue threads.  In our single-threaded
-         * emulator, workqueue threads are never actually created, so
-         * just return 0.
+         *
+         * Kernel interface for workqueue thread management.
+         * WQOPS_QUEUE_REQTHREADS: libdispatch requests N threads at a
+         *   given QoS priority.  We create one workqueue thread that
+         *   enters at the wqthread callback registered via bsdthread_register.
+         * WQOPS_THREAD_RETURN: workqueue thread is done, return to pool.
+         *   In our model the host thread exits.
          */
-        ret = 0;
+        {
+            int wq_op = (int)arg1;
+
+            if (do_strace) {
+                fprintf(stderr, "  workq_kernreturn: op=0x%x item=0x%lx "
+                        "aff=%d prio=%d\n",
+                        wq_op, (unsigned long)arg2, (int)arg3, (int)arg4);
+            }
+
+            switch (wq_op) {
+            case WQOPS_QUEUE_REQTHREADS:
+            case WQOPS_QUEUE_REQTHREADS2:
+            {
+                /*
+                 * arg2 = reqcount (number of threads requested)
+                 * arg3 = priority / QoS class
+                 *
+                 * Create one workqueue thread.  The thread enters at
+                 * the wqthread callback with:
+                 *   x0 = pthread_self (we allocate a fake one)
+                 *   x1 = mach_thread_self port
+                 *   x2 = stack bottom address
+                 *   x3 = NULL (keventlist, for non-kevent threads)
+                 *   x4 = flags (WQ_FLAG_THREAD_NEWSPI)
+                 *   x5 = 0 (nkevents)
+                 */
+                if (!saved_wqthread) {
+                    ret = -TARGET_ENOTSUP;
+                    break;
+                }
+
+                /*
+                 * Allocate the workqueue thread stack region.
+                 *
+                 * XNU layout (from workq_thread_get_addrs):
+                 *   stackaddr  = base of allocation
+                 *   guard page = stackaddr .. + guardsize
+                 *   usable stack = guard .. + PTH_DEFAULT_STACKSIZE
+                 *   gap (arm64) = 12 KB (PTHREAD_T_OFFSET)
+                 *   self       = stackaddr + guard + stacksz + gap
+                 *   stack_top  = self & ~0xF
+                 *   stack_bottom = stackaddr + guard
+                 *
+                 * total = guard + stacksz + gap + pthsize
+                 */
+                size_t page_sz = qemu_real_host_page_size();
+                size_t guardsize = page_sz;
+#define PTH_DEFAULT_STACKSZ (512 * 1024)
+#define PTHREAD_T_OFFSET_ARM64 (12 * 1024)
+                size_t pthsize = saved_pthsize ? saved_pthsize : 0x4000;
+                size_t total = guardsize + PTH_DEFAULT_STACKSZ
+                             + PTHREAD_T_OFFSET_ARM64 + pthsize;
+
+                mmap_lock();
+                abi_ulong stackaddr = target_mmap(0, total,
+                    PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                mmap_unlock();
+
+                if (stackaddr == (abi_ulong)-1) {
+                    ret = -TARGET_ENOMEM;
+                    break;
+                }
+
+                /* Mark guard page as inaccessible */
+                mmap_lock();
+                target_mprotect(stackaddr, guardsize, PROT_NONE);
+                mmap_unlock();
+
+                abi_ulong stack_bottom = stackaddr + guardsize;
+                abi_ulong self_addr = stackaddr + guardsize
+                                    + PTH_DEFAULT_STACKSZ
+                                    + PTHREAD_T_OFFSET_ARM64;
+                abi_ulong stack_top = self_addr & ~(abi_ulong)0xF;
+
+                /*
+                 * TSD base = self + tsd_offset.
+                 * The kernel calls thread_set_tsd_base() with this value
+                 * which sets TPIDRRO_EL0 on the new thread.
+                 */
+                abi_ulong tsd_base = self_addr;
+                if (saved_tsd_offset) {
+                    tsd_base = self_addr + saved_tsd_offset;
+                }
+
+                /*
+                 * Build flags for the upcall.
+                 *
+                 * The priority (arg4 = prio param) is a pthread_priority_t.
+                 * QoS is encoded one-hot in bits 8-13:
+                 *   qos = __builtin_ffs((pp & 0x3F00) >> 8)
+                 * The kernel constructs upcall flags:
+                 *   flags = WQ_FLAG_THREAD_NEWSPI | qos | WQ_FLAG_THREAD_PRIO_QOS
+                 *
+                 * We also add WQ_FLAG_THREAD_TSD_BASE_SET since we set
+                 * TPIDRRO_EL0 ourselves.
+                 */
+                uint32_t pp = (uint32_t)arg4;
+                uint32_t qos_bits = (pp & 0x00003F00) >> 8;
+                uint32_t qos = qos_bits ? __builtin_ffs(qos_bits) : 4;
+                uint32_t flags = WQ_FLAG_THREAD_NEWSPI
+                               | WQ_FLAG_THREAD_TSD_BASE_SET
+                               | WQ_FLAG_THREAD_PRIO_QOS
+                               | qos;
+                if (pp & 0x80000000) {  /* _PTHREAD_PRIORITY_OVERCOMMIT_FLAG */
+                    flags |= WQ_FLAG_THREAD_OVERCOMMIT;
+                }
+
+                TaskState *parent_ts = get_task_state(
+                    env_cpu((CPUArchState *)cpu_env));
+
+                if (do_strace) {
+                    fprintf(stderr, "  WQOPS_QUEUE_REQTHREADS: "
+                            "wqthread=0x%lx self=0x%lx "
+                            "sp=0x%lx stacklow=0x%lx "
+                            "tsd_base=0x%lx flags=0x%x\n",
+                            (unsigned long)saved_wqthread,
+                            (unsigned long)self_addr,
+                            (unsigned long)stack_top,
+                            (unsigned long)stack_bottom,
+                            (unsigned long)tsd_base,
+                            flags);
+                }
+
+                int rc = create_guest_thread(
+                    (CPUArchState *)cpu_env,
+                    saved_wqthread,  /* PC = wqthread callback */
+                    stack_top,       /* SP */
+                    self_addr,       /* x0 = pthread_self */
+                    mach_thread_self(), /* x1 = kport */
+                    stack_bottom,    /* x2 = stacklowaddr */
+                    0,               /* x3 = keventlist (NULL) */
+                    flags,           /* x4 = flags */
+                    0,               /* x5 = nkevents */
+                    tsd_base,        /* TPIDRRO_EL0 */
+                    parent_ts);
+
+                if (do_strace) {
+                    fprintf(stderr, "  create_guest_thread: rc=%d\n", rc);
+                }
+
+                if (rc < 0) {
+                    ret = rc;
+                } else {
+                    ret = 0;
+                }
+                break;
+            }
+
+            case WQOPS_THREAD_RETURN:
+            case WQOPS_THREAD_KEVENT_RETURN:
+            case WQOPS_THREAD_WORKLOOP_RETURN:
+                /*
+                 * Thread is done with work.  In a real kernel this
+                 * would park the thread or redirect it to new work.
+                 * The syscall never returns normally — libpthread has
+                 * a BRK (trap) right after the syscall as a safety net.
+                 *
+                 * We simply exit the host thread since a new one will
+                 * be created if more work arrives via WQOPS_QUEUE_REQTHREADS.
+                 */
+                pthread_exit(NULL);
+                __builtin_unreachable();
+
+            case WQOPS_SHOULD_NARROW:
+                /* Should we reduce thread count?  No. */
+                ret = 0;
+                break;
+
+            case WQOPS_QUEUE_NEWSPISUPP:
+                /*
+                 * Query for newer SPI support.  arg2 = feature key.
+                 * Return 0 to indicate we support the new SPI.
+                 */
+                ret = 0;
+                break;
+
+            case WQOPS_SET_EVENT_MANAGER_PRIORITY:
+                /* Set event manager priority — just acknowledge. */
+                ret = 0;
+                break;
+
+            case WQOPS_SETUP_DISPATCH:
+            {
+                /*
+                 * libdispatch calls this to register its config struct.
+                 * arg2 = pointer to workq_dispatch_config
+                 * arg3 = sizeof(workq_dispatch_config)
+                 *
+                 * We acknowledge it and store nothing — the real kernel
+                 * uses this for serialno / label offsets in workloop
+                 * kqueues.  We don't emulate that yet.
+                 */
+                if (do_strace) {
+                    fprintf(stderr, "  WQOPS_SETUP_DISPATCH: "
+                            "config=0x%lx size=%d\n",
+                            (unsigned long)arg2, (int)arg3);
+                }
+                ret = 0;
+                break;
+            }
+
+            default:
+                if (do_strace) {
+                    fprintf(stderr, "  workq_kernreturn: unknown op 0x%x\n",
+                            wq_op);
+                }
+                ret = 0;
+                break;
+            }
+        }
         break;
 
     /*

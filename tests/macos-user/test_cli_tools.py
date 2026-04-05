@@ -816,13 +816,40 @@ int main(void) {
     _PTHREAD_CREATE_SRC = r'''
 #include <stdio.h>
 #include <pthread.h>
+static void *thread_func(void *arg) {
+    int *val = (int *)arg;
+    *val = 42;
+    return NULL;
+}
 int main(void) {
     pthread_t t;
-    int rc = pthread_create(&t, NULL, NULL, NULL);
-    /* Expect EAGAIN (35) or ENOTSUP in single-threaded emulator */
+    int result = 0;
+    int rc = pthread_create(&t, NULL, thread_func, &result);
     printf("rc=%d\n", rc);
-    printf("graceful=%s\n", rc != 0 ? "YES" : "NO");
+    if (rc == 0) {
+        pthread_join(t, NULL);
+        printf("thread_result=%d\n", result);
+    }
     return 0;
+}
+'''
+
+    _DISPATCH_ASYNC_SRC = r'''
+#include <stdio.h>
+#include <unistd.h>
+#include <dispatch/dispatch.h>
+int main(void) {
+    __block int done = 0;
+    dispatch_queue_t q = dispatch_get_global_queue(
+            DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
+    dispatch_async(q, ^{
+        printf("async_block_ran=YES\n");
+        done = 1;
+    });
+    for (int i = 0; i < 100 && !done; i++)
+        usleep(50000);
+    printf("done=%d\n", done);
+    return done ? 0 : 1;
 }
 '''
 
@@ -893,14 +920,24 @@ int main(void) {
         self.assertIn(b"result=42", out)
         self.assertIn(b"nested=99", out)
 
-    def test_pthread_create_graceful(self):
-        """pthread_create returns error gracefully (single-threaded mode)."""
+    def test_pthread_create(self):
+        """pthread_create with a real thread function."""
         exe = _compile_framework_test("pthread_create",
                                       self._PTHREAD_CREATE_SRC,
                                       [], "c")
         rc, out, _ = _run_emulated(exe)
         self.assertEqual(rc, 0)
-        self.assertIn(b"graceful=YES", out)
+        self.assertIn(b"rc=0", out)
+
+    def test_dispatch_async(self):
+        """dispatch_async on a global concurrent queue (GCD workqueue)."""
+        exe = _compile_framework_test("dispatch_async",
+                                      self._DISPATCH_ASYNC_SRC,
+                                      [], "c")
+        rc, out, _ = _run_emulated(exe, timeout=15)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"async_block_ran=YES", out)
+        self.assertIn(b"done=1", out)
 
     # --- AppKit tests ---
 
