@@ -41,6 +41,7 @@
 #include "target_arch_cpu.h"
 
 #include <mach-o/loader.h>
+#include <mach-o/fat.h>
 
 uintptr_t qemu_host_page_size;
 intptr_t qemu_host_page_mask;
@@ -556,14 +557,44 @@ int main(int argc, char **argv, char **envp)
         int peek_fd = open(filename, O_RDONLY);
         bool is_dynamic = false;
         if (peek_fd >= 0) {
+            /*
+             * Handle FAT (universal) binaries: skip to the arm64 slice.
+             */
+            uint32_t magic;
+            off_t mh_offset = 0;
+            if (read(peek_fd, &magic, sizeof(magic)) == sizeof(magic)) {
+                if (magic == FAT_CIGAM || magic == FAT_MAGIC) {
+                    /* FAT binary — find arm64 slice offset */
+                    uint32_t narch;
+                    if (read(peek_fd, &narch, 4) == 4) {
+                        narch = ntohl(narch);
+                        for (uint32_t i = 0; i < narch; i++) {
+                            struct fat_arch fa;
+                            if (read(peek_fd, &fa, sizeof(fa))
+                                != sizeof(fa)) {
+                                break;
+                            }
+                            cpu_type_t ct = (cpu_type_t)ntohl(fa.cputype);
+                            if (ct == CPU_TYPE_ARM64) {
+                                mh_offset = ntohl(fa.offset);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            lseek(peek_fd, mh_offset, SEEK_SET);
+
             struct mach_header_64 mh;
-            if (read(peek_fd, &mh, sizeof(mh)) == sizeof(mh)) {
+            if (read(peek_fd, &mh, sizeof(mh)) == sizeof(mh) &&
+                mh.magic == MH_MAGIC_64) {
                 uint8_t *cmdbuf = g_malloc(mh.sizeofcmds);
                 if (read(peek_fd, cmdbuf, mh.sizeofcmds) ==
                     (ssize_t)mh.sizeofcmds) {
                     uint8_t *p = cmdbuf;
                     for (uint32_t ci = 0; ci < mh.ncmds; ci++) {
-                        struct load_command *lc = (struct load_command *)p;
+                        struct load_command *lc =
+                            (struct load_command *)p;
                         if (lc->cmd == LC_LOAD_DYLINKER) {
                             is_dynamic = true;
                             break;
