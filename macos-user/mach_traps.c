@@ -717,8 +717,10 @@ static bool handle_mig_message(void *buf, uint64_t options,
 #define MACH_TRAP_PORT_EXTRACT_MEMBER           (-23)
 #define MACH_TRAP_PORT_CONSTRUCT                (-24)
 #define MACH_TRAP_PORT_DESTRUCT                 (-25)
-#define MACH_TRAP_PORT_REQUEST_NOTIFICATION     (-70)
-#define MACH_TRAP_PORT_GET_ATTRIBUTES           (-71)
+#define MACH_TRAP_PORT_GET_ATTRIBUTES           (-40)
+#define MACH_TRAP_PORT_GUARD                    (-41)
+#define MACH_TRAP_PORT_UNGUARD                  (-42)
+#define MACH_TRAP_GENERATE_ACTIVITY_ID          (-43)
 #define MACH_TRAP_REPLY_PORT                    (-26)
 #define MACH_TRAP_THREAD_SELF                   (-27)
 #define MACH_TRAP_TASK_SELF                     (-28)
@@ -727,13 +729,19 @@ static bool handle_mig_message(void *buf, uint64_t options,
 #define MACH_TRAP_MACH_MSG_OVERWRITE            (-32)
 #define MACH_TRAP_SEMAPHORE_SIGNAL              (-33)
 #define MACH_TRAP_SEMAPHORE_SIGNAL_ALL          (-34)
+#define MACH_TRAP_SEMAPHORE_SIGNAL_THREAD       (-35)
 #define MACH_TRAP_SEMAPHORE_WAIT                (-36)
+#define MACH_TRAP_SEMAPHORE_WAIT_SIGNAL         (-37)
+#define MACH_TRAP_SEMAPHORE_TIMEDWAIT           (-38)
+#define MACH_TRAP_SEMAPHORE_TIMEDWAIT_SIGNAL    (-39)
 #define MACH_TRAP_MACH_MSG2                     (-47)
 #define MACH_TRAP_THREAD_GET_SPECIAL_REPLY_PORT (-50)
 #define MACH_TRAP_SWTCH_PRI                     (-59)
 #define MACH_TRAP_SWTCH                         (-60)
 #define MACH_TRAP_SYSCALL_THREAD_SWITCH         (-61)
+#define MACH_TRAP_HOST_CREATE_MACH_VOUCHER      (-70)
 #define MACH_TRAP_PORT_TYPE                     (-76)
+#define MACH_TRAP_PORT_REQUEST_NOTIFICATION     (-77)
 #define MACH_TRAP_TIMEBASE_INFO                 (-89)
 #define MACH_TRAP_WAIT_UNTIL                    (-90)
 #define MACH_TRAP_MK_TIMER_CREATE               (-91)
@@ -1038,6 +1046,68 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
         }
         break;
 
+    case MACH_TRAP_PORT_GUARD:
+    case MACH_TRAP_PORT_UNGUARD:
+        /*
+         * _kernelrpc_mach_port_guard_trap(task, name, guard, strict)
+         * _kernelrpc_mach_port_unguard_trap(task, name, guard)
+         * Port guarding is advisory protection.  Forward to host,
+         * but tolerate all errors — guarding doesn't affect
+         * functional correctness.
+         */
+        if (trap_num == MACH_TRAP_PORT_GUARD) {
+            ret = mach_port_guard(mach_task_self(),
+                                  (mach_port_name_t)arg2,
+                                  (mach_port_context_t)arg3,
+                                  (boolean_t)arg4);
+        } else {
+            ret = mach_port_unguard(mach_task_self(),
+                                    (mach_port_name_t)arg2,
+                                    (mach_port_context_t)arg3);
+        }
+        if (ret != KERN_SUCCESS) {
+            ret = KERN_SUCCESS;
+        }
+        break;
+
+    case MACH_TRAP_GENERATE_ACTIVITY_ID:
+        /*
+         * mach_generate_activity_id(mach_port_t target, int count,
+         *                           uint64_t *activity_id)
+         * Generate activity IDs for diagnostics/tracing.  We generate
+         * sequential IDs without going to the kernel.
+         */
+        {
+            static uint64_t next_activity_id = 1;
+            if (arg3) {
+                uint64_t *out = (uint64_t *)g2h_untagged(arg3);
+                *out = next_activity_id;
+                next_activity_id += (int)arg2;
+            }
+            ret = KERN_SUCCESS;
+        }
+        break;
+
+    case MACH_TRAP_HOST_CREATE_MACH_VOUCHER:
+        /*
+         * host_create_mach_voucher_trap(host, recipes, recipes_size,
+         *                               voucher_ptr)
+         * Create a Mach voucher for resource accounting.  Forward to
+         * host kernel with pointer translation.
+         */
+        {
+            void *recipes = arg2 ? g2h_untagged(arg2) : NULL;
+            mach_port_name_t voucher = MACH_PORT_NULL;
+            ret = host_create_mach_voucher(mach_host_self(),
+                                            (mach_voucher_attr_raw_recipe_array_t)recipes,
+                                            (mach_msg_type_number_t)arg3,
+                                            &voucher);
+            if (ret == KERN_SUCCESS && arg4) {
+                memcpy(g2h_untagged(arg4), &voucher, sizeof(voucher));
+            }
+        }
+        break;
+
     case MACH_TRAP_MACH_MSG:
     case MACH_TRAP_MACH_MSG_OVERWRITE:
         /*
@@ -1142,14 +1212,35 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
 
     case MACH_TRAP_SEMAPHORE_SIGNAL:
     case MACH_TRAP_SEMAPHORE_SIGNAL_ALL:
+    case MACH_TRAP_SEMAPHORE_SIGNAL_THREAD:
     case MACH_TRAP_SEMAPHORE_WAIT:
+    case MACH_TRAP_SEMAPHORE_WAIT_SIGNAL:
+    case MACH_TRAP_SEMAPHORE_TIMEDWAIT:
+    case MACH_TRAP_SEMAPHORE_TIMEDWAIT_SIGNAL:
         /* Semaphore operations — forward to host */
         if (trap_num == MACH_TRAP_SEMAPHORE_SIGNAL) {
             ret = semaphore_signal((semaphore_t)arg1);
         } else if (trap_num == MACH_TRAP_SEMAPHORE_SIGNAL_ALL) {
             ret = semaphore_signal_all((semaphore_t)arg1);
-        } else {
+        } else if (trap_num == MACH_TRAP_SEMAPHORE_SIGNAL_THREAD) {
+            ret = semaphore_signal_thread((semaphore_t)arg1,
+                                          (thread_t)arg2);
+        } else if (trap_num == MACH_TRAP_SEMAPHORE_WAIT) {
             ret = semaphore_wait((semaphore_t)arg1);
+        } else if (trap_num == MACH_TRAP_SEMAPHORE_WAIT_SIGNAL) {
+            ret = semaphore_wait_signal((semaphore_t)arg1,
+                                        (semaphore_t)arg2);
+        } else if (trap_num == MACH_TRAP_SEMAPHORE_TIMEDWAIT) {
+            mach_timespec_t ts;
+            ts.tv_sec = (unsigned int)arg2;
+            ts.tv_nsec = (clock_res_t)arg3;
+            ret = semaphore_timedwait((semaphore_t)arg1, ts);
+        } else {
+            mach_timespec_t ts;
+            ts.tv_sec = (unsigned int)arg3;
+            ts.tv_nsec = (clock_res_t)arg4;
+            ret = semaphore_timedwait_signal((semaphore_t)arg1,
+                                             (semaphore_t)arg2, ts);
         }
         break;
 

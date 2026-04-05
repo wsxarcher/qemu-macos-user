@@ -14,6 +14,7 @@
 #include <sys/socket.h>
 #include <sys/attr.h>
 #include <sys/mount.h>
+#include <sys/event.h>
 #include <poll.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
@@ -27,6 +28,40 @@
 
 /* csops is a private syscall, declare it here */
 extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
+
+/*
+ * Private kevent_qos_s structure (not in public headers).
+ * Used by kevent_qos (syscall 374) and kevent_id (syscall 375).
+ */
+struct kevent_qos_s {
+    uint64_t ident;
+    int16_t  filter;
+    uint16_t flags;
+    int32_t  qos;
+    uint64_t udata;
+    uint32_t fflags;
+    uint32_t xflags;
+    int64_t  data;
+    uint64_t ext[4];
+};
+
+#define KEVENT_FLAG_WORKQ      0x0020
+#define KEVENT_FLAG_WORKLOOP   0x0100
+
+/*
+ * Workqueue kqueue fd.  libdispatch calls kevent_qos with fd=-1 and
+ * KEVENT_FLAG_WORKQ; the real kernel routes those to the per-process
+ * workqueue kqueue.  We emulate this with a normal kqueue fd.
+ */
+static int workq_kqueue_fd = -1;
+
+static int get_workq_kqueue(void)
+{
+    if (workq_kqueue_fd < 0) {
+        workq_kqueue_fd = kqueue();
+    }
+    return workq_kqueue_fd;
+}
 
 /*
  * On macOS with Cryptex volumes (macOS 13+), /System/Library/dyld/ does
@@ -1217,10 +1252,78 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
 
     case TARGET_MACOS_NR_bsdthread_register:
         /*
-         * __bsdthread_register(threadstart, wqthread, pthsize, ...)
-         * Registers pthread callbacks with the kernel.  We're
-         * single-threaded and don't create kernel threads, so just
-         * return success.
+         * __bsdthread_register(threadstart, wqthread, pthsize,
+         *                      data, data_size, dispatch_queue_offset)
+         *
+         * Registers pthread callbacks with the kernel.  We don't
+         * create kernel threads, but we must:
+         *   1. Return the feature-flag bitmap (rv > 0).
+         *   2. Fill in the "copy-out" fields of the registration struct.
+         *
+         * Feature bits (from kern_internal.h):
+         *   0x01  PTHREAD_FEATURE_DISPATCHFUNC
+         *   0x02  PTHREAD_FEATURE_FINEPRIO
+         *   0x04  PTHREAD_FEATURE_BSDTHREADCTL
+         *   0x08  PTHREAD_FEATURE_SETSELF
+         *   0x10  PTHREAD_FEATURE_QOS_MAINTENANCE
+         *   0x40  PTHREAD_FEATURE_KEVENT
+         *   0x80  PTHREAD_FEATURE_WORKLOOP
+         *  0x100  PTHREAD_FEATURE_COOPERATIVE_WORKQ
+         *  0x40000000  PTHREAD_FEATURE_QOS_DEFAULT
+         */
+        {
+            /* Fill in copy-out fields if a data pointer was provided */
+            if (arg4 && arg5 >= 24) {
+                /*
+                 * struct _pthread_registration_data (packed):
+                 *   u64 version                  [+0]  copy-in/out
+                 *   u64 dispatch_queue_offset     [+8]  copy-in
+                 *   u64 main_qos                 [+16] copy-out
+                 *   u32 tsd_offset               [+24] copy-in
+                 *   u32 return_to_kernel_offset   [+28] copy-in
+                 *   u32 mach_thread_self_offset   [+32] copy-in
+                 *   u64 stack_addr_hint          [+36] copy-out
+                 *   u32 mutex_default_policy      [+44] copy-out
+                 *   u32 joinable_offset_bits      [+48] copy-in
+                 *   u32 wq_quantum_expiry_offset  [+52] copy-in
+                 */
+                uint8_t *data = (uint8_t *)g2h_untagged(arg4);
+                uint64_t datasz = arg5;
+
+                /* main_qos = 0 (THREAD_QOS_UNSPECIFIED) */
+                if (datasz >= 24) {
+                    memset(data + 16, 0, 8);
+                }
+                /* stack_addr_hint = 0 (use default) */
+                if (datasz >= 44) {
+                    memset(data + 36, 0, 8);
+                }
+                /* mutex_default_policy = FIRSTFIT(2) | ULOCK(0x100) */
+                if (datasz >= 48) {
+                    uint32_t policy = 0x102;
+                    memcpy(data + 44, &policy, 4);
+                }
+            }
+            ret = 0x400001df;
+        }
+        break;
+
+    case TARGET_MACOS_NR_workq_open:
+        /*
+         * workq_open(void)
+         * Opens the workqueue for this process.  We don't implement
+         * real workqueues but returning success prevents libdispatch
+         * from aborting.
+         */
+        ret = 0;
+        break;
+
+    case TARGET_MACOS_NR_workq_kernreturn:
+        /*
+         * workq_kernreturn(int options, void *item, int affinity, int prio)
+         * Kernel return for workqueue threads.  In our single-threaded
+         * emulator, workqueue threads are never actually created, so
+         * just return 0.
          */
         ret = 0;
         break;
@@ -1228,6 +1331,96 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
     /*
      * Syscalls required by dyld and dynamically linked programs
      */
+
+    case TARGET_MACOS_NR_kqueue:
+        /* kqueue(void) — create a new kernel event queue */
+        ret = get_errno(kqueue());
+        break;
+
+    case TARGET_MACOS_NR_kevent: {
+        /*
+         * kevent(int kq, const struct kevent *changelist, int nchanges,
+         *        struct kevent *eventlist, int nevents,
+         *        const struct timespec *timeout)
+         */
+        struct kevent *cl = arg2 ? (struct kevent *)g2h_untagged(arg2) : NULL;
+        struct kevent *el = arg4 ? (struct kevent *)g2h_untagged(arg4) : NULL;
+        struct timespec *ts = arg6 ? (struct timespec *)g2h_untagged(arg6) : NULL;
+        ret = get_errno(kevent((int)arg1, cl, (int)arg3, el, (int)arg5, ts));
+        break;
+    }
+
+    case TARGET_MACOS_NR_kevent64: {
+        /*
+         * kevent64(int kq, const struct kevent64_s *changelist, int nchanges,
+         *          struct kevent64_s *eventlist, int nevents,
+         *          unsigned int flags, const struct timespec *timeout)
+         *
+         * Forward to host via raw syscall.  The kevent64_s struct is the
+         * same layout on guest and host (both arm64).
+         */
+        void *cl = arg2 ? g2h_untagged(arg2) : NULL;
+        void *el = arg4 ? g2h_untagged(arg4) : NULL;
+        void *ts = arg7 ? g2h_untagged(arg7) : NULL;
+        ret = get_errno(syscall(SYS_kevent64, (int)arg1, cl, (int)arg3,
+                                el, (int)arg5, (unsigned int)arg6, ts));
+        break;
+    }
+
+    case TARGET_MACOS_NR_kevent_qos: {
+        /*
+         * kevent_qos(int kq, const struct kevent_qos_s *changelist,
+         *            int nchanges, struct kevent_qos_s *eventlist,
+         *            int nevents, void *data_out,
+         *            size_t *data_available, unsigned int flags)
+         *
+         * When fd == -1 and flags & KEVENT_FLAG_WORKQ, libdispatch is
+         * using the per-process workqueue kqueue.  We can't dispatch to
+         * workqueue threads (single-threaded), so just pretend the
+         * changelist was registered and return 0 events.
+         */
+        int kq = (int)arg1;
+        unsigned int flags = (unsigned int)arg8;
+
+        if (kq == -1 && (flags & KEVENT_FLAG_WORKQ)) {
+            ret = 0;
+            break;
+        }
+
+        void *cl = arg2 ? g2h_untagged(arg2) : NULL;
+        void *el = arg4 ? g2h_untagged(arg4) : NULL;
+        void *d_out = arg6 ? g2h_untagged(arg6) : NULL;
+        size_t *d_avail = arg7 ? (size_t *)g2h_untagged(arg7) : NULL;
+
+        ret = get_errno(syscall(SYS_kevent_qos, kq, cl, (int)arg3,
+                                el, (int)arg5, d_out, d_avail, flags));
+        break;
+    }
+
+    case TARGET_MACOS_NR_kevent_id: {
+        /*
+         * kevent_id(uint64_t id, const struct kevent_qos_s *changelist,
+         *           int nchanges, struct kevent_qos_s *eventlist,
+         *           int nevents, void *data_out,
+         *           size_t *data_available, unsigned int flags)
+         *
+         * Used by libdispatch for workloop kqueues.  Workloop events
+         * need real kernel workqueue thread support that we lack;
+         * stub the call to return 0 events.
+         */
+        ret = 0;
+        break;
+    }
+
+    case TARGET_MACOS_NR_guarded_kqueue_np: {
+        /*
+         * guarded_kqueue_np(const guardid_t *guard, unsigned guardflags)
+         * Create a guarded kqueue fd.  Forward to host.
+         */
+        uint64_t *gp = arg1 ? (uint64_t *)g2h_untagged(arg1) : NULL;
+        ret = get_errno(syscall(SYS_guarded_kqueue_np, gp, (unsigned int)arg2));
+        break;
+    }
 
     case TARGET_MACOS_NR_sysctl:
         /* __sysctl(int *name, u_int namelen, void *old, size_t *oldlenp,
