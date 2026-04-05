@@ -708,6 +708,345 @@ int main(void) {
         self.assertEqual(rc, 0)
         self.assertIn(b"hosts_exists=YES", out)
 
+    # --- Advanced Foundation tests ---
+
+    _FOUNDATION_PROCESSINFO_SRC = r'''
+#import <Foundation/Foundation.h>
+#include <stdio.h>
+int main(void) {
+    @autoreleasepool {
+        NSProcessInfo *pi = [NSProcessInfo processInfo];
+        printf("name=%s\n", [[pi processName] UTF8String]);
+        NSOperatingSystemVersion v = [pi operatingSystemVersion];
+        printf("os=%ld.%ld.%ld\n", (long)v.majorVersion,
+               (long)v.minorVersion, (long)v.patchVersion);
+        printf("argc=%lu\n", (unsigned long)[[pi arguments] count]);
+    }
+    return 0;
+}
+'''
+
+    _FOUNDATION_REGEX_SRC = r'''
+#import <Foundation/Foundation.h>
+#include <stdio.h>
+int main(void) {
+    @autoreleasepool {
+        NSString *text = @"Phone: 123-456-7890 and 987-654-3210";
+        NSRegularExpression *re = [NSRegularExpression
+            regularExpressionWithPattern:@"\\d{3}-\\d{3}-\\d{4}"
+            options:0 error:nil];
+        NSArray *matches = [re matchesInString:text options:0
+                            range:NSMakeRange(0, [text length])];
+        printf("matches=%lu\n", (unsigned long)[matches count]);
+        for (NSTextCheckingResult *m in matches) {
+            NSString *s = [text substringWithRange:[m range]];
+            printf("found=%s\n", [s UTF8String]);
+        }
+    }
+    return 0;
+}
+'''
+
+    _FOUNDATION_SORT_SRC = r'''
+#import <Foundation/Foundation.h>
+#include <stdio.h>
+int main(void) {
+    @autoreleasepool {
+        NSArray *arr = @[@"cherry", @"apple", @"banana"];
+        NSArray *sorted = [arr sortedArrayUsingSelector:@selector(compare:)];
+        NSString *joined = [sorted componentsJoinedByString:@","];
+        printf("sorted=%s\n", [joined UTF8String]);
+    }
+    return 0;
+}
+'''
+
+    _FOUNDATION_JSON_SRC = r'''
+#import <Foundation/Foundation.h>
+#include <stdio.h>
+int main(void) {
+    @autoreleasepool {
+        NSDictionary *obj = @{@"name": @"QEMU", @"version": @8};
+        NSData *json = [NSJSONSerialization dataWithJSONObject:obj
+                        options:NSJSONWritingSortedKeys error:nil];
+        NSString *s = [[NSString alloc] initWithData:json
+                       encoding:NSUTF8StringEncoding];
+        printf("json=%s\n", [s UTF8String]);
+        /* Round-trip parse */
+        NSDictionary *parsed = [NSJSONSerialization JSONObjectWithData:json
+                                options:0 error:nil];
+        printf("name=%s\n", [[parsed objectForKey:@"name"] UTF8String]);
+    }
+    return 0;
+}
+'''
+
+    _FOUNDATION_URL_SRC = r'''
+#import <Foundation/Foundation.h>
+#include <stdio.h>
+int main(void) {
+    @autoreleasepool {
+        NSURL *url = [NSURL URLWithString:@"https://user:pw@example.com:8080/path?q=1#frag"];
+        printf("scheme=%s\n", [[url scheme] UTF8String]);
+        printf("host=%s\n", [[url host] UTF8String]);
+        printf("port=%d\n", [[url port] intValue]);
+        printf("path=%s\n", [[url path] UTF8String]);
+    }
+    return 0;
+}
+'''
+
+    _DISPATCH_SYNC_SRC = r'''
+#include <stdio.h>
+#include <dispatch/dispatch.h>
+int main(void) {
+    __block int result = 0;
+    dispatch_queue_t q = dispatch_queue_create("test", DISPATCH_QUEUE_SERIAL);
+    dispatch_sync(q, ^{ result = 42; });
+    printf("result=%d\n", result);
+    /* Nested sync on same serial queue from different queue */
+    __block int r2 = 0;
+    dispatch_queue_t q2 = dispatch_queue_create("test2", DISPATCH_QUEUE_SERIAL);
+    dispatch_sync(q2, ^{ r2 = 99; });
+    printf("nested=%d\n", r2);
+    return 0;
+}
+'''
+
+    _PTHREAD_CREATE_SRC = r'''
+#include <stdio.h>
+#include <pthread.h>
+static void *thread_func(void *arg) {
+    int *val = (int *)arg;
+    *val = 42;
+    return NULL;
+}
+int main(void) {
+    pthread_t t;
+    int result = 0;
+    int rc = pthread_create(&t, NULL, thread_func, &result);
+    printf("rc=%d\n", rc);
+    if (rc == 0) {
+        pthread_join(t, NULL);
+        printf("thread_result=%d\n", result);
+    }
+    return 0;
+}
+'''
+
+    _DISPATCH_ASYNC_SRC = r'''
+#include <stdio.h>
+#include <unistd.h>
+#include <dispatch/dispatch.h>
+int main(void) {
+    __block int done = 0;
+    dispatch_queue_t q = dispatch_get_global_queue(
+            DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
+    dispatch_async(q, ^{
+        printf("async_block_ran=YES\n");
+        done = 1;
+    });
+    for (int i = 0; i < 100 && !done; i++)
+        usleep(50000);
+    printf("done=%d\n", done);
+    return done ? 0 : 1;
+}
+'''
+
+    def test_foundation_processinfo(self):
+        """Foundation NSProcessInfo basics."""
+        exe = _compile_framework_test("foundation_pi",
+                                      self._FOUNDATION_PROCESSINFO_SRC,
+                                      ["Foundation"])
+        rc, out, _ = _run_emulated(exe)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"name=foundation_pi", out)
+        self.assertIn(b"argc=1", out)
+        # OS version should be present
+        self.assertRegex(out.decode(), r"os=\d+\.\d+\.\d+")
+
+    def test_foundation_regex(self):
+        """Foundation NSRegularExpression pattern matching."""
+        exe = _compile_framework_test("foundation_regex",
+                                      self._FOUNDATION_REGEX_SRC,
+                                      ["Foundation"])
+        rc, out, _ = _run_emulated(exe)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"matches=2", out)
+        self.assertIn(b"found=123-456-7890", out)
+        self.assertIn(b"found=987-654-3210", out)
+
+    def test_foundation_sort(self):
+        """Foundation NSArray sorting."""
+        exe = _compile_framework_test("foundation_sort",
+                                      self._FOUNDATION_SORT_SRC,
+                                      ["Foundation"])
+        rc, out, _ = _run_emulated(exe)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"sorted=apple,banana,cherry", out)
+
+    def test_foundation_json(self):
+        """Foundation NSJSONSerialization round-trip."""
+        exe = _compile_framework_test("foundation_json",
+                                      self._FOUNDATION_JSON_SRC,
+                                      ["Foundation"])
+        rc, out, _ = _run_emulated(exe)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"name=QEMU", out)
+        # JSON output should contain both keys
+        decoded = out.decode()
+        self.assertIn('"name"', decoded)
+        self.assertIn('"version"', decoded)
+
+    def test_foundation_url(self):
+        """Foundation NSURL parsing."""
+        exe = _compile_framework_test("foundation_url",
+                                      self._FOUNDATION_URL_SRC,
+                                      ["Foundation"])
+        rc, out, _ = _run_emulated(exe)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"scheme=https", out)
+        self.assertIn(b"host=example.com", out)
+        self.assertIn(b"port=8080", out)
+        self.assertIn(b"path=/path", out)
+
+    def test_dispatch_sync(self):
+        """GCD dispatch_sync executes blocks on serial queues."""
+        exe = _compile_framework_test("dispatch_sync",
+                                      self._DISPATCH_SYNC_SRC,
+                                      [], "c")
+        rc, out, _ = _run_emulated(exe)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"result=42", out)
+        self.assertIn(b"nested=99", out)
+
+    def test_pthread_create(self):
+        """pthread_create with a real thread function."""
+        exe = _compile_framework_test("pthread_create",
+                                      self._PTHREAD_CREATE_SRC,
+                                      [], "c")
+        rc, out, _ = _run_emulated(exe)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"rc=0", out)
+
+    def test_dispatch_async(self):
+        """dispatch_async on a global concurrent queue (GCD workqueue)."""
+        exe = _compile_framework_test("dispatch_async",
+                                      self._DISPATCH_ASYNC_SRC,
+                                      [], "c")
+        rc, out, _ = _run_emulated(exe, timeout=15)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"async_block_ran=YES", out)
+        self.assertIn(b"done=1", out)
+
+    # --- AppKit tests ---
+
+    _APPKIT_COLOR_SRC = r'''
+#import <AppKit/AppKit.h>
+#include <stdio.h>
+int main(void) {
+    @autoreleasepool {
+        NSColor *c = [NSColor colorWithRed:0.2 green:0.4 blue:0.6 alpha:0.8];
+        NSColor *rgb = [c colorUsingColorSpace:[NSColorSpace sRGBColorSpace]];
+        CGFloat r, g, b, a;
+        [rgb getRed:&r green:&g blue:&b alpha:&a];
+        printf("r=%.1f g=%.1f b=%.1f a=%.1f\n", r, g, b, a);
+    }
+    return 0;
+}
+'''
+
+    _APPKIT_BEZIERPATH_SRC = r'''
+#import <AppKit/AppKit.h>
+#include <stdio.h>
+int main(void) {
+    @autoreleasepool {
+        NSBezierPath *path = [NSBezierPath bezierPath];
+        [path moveToPoint:NSMakePoint(0, 0)];
+        [path lineToPoint:NSMakePoint(100, 100)];
+        [path lineToPoint:NSMakePoint(200, 0)];
+        [path closePath];
+        printf("elements=%ld\n", [path elementCount]);
+        printf("bounds=%.0f,%.0f,%.0f,%.0f\n",
+               [path bounds].origin.x, [path bounds].origin.y,
+               [path bounds].size.width, [path bounds].size.height);
+    }
+    return 0;
+}
+'''
+
+    _APPKIT_IMAGE_SRC = r'''
+#import <AppKit/AppKit.h>
+#include <stdio.h>
+int main(void) {
+    @autoreleasepool {
+        /* Trigger AppKit class initialization */
+        (void)[NSColor redColor];
+        NSImage *img = [[NSImage alloc] initWithSize:NSMakeSize(64, 64)];
+        printf("size=%.0fx%.0f\n", [img size].width, [img size].height);
+    }
+    return 0;
+}
+'''
+
+    _APPKIT_ATTRSTRING_SRC = r'''
+#import <AppKit/AppKit.h>
+#include <stdio.h>
+int main(void) {
+    @autoreleasepool {
+        /* Initialize AppKit subsystem first via NSColor */
+        (void)[NSColor redColor];
+        NSDictionary *attrs = @{
+            NSForegroundColorAttributeName: [NSColor redColor]
+        };
+        NSAttributedString *as = [[NSAttributedString alloc]
+            initWithString:@"Hello QEMU" attributes:attrs];
+        printf("len=%lu\n", (unsigned long)[as length]);
+        printf("str=%s\n", [[as string] UTF8String]);
+    }
+    return 0;
+}
+'''
+
+    def test_appkit_color(self):
+        """AppKit NSColor creation and color space conversion."""
+        exe = _compile_framework_test("appkit_color",
+                                      self._APPKIT_COLOR_SRC,
+                                      ["AppKit"])
+        rc, out, _ = _run_emulated(exe)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"r=0.2 g=0.4 b=0.6 a=0.8", out)
+
+    def test_appkit_bezierpath(self):
+        """AppKit NSBezierPath construction and bounds."""
+        exe = _compile_framework_test("appkit_bezierpath",
+                                      self._APPKIT_BEZIERPATH_SRC,
+                                      ["AppKit"])
+        rc, out, _ = _run_emulated(exe)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"elements=5", out)
+        # Path from (0,0)→(100,100)→(200,0) should have bounds 0,0,200,100
+        self.assertIn(b"bounds=0,0,200,100", out)
+
+    def test_appkit_image(self):
+        """AppKit NSImage creation."""
+        exe = _compile_framework_test("appkit_image",
+                                      self._APPKIT_IMAGE_SRC,
+                                      ["AppKit"])
+        rc, out, _ = _run_emulated(exe)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"size=64x64", out)
+
+    def test_appkit_attributedstring(self):
+        """AppKit NSAttributedString with color attribute."""
+        exe = _compile_framework_test("appkit_attrstr",
+                                      self._APPKIT_ATTRSTRING_SRC,
+                                      ["AppKit"])
+        rc, out, _ = _run_emulated(exe)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"len=10", out)
+        self.assertIn(b"str=Hello QEMU", out)
+
 
 # ---------------------------------------------------------------------------
 # Helper: compile Objective-C / C test programs from source strings
