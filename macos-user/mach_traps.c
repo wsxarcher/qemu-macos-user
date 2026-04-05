@@ -63,6 +63,66 @@ static kern_return_t host_mach_msg2_trap(
 }
 
 /*
+ * Raw mk_timer traps via inline assembly.
+ * mk_timer_create returns a port name (not kern_return_t).
+ */
+static mach_port_name_t host_mk_timer_create(void)
+{
+    register uint64_t x0 __asm__("x0");
+    register int x16 __asm__("x16") = -91;
+    __asm__ volatile(
+        "svc #0x80"
+        : "=r"(x0)
+        : "r"(x16)
+        : "memory", "cc"
+    );
+    return (mach_port_name_t)x0;
+}
+
+static kern_return_t host_mk_timer_destroy(mach_port_name_t name)
+{
+    register uint64_t x0 __asm__("x0") = name;
+    register int x16 __asm__("x16") = -92;
+    __asm__ volatile(
+        "svc #0x80"
+        : "+r"(x0)
+        : "r"(x16)
+        : "memory", "cc"
+    );
+    return (kern_return_t)x0;
+}
+
+static kern_return_t host_mk_timer_arm(mach_port_name_t name,
+                                       uint64_t expire_time)
+{
+    register uint64_t x0 __asm__("x0") = name;
+    register uint64_t x1 __asm__("x1") = expire_time;
+    register int x16 __asm__("x16") = -93;
+    __asm__ volatile(
+        "svc #0x80"
+        : "+r"(x0)
+        : "r"(x1), "r"(x16)
+        : "memory", "cc"
+    );
+    return (kern_return_t)x0;
+}
+
+static kern_return_t host_mk_timer_cancel(mach_port_name_t name,
+                                          uint64_t *result_time)
+{
+    register uint64_t x0 __asm__("x0") = name;
+    register uint64_t x1 __asm__("x1") = (uint64_t)result_time;
+    register int x16 __asm__("x16") = -94;
+    __asm__ volatile(
+        "svc #0x80"
+        : "+r"(x0)
+        : "r"(x1), "r"(x16)
+        : "memory", "cc"
+    );
+    return (kern_return_t)x0;
+}
+
+/*
  * Handle well-known MIG messages in-process.
  *
  * Modern macOS message filters SIGKILL processes that send raw Mach
@@ -364,6 +424,100 @@ static bool handle_mig_message(void *buf, uint64_t options,
         *ret_out = KERN_SUCCESS;
         return true;
     }
+    case 4817: {
+        /*
+         * _mach_make_memory_entry — MIG subsystem mach_vm, routine 17.
+         * Creates a named memory entry (port) for a VM region.
+         * We translate the guest offset to a host address.
+         *
+         * Request (COMPLEX): header(24) + body(4) + port_desc(12) +
+         *   NDR(8) + size(8) + offset(8) + permission(4) = 68
+         * Reply (COMPLEX, success): header(24) + body(4) +
+         *   port_desc(12) + NDR(8) + size(8) = 56
+         * Reply (error): header(24) + NDR(8) + retval(4) = 36
+         */
+        struct __attribute__((packed)) {
+            mach_msg_header_t hdr;
+            mach_msg_body_t body;
+            mach_msg_port_descriptor_t parent;
+            NDR_record_t NDR;
+            uint64_t size;
+            uint64_t offset;
+            int permission;
+        } *req = buf;
+
+        memory_object_size_t size = req->size;
+        memory_object_offset_t guest_offset = req->offset;
+        vm_prot_t permission = req->permission;
+        mem_entry_name_port_t parent = req->parent.name;
+        mach_port_t object_handle = MACH_PORT_NULL;
+
+        void *host_addr = g2h_untagged((abi_ulong)guest_offset);
+        memory_object_offset_t host_offset =
+            (memory_object_offset_t)(uintptr_t)host_addr;
+
+        if (do_strace) {
+            fprintf(stderr,
+                "  _mach_make_memory_entry: guest_off=0x%llx "
+                "host_off=0x%llx size=0x%llx perm=0x%x\n",
+                (unsigned long long)guest_offset,
+                (unsigned long long)host_offset,
+                (unsigned long long)size, permission);
+        }
+
+        kern_return_t kr = mach_make_memory_entry_64(
+            mach_task_self(), &size, host_offset,
+            permission, &object_handle, parent);
+
+        if (do_strace) {
+            fprintf(stderr,
+                "  _mach_make_memory_entry -> %d, handle=0x%x size=0x%llx\n",
+                kr, object_handle, (unsigned long long)size);
+        }
+
+        if (kr == KERN_SUCCESS) {
+            /* COMPLEX reply — no RetCode field for success */
+            struct __attribute__((packed)) {
+                mach_msg_header_t hdr;
+                mach_msg_body_t body;
+                mach_msg_port_descriptor_t object;
+                NDR_record_t NDR;
+                memory_object_size_t size;
+            } *reply = buf;
+
+            reply->hdr.msgh_bits =
+                MACH_MSGH_BITS_COMPLEX |
+                MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+            reply->hdr.msgh_size = sizeof(*reply);
+            reply->hdr.msgh_remote_port = MACH_PORT_NULL;
+            reply->hdr.msgh_local_port = hdr->msgh_local_port;
+            reply->hdr.msgh_id = msg_id + 100;  /* 4917 */
+            reply->body.msgh_descriptor_count = 1;
+            reply->object.name = object_handle;
+            reply->object.disposition = MACH_MSG_TYPE_MOVE_SEND;
+            reply->object.type = MACH_MSG_PORT_DESCRIPTOR;
+            reply->NDR = NDR_record;
+            reply->size = size;
+        } else {
+            struct __attribute__((packed)) {
+                mach_msg_header_t hdr;
+                NDR_record_t NDR;
+                kern_return_t retval;
+            } *reply = buf;
+
+            reply->hdr.msgh_bits =
+                MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+            reply->hdr.msgh_size = sizeof(*reply);
+            reply->hdr.msgh_remote_port = MACH_PORT_NULL;
+            reply->hdr.msgh_local_port = hdr->msgh_local_port;
+            reply->hdr.msgh_id = msg_id + 100;  /* 4917 */
+            reply->NDR = NDR_record;
+            reply->retval = kr;
+        }
+
+        *ret_out = KERN_SUCCESS;
+        return true;
+    }
     case 8000: {
         /*
          * task_restartable_ranges_register — private MIG.
@@ -538,6 +692,10 @@ static bool handle_mig_message(void *buf, uint64_t options,
         return true;
     }
     default:
+        if (do_strace) {
+            fprintf(stderr, "  MIG unhandled: id=%d remote=0x%x local=0x%x\n",
+                    msg_id, hdr->msgh_remote_port, hdr->msgh_local_port);
+        }
         return false;
     }
 }
@@ -815,9 +973,13 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                 ret = mach_port_deallocate(mach_task_self(),
                                            (mach_port_name_t)arg2);
             } else if (trap_num == MACH_TRAP_PORT_ALLOCATE) {
+                /*
+                 * _kernelrpc_mach_port_allocate_trap
+                 * arg1=task, arg2=right, arg3=guest name_ptr
+                 */
                 mach_port_name_t name;
                 ret = mach_port_allocate(mach_task_self(),
-                                         (mach_port_right_t)arg3,
+                                         (mach_port_right_t)arg2,
                                          &name);
                 if (ret == KERN_SUCCESS && arg3) {
                     memcpy(g2h_untagged(arg3), &name, sizeof(name));
@@ -856,10 +1018,10 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                  * arg1=task, arg2=name, arg3=msgid, arg4=sync,
                  * arg5=notify, arg6=notifyPoly, arg7=guest prev_ptr
                  *
-                 * Forward to host for ports in our namespace.
-                 * Write MACH_PORT_NULL as previous.
+                 * Stub: write MACH_PORT_NULL as previous if pointer
+                 * looks like a valid guest stack/heap address.
                  */
-                if (arg7) {
+                if (arg7 > 0x1000) {
                     mach_port_name_t prev = MACH_PORT_NULL;
                     memcpy(g2h_untagged(arg7), &prev, sizeof(prev));
                 }
@@ -888,7 +1050,7 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
             mach_msg_header_t *hdr = (mach_msg_header_t *)host_data;
 
             /* Pack into mach_msg2 format */
-            uint64_t options = (uint64_t)(uint32_t)arg2 | 0x200000000ULL;
+            uint64_t options = (uint64_t)(uint32_t)arg2 | 0x10000ULL;
             uint64_t bits_and_size = 0;
             uint64_t remote_and_local = 0;
             uint64_t voucher_and_id = 0;
@@ -920,13 +1082,14 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
          * Only the data pointer needs guest→host translation;
          * all other packed arguments pass through unchanged.
          *
-         * Ensure MACH64_SEND_FILTER_NONFATAL (bit 33) is set so
+         * Ensure MACH_SEND_FILTER_NONFATAL (0x10000) is set so
          * that filtered messages return an error instead of killing
          * the process.
          */
         {
             void *host_data = arg1 ? g2h_untagged(arg1) : NULL;
-            uint64_t options = (uint64_t)arg2 | 0x200000000ULL;
+            uint64_t options = (uint64_t)arg2 | 0x10000ULL;
+            /* MACH_SEND_FILTER_NONFATAL: return error on filtered msgs */
 
             if (do_strace && host_data) {
                 mach_msg_header_t *hdr = (mach_msg_header_t *)host_data;
@@ -991,11 +1154,29 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
         break;
 
     case MACH_TRAP_MK_TIMER_CREATE:
+        /* mk_timer_create — returns a port name, not kern_return_t */
+        ret = (abi_long)host_mk_timer_create();
+        break;
+
     case MACH_TRAP_MK_TIMER_DESTROY:
+        /* mk_timer_destroy(name) */
+        ret = host_mk_timer_destroy((mach_port_name_t)arg1);
+        break;
+
     case MACH_TRAP_MK_TIMER_ARM:
+        /* mk_timer_arm(name, expire_time) */
+        ret = host_mk_timer_arm((mach_port_name_t)arg1, (uint64_t)arg2);
+        break;
+
     case MACH_TRAP_MK_TIMER_CANCEL:
-        /* Timer operations — stub for now */
-        ret = KERN_SUCCESS;
+        /* mk_timer_cancel(name, result_time_ptr) */
+        {
+            uint64_t result_time = 0;
+            ret = host_mk_timer_cancel((mach_port_name_t)arg1, &result_time);
+            if (ret == KERN_SUCCESS && arg2) {
+                memcpy(g2h_untagged(arg2), &result_time, sizeof(result_time));
+            }
+        }
         break;
 
     case MACH_TRAP_VM_PURGABLE_CONTROL:
