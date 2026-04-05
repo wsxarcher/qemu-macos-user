@@ -320,7 +320,7 @@ class TestSystemBinaries(unittest.TestCase):
 
     def test_ls_hidden(self):
         """/bin/ls -a shows hidden entries."""
-        self._assert_same_output(["/bin/ls", "-a", "/tmp"])
+        self._assert_same_output(["/bin/ls", "-a", "/"])
 
     # -- /bin/hostname -----------------------------------------------------
 
@@ -1161,6 +1161,275 @@ int main(void) {
         rc, out, _ = _run_emulated(exe, timeout=10)
         self.assertEqual(rc, 0)
         self.assertIn(b"dispatched=1", out)
+
+    # -- AppKit class resolution (no WindowServer, no UI) ----------------
+    _APPKIT_CLASSES_SRC = r'''
+#include <dlfcn.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+static void bail(int sig) { _exit(99); }
+
+int main(void) {
+    signal(SIGALRM, bail);
+    alarm(8);
+
+    void *appkit = dlopen(
+        "/System/Library/Frameworks/AppKit.framework/AppKit", RTLD_LAZY);
+    if (!appkit) { printf("appkit_load=FAIL\n"); return 1; }
+    printf("appkit_load=OK\n");
+
+    const char *names[] = {
+        "OBJC_CLASS_$_NSApplication",
+        "OBJC_CLASS_$_NSDockTile",
+        "OBJC_CLASS_$_NSImage",
+        "OBJC_CLASS_$_NSBundle",
+        "OBJC_CLASS_$_NSWindow",
+        "OBJC_CLASS_$_NSView",
+        "OBJC_CLASS_$_NSFont",
+        "OBJC_CLASS_$_NSEvent",
+        "OBJC_CLASS_$_NSScreen",
+        "OBJC_CLASS_$_NSMenu",
+        NULL
+    };
+    int ok = 0;
+    for (int i = 0; names[i]; i++) {
+        void *cls = dlsym(appkit, names[i]);
+        if (cls) ok++;
+    }
+    printf("classes_resolved=%d\n", ok);
+    return 0;
+}
+'''
+
+    def test_appkit_class_loading(self):
+        """AppKit loads and key classes resolve via dlsym."""
+        exe = _compile_framework_test("appkit_classes",
+                                      self._APPKIT_CLASSES_SRC,
+                                      [],
+                                      language="c")
+        rc, out, _ = _run_emulated(exe, timeout=10)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"appkit_load=OK", out)
+        self.assertIn(b"classes_resolved=10", out)
+
+    # -- AppKit object creation (no WindowServer) -------------------------
+    _APPKIT_OBJECTS_SRC = r'''
+#import <Foundation/Foundation.h>
+#include <dlfcn.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+static void bail(int sig) { _exit(99); }
+
+int main(void) {
+    signal(SIGALRM, bail);
+    alarm(8);
+
+    @autoreleasepool {
+        void *appkit = dlopen(
+            "/System/Library/Frameworks/AppKit.framework/AppKit",
+            RTLD_LAZY);
+        if (!appkit) return 1;
+
+        /* NSImage alloc/init — no WindowServer */
+        Class nsimage = (__bridge Class)dlsym(appkit,
+            "OBJC_CLASS_$_NSImage");
+        id img = [[nsimage alloc] init];
+        printf("nsimage=%s\n", img ? "OK" : "FAIL");
+
+        /* NSBundle mainBundle */
+        Class nsbundle = (__bridge Class)dlsym(appkit,
+            "OBJC_CLASS_$_NSBundle");
+        id bundle = [nsbundle mainBundle];
+        printf("nsbundle=%s\n", bundle ? "OK" : "FAIL");
+
+        /* NSFont — class method that doesn't need WindowServer */
+        Class nsfont = (__bridge Class)dlsym(appkit,
+            "OBJC_CLASS_$_NSFont");
+        if (nsfont) {
+            printf("nsfont_class=OK\n");
+        } else {
+            printf("nsfont_class=FAIL\n");
+        }
+
+        /* NSProcessInfo from AppKit context */
+        NSString *name = [[NSProcessInfo processInfo] processName];
+        printf("process_name=%s\n", [name UTF8String]);
+
+        return 0;
+    }
+}
+'''
+
+    def test_appkit_object_creation(self):
+        """NSImage, NSBundle accessible without WindowServer."""
+        exe = _compile_framework_test("appkit_objects",
+                                      self._APPKIT_OBJECTS_SRC,
+                                      ["Foundation"])
+        rc, out, _ = _run_emulated(exe, timeout=10)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"nsimage=OK", out)
+        self.assertIn(b"nsbundle=OK", out)
+        self.assertIn(b"nsfont_class=OK", out)
+        self.assertIn(b"process_name=", out)
+
+    # -- CoreGraphics color space + affine transform (no WindowServer) ----
+    _CG_MATH_SRC = r'''
+#import <CoreGraphics/CoreGraphics.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <math.h>
+
+static void bail(int sig) { _exit(99); }
+
+int main(void) {
+    signal(SIGALRM, bail);
+    alarm(8);
+
+    /* CGColorSpace creation */
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    printf("colorspace=%s\n", cs ? "OK" : "FAIL");
+    if (cs) {
+        size_t n = CGColorSpaceGetNumberOfComponents(cs);
+        printf("components=%zu\n", n);
+        CGColorSpaceRelease(cs);
+    }
+
+    /* CGAffineTransform math */
+    CGAffineTransform t = CGAffineTransformIdentity;
+    t = CGAffineTransformTranslate(t, 100, 200);
+    t = CGAffineTransformScale(t, 2.0, 3.0);
+    CGPoint p = CGPointApplyAffineTransform(CGPointMake(1, 1), t);
+    /* expected: (100 + 2*1, 200 + 3*1) = (102, 203) */
+    int px = (int)round(p.x);
+    int py = (int)round(p.y);
+    printf("transform=%d,%d\n", px, py);
+
+    /* CGPath construction */
+    CGMutablePathRef path = CGPathCreateMutable();
+    CGPathMoveToPoint(path, NULL, 0, 0);
+    CGPathAddLineToPoint(path, NULL, 10, 0);
+    CGPathAddLineToPoint(path, NULL, 10, 10);
+    CGPathCloseSubpath(path);
+    CGRect bbox = CGPathGetBoundingBox(path);
+    printf("path_bbox=%.0f,%.0f,%.0f,%.0f\n",
+           bbox.origin.x, bbox.origin.y,
+           bbox.size.width, bbox.size.height);
+    CGPathRelease(path);
+
+    return 0;
+}
+'''
+
+    def test_cg_colorspace_transform(self):
+        """CoreGraphics color space, affine transform, path math."""
+        exe = _compile_framework_test("cg_math",
+                                      self._CG_MATH_SRC,
+                                      ["CoreGraphics"],
+                                      language="c")
+        rc, out, _ = _run_emulated(exe, timeout=10)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"colorspace=OK", out)
+        self.assertIn(b"components=3", out)
+        self.assertIn(b"transform=102,203", out)
+        self.assertIn(b"path_bbox=0,0,10,10", out)
+
+    # -- CoreText attributed string (no font server) ---------------------
+    _CORETEXT_SRC = r'''
+#import <CoreText/CoreText.h>
+#import <CoreFoundation/CoreFoundation.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+static void bail(int sig) { _exit(99); }
+
+int main(void) {
+    signal(SIGALRM, bail);
+    alarm(8);
+
+    /* Build an attributed string and measure glyph count */
+    CFStringRef str = CFSTR("Hello QEMU");
+    CFMutableDictionaryRef attrs = CFDictionaryCreateMutable(
+        NULL, 0, &kCFTypeDictionaryKeyCallBacks,
+        &kCFTypeDictionaryValueCallBacks);
+
+    CFAttributedStringRef astr = CFAttributedStringCreate(
+        NULL, str, attrs);
+    CFIndex len = CFAttributedStringGetLength(astr);
+    printf("attr_string_len=%ld\n", (long)len);
+
+    /* Verify the string content round-trips */
+    CFStringRef back = CFAttributedStringGetString(astr);
+    char buf[64] = {0};
+    CFStringGetCString(back, buf, sizeof(buf), kCFStringEncodingUTF8);
+    printf("attr_string_text=%s\n", buf);
+
+    CFRelease(astr);
+    CFRelease(attrs);
+    return 0;
+}
+'''
+
+    def test_coretext_attributed_string(self):
+        """CoreText attributed string creation (no font server)."""
+        exe = _compile_framework_test("coretext_astr",
+                                      self._CORETEXT_SRC,
+                                      ["CoreText", "CoreFoundation"],
+                                      language="c")
+        rc, out, _ = _run_emulated(exe, timeout=10)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"attr_string_len=10", out)
+        self.assertIn(b"attr_string_text=Hello QEMU", out)
+
+    # -- Security framework: random bytes ---------------------------------
+    _SECURITY_RANDOM_SRC = r'''
+#include <Security/Security.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+static void bail(int sig) { _exit(99); }
+
+int main(void) {
+    signal(SIGALRM, bail);
+    alarm(8);
+
+    uint8_t buf[32] = {0};
+    OSStatus st = SecRandomCopyBytes(kSecRandomDefault, sizeof(buf), buf);
+    printf("status=%d\n", (int)st);
+
+    /* Check that at least some bytes are non-zero */
+    int nonzero = 0;
+    for (int i = 0; i < 32; i++) nonzero += (buf[i] != 0);
+    printf("nonzero=%d\n", nonzero);
+
+    return 0;
+}
+'''
+
+    def test_security_random(self):
+        """Security framework SecRandomCopyBytes produces random data."""
+        exe = _compile_framework_test("sec_random",
+                                      self._SECURITY_RANDOM_SRC,
+                                      ["Security"],
+                                      language="c")
+        rc, out, _ = _run_emulated(exe, timeout=10)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"status=0", out)
+        for line in out.split(b"\n"):
+            if line.startswith(b"nonzero="):
+                n = int(line.split(b"=")[1])
+                self.assertGreater(n, 5, "expected many nonzero bytes")
 
 
 # ---------------------------------------------------------------------------
