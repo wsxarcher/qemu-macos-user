@@ -708,6 +708,200 @@ int main(void) {
         self.assertEqual(rc, 0)
         self.assertIn(b"hosts_exists=YES", out)
 
+    # --- Advanced Foundation tests ---
+
+    _FOUNDATION_PROCESSINFO_SRC = r'''
+#import <Foundation/Foundation.h>
+#include <stdio.h>
+int main(void) {
+    @autoreleasepool {
+        NSProcessInfo *pi = [NSProcessInfo processInfo];
+        printf("name=%s\n", [[pi processName] UTF8String]);
+        NSOperatingSystemVersion v = [pi operatingSystemVersion];
+        printf("os=%ld.%ld.%ld\n", (long)v.majorVersion,
+               (long)v.minorVersion, (long)v.patchVersion);
+        printf("argc=%lu\n", (unsigned long)[[pi arguments] count]);
+    }
+    return 0;
+}
+'''
+
+    _FOUNDATION_REGEX_SRC = r'''
+#import <Foundation/Foundation.h>
+#include <stdio.h>
+int main(void) {
+    @autoreleasepool {
+        NSString *text = @"Phone: 123-456-7890 and 987-654-3210";
+        NSRegularExpression *re = [NSRegularExpression
+            regularExpressionWithPattern:@"\\d{3}-\\d{3}-\\d{4}"
+            options:0 error:nil];
+        NSArray *matches = [re matchesInString:text options:0
+                            range:NSMakeRange(0, [text length])];
+        printf("matches=%lu\n", (unsigned long)[matches count]);
+        for (NSTextCheckingResult *m in matches) {
+            NSString *s = [text substringWithRange:[m range]];
+            printf("found=%s\n", [s UTF8String]);
+        }
+    }
+    return 0;
+}
+'''
+
+    _FOUNDATION_SORT_SRC = r'''
+#import <Foundation/Foundation.h>
+#include <stdio.h>
+int main(void) {
+    @autoreleasepool {
+        NSArray *arr = @[@"cherry", @"apple", @"banana"];
+        NSArray *sorted = [arr sortedArrayUsingSelector:@selector(compare:)];
+        NSString *joined = [sorted componentsJoinedByString:@","];
+        printf("sorted=%s\n", [joined UTF8String]);
+    }
+    return 0;
+}
+'''
+
+    _FOUNDATION_JSON_SRC = r'''
+#import <Foundation/Foundation.h>
+#include <stdio.h>
+int main(void) {
+    @autoreleasepool {
+        NSDictionary *obj = @{@"name": @"QEMU", @"version": @8};
+        NSData *json = [NSJSONSerialization dataWithJSONObject:obj
+                        options:NSJSONWritingSortedKeys error:nil];
+        NSString *s = [[NSString alloc] initWithData:json
+                       encoding:NSUTF8StringEncoding];
+        printf("json=%s\n", [s UTF8String]);
+        /* Round-trip parse */
+        NSDictionary *parsed = [NSJSONSerialization JSONObjectWithData:json
+                                options:0 error:nil];
+        printf("name=%s\n", [[parsed objectForKey:@"name"] UTF8String]);
+    }
+    return 0;
+}
+'''
+
+    _FOUNDATION_URL_SRC = r'''
+#import <Foundation/Foundation.h>
+#include <stdio.h>
+int main(void) {
+    @autoreleasepool {
+        NSURL *url = [NSURL URLWithString:@"https://user:pw@example.com:8080/path?q=1#frag"];
+        printf("scheme=%s\n", [[url scheme] UTF8String]);
+        printf("host=%s\n", [[url host] UTF8String]);
+        printf("port=%d\n", [[url port] intValue]);
+        printf("path=%s\n", [[url path] UTF8String]);
+    }
+    return 0;
+}
+'''
+
+    _DISPATCH_SYNC_SRC = r'''
+#include <stdio.h>
+#include <dispatch/dispatch.h>
+int main(void) {
+    __block int result = 0;
+    dispatch_queue_t q = dispatch_queue_create("test", DISPATCH_QUEUE_SERIAL);
+    dispatch_sync(q, ^{ result = 42; });
+    printf("result=%d\n", result);
+    /* Nested sync on same serial queue from different queue */
+    __block int r2 = 0;
+    dispatch_queue_t q2 = dispatch_queue_create("test2", DISPATCH_QUEUE_SERIAL);
+    dispatch_sync(q2, ^{ r2 = 99; });
+    printf("nested=%d\n", r2);
+    return 0;
+}
+'''
+
+    _PTHREAD_CREATE_SRC = r'''
+#include <stdio.h>
+#include <pthread.h>
+int main(void) {
+    pthread_t t;
+    int rc = pthread_create(&t, NULL, NULL, NULL);
+    /* Expect EAGAIN (35) or ENOTSUP in single-threaded emulator */
+    printf("rc=%d\n", rc);
+    printf("graceful=%s\n", rc != 0 ? "YES" : "NO");
+    return 0;
+}
+'''
+
+    def test_foundation_processinfo(self):
+        """Foundation NSProcessInfo basics."""
+        exe = _compile_framework_test("foundation_pi",
+                                      self._FOUNDATION_PROCESSINFO_SRC,
+                                      ["Foundation"])
+        rc, out, _ = _run_emulated(exe)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"name=foundation_pi", out)
+        self.assertIn(b"argc=1", out)
+        # OS version should be present
+        self.assertRegex(out.decode(), r"os=\d+\.\d+\.\d+")
+
+    def test_foundation_regex(self):
+        """Foundation NSRegularExpression pattern matching."""
+        exe = _compile_framework_test("foundation_regex",
+                                      self._FOUNDATION_REGEX_SRC,
+                                      ["Foundation"])
+        rc, out, _ = _run_emulated(exe)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"matches=2", out)
+        self.assertIn(b"found=123-456-7890", out)
+        self.assertIn(b"found=987-654-3210", out)
+
+    def test_foundation_sort(self):
+        """Foundation NSArray sorting."""
+        exe = _compile_framework_test("foundation_sort",
+                                      self._FOUNDATION_SORT_SRC,
+                                      ["Foundation"])
+        rc, out, _ = _run_emulated(exe)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"sorted=apple,banana,cherry", out)
+
+    def test_foundation_json(self):
+        """Foundation NSJSONSerialization round-trip."""
+        exe = _compile_framework_test("foundation_json",
+                                      self._FOUNDATION_JSON_SRC,
+                                      ["Foundation"])
+        rc, out, _ = _run_emulated(exe)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"name=QEMU", out)
+        # JSON output should contain both keys
+        decoded = out.decode()
+        self.assertIn('"name"', decoded)
+        self.assertIn('"version"', decoded)
+
+    def test_foundation_url(self):
+        """Foundation NSURL parsing."""
+        exe = _compile_framework_test("foundation_url",
+                                      self._FOUNDATION_URL_SRC,
+                                      ["Foundation"])
+        rc, out, _ = _run_emulated(exe)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"scheme=https", out)
+        self.assertIn(b"host=example.com", out)
+        self.assertIn(b"port=8080", out)
+        self.assertIn(b"path=/path", out)
+
+    def test_dispatch_sync(self):
+        """GCD dispatch_sync executes blocks on serial queues."""
+        exe = _compile_framework_test("dispatch_sync",
+                                      self._DISPATCH_SYNC_SRC,
+                                      [], "c")
+        rc, out, _ = _run_emulated(exe)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"result=42", out)
+        self.assertIn(b"nested=99", out)
+
+    def test_pthread_create_graceful(self):
+        """pthread_create returns error gracefully (single-threaded mode)."""
+        exe = _compile_framework_test("pthread_create",
+                                      self._PTHREAD_CREATE_SRC,
+                                      [], "c")
+        rc, out, _ = _run_emulated(exe)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"graceful=YES", out)
+
 
 # ---------------------------------------------------------------------------
 # Helper: compile Objective-C / C test programs from source strings
