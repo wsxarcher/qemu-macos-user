@@ -543,6 +543,36 @@ int main(int argc, char **argv, char **envp)
     env = cpu_env(cpu);
     cpu_reset(cpu);
 
+    /*
+     * Set the counter frequency to match the host's real timer (24 MHz
+     * on Apple Silicon).  The commpage contains timebase_info {125, 3}
+     * which converts CNTVCT ticks to nanoseconds assuming a 24 MHz
+     * counter.  Without this, the QEMU default (1 GHz) gives tick
+     * values ~42x too large, breaking CFAbsoluteTime ↔ mach_absolute_time
+     * conversion and making all timers fire in the far future.
+     */
+    {
+        ARMCPU *arm_cpu = ARM_CPU(cpu);
+        arm_cpu->gt_cntfrq_hz = 24000000;  /* Apple Silicon CNTFRQ */
+        env->cp15.c14_cntfrq = 24000000;
+    }
+
+    /*
+     * Disable Pointer Authentication (PAC) to match macOS arm64 behavior.
+     *
+     * The macOS kernel disables PAC for arm64 (non-arm64e) processes by
+     * clearing SCTLR_EL1.{EnIA,EnIB,EnDA,EnDB}.  This makes PACIA/PACIB
+     * instructions behave as NOPs — pointers are never signed.
+     *
+     * Without this, the arm64e shared cache code signs function pointers
+     * via PACIA/PACIB, and our arm64 guest code (which uses plain BLR
+     * without authentication) jumps to corrupted addresses with PAC bits
+     * still set in bits 48-55.
+     */
+    env->cp15.sctlr_el[1] &= ~(SCTLR_EnIA | SCTLR_EnIB |
+                                SCTLR_EnDA | SCTLR_EnDB);
+    arm_rebuild_hflags(env);
+
     thread_cpu = cpu;
 
     /* Initialize task state */

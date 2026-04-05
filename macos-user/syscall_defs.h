@@ -408,10 +408,10 @@
 #define TARGET_MACOS_NR___channel_sync      491
 #define TARGET_MACOS_NR___channel_get_opt   492
 #define TARGET_MACOS_NR___channel_set_opt   493
-#define TARGET_MACOS_NR_ulock_wait          494
-#define TARGET_MACOS_NR_ulock_wake          495
-#define TARGET_MACOS_NR_fclonefileat        496
-#define TARGET_MACOS_NR_fs_snapshot         497
+#define TARGET_MACOS_NR_ulock_wait          515
+#define TARGET_MACOS_NR_ulock_wake          516
+#define TARGET_MACOS_NR_fclonefileat        517
+#define TARGET_MACOS_NR_fs_snapshot         518
 #define TARGET_MACOS_NR_terminate_with_payload 520
 #define TARGET_MACOS_NR_abort_with_payload  521
 #define TARGET_MACOS_NR_necp_session_open   522
