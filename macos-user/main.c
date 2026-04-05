@@ -64,6 +64,8 @@ unsigned long target_dflssiz = 8 * 1024 * 1024;     /* initial stack size limit 
 unsigned long target_maxssiz = 64 * 1024 * 1024;    /* max stack size */
 unsigned long target_sgrowsiz = 128 * 1024;         /* amount to grow stack */
 
+static const char *macos_cpu_type;
+
 __thread CPUState *thread_cpu;
 
 bool qemu_cpu_is_self(CPUState *cpu)
@@ -252,6 +254,27 @@ void init_task_state(TaskState *ts)
     ts->bprm = NULL;
     ts->info = NULL;
     sigemptyset(&ts->signal_mask);
+}
+
+CPUArchState *cpu_copy(CPUArchState *env)
+{
+    CPUState *cpu = env_cpu(env);
+    CPUState *new_cpu = cpu_create(macos_cpu_type);
+    CPUArchState *new_env = cpu_env(new_cpu);
+
+    /* Reset non-arch specific state, then copy arch state */
+    cpu_reset(new_cpu);
+    new_cpu->tcg_cflags = cpu->tcg_cflags;
+    memcpy(new_env, env, sizeof(CPUArchState));
+
+    /* Clone breakpoints */
+    CPUBreakpoint *bp;
+    QTAILQ_INIT(&new_cpu->breakpoints);
+    QTAILQ_FOREACH(bp, &cpu->breakpoints, entry) {
+        cpu_breakpoint_insert(new_cpu, bp->pc, bp->flags, NULL);
+    }
+
+    return new_env;
 }
 
 /*
@@ -504,6 +527,7 @@ int main(int argc, char **argv, char **envp)
     }
 
     const char *cpu_type = parse_cpu_option(cpu_model);
+    macos_cpu_type = cpu_type;
 
     /* init tcg before creating CPUs and to get qemu_host_page_size */
     {

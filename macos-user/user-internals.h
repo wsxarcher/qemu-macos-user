@@ -8,6 +8,8 @@
 #include "qemu/osdep.h"
 #include "user/abitypes.h"
 #include "user/guest-host.h"
+#include "exec/tb-flush.h"
+#include "exec/translation-block.h"
 #include <sys/ioctl.h>
 
 /* Environment list */
@@ -165,5 +167,17 @@ extern const void *mmap_flags_tbl;
 /* GDB */
 void gdb_exit(int code);
 void dump_core_and_abort(int sig);
+
+/* Thread support */
+CPUArchState *cpu_copy(CPUArchState *env);
+void cpu_loop(CPUArchState *env);
+
+static inline void begin_parallel_context(CPUState *cs)
+{
+    if (!tcg_cflags_has(cs, CF_PARALLEL)) {
+        tb_flush__exclusive_or_serial();
+        tcg_cflags_set(cs, CF_PARALLEL);
+    }
+}
 
 #endif /* USER_INTERNALS_H */
