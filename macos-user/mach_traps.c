@@ -122,8 +122,8 @@ static bool handle_mig_message(void *buf, uint64_t options,
         reply->hdr.msgh_size = sizeof(mach_msg_header_t) +
                                sizeof(NDR_record_t) + 8 +
                                count * sizeof(int);
-        reply->hdr.msgh_remote_port = hdr->msgh_local_port;
-        reply->hdr.msgh_local_port = MACH_PORT_NULL;
+        reply->hdr.msgh_remote_port = MACH_PORT_NULL;
+        reply->hdr.msgh_local_port = hdr->msgh_local_port;
         reply->hdr.msgh_id = msg_id + 100;
         reply->NDR = NDR_record;
         reply->retval = kr;
@@ -163,8 +163,8 @@ static bool handle_mig_message(void *buf, uint64_t options,
         reply->hdr.msgh_bits = MACH_MSGH_BITS_COMPLEX |
                                MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
         reply->hdr.msgh_size = sizeof(*reply);
-        reply->hdr.msgh_remote_port = hdr->msgh_local_port;
-        reply->hdr.msgh_local_port = MACH_PORT_NULL;
+        reply->hdr.msgh_remote_port = MACH_PORT_NULL;
+        reply->hdr.msgh_local_port = hdr->msgh_local_port;
         reply->hdr.msgh_id = msg_id + 100;  /* 306 */
         reply->body.msgh_descriptor_count = 1;
         reply->clock_port.name = clock_serv;
@@ -193,8 +193,8 @@ static bool handle_mig_message(void *buf, uint64_t options,
 
         reply->hdr.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
         reply->hdr.msgh_size = sizeof(*reply);
-        reply->hdr.msgh_remote_port = hdr->msgh_local_port;
-        reply->hdr.msgh_local_port = MACH_PORT_NULL;
+        reply->hdr.msgh_remote_port = MACH_PORT_NULL;
+        reply->hdr.msgh_local_port = hdr->msgh_local_port;
         reply->hdr.msgh_id = msg_id + 100;  /* 1100 */
         reply->NDR = NDR_record;
         reply->retval = kr;
@@ -231,8 +231,8 @@ static bool handle_mig_message(void *buf, uint64_t options,
         reply->hdr.msgh_bits = MACH_MSGH_BITS_COMPLEX |
                                MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
         reply->hdr.msgh_size = sizeof(*reply);
-        reply->hdr.msgh_remote_port = hdr->msgh_local_port;
-        reply->hdr.msgh_local_port = MACH_PORT_NULL;
+        reply->hdr.msgh_remote_port = MACH_PORT_NULL;
+        reply->hdr.msgh_local_port = hdr->msgh_local_port;
         reply->hdr.msgh_id = msg_id + 100;  /* 3518 */
         reply->body.msgh_descriptor_count = 1;
         reply->semaphore.name = sem;
@@ -355,8 +355,8 @@ static bool handle_mig_message(void *buf, uint64_t options,
         reply->hdr.msgh_bits =
             MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
         reply->hdr.msgh_size = sizeof(*reply);
-        reply->hdr.msgh_remote_port = hdr->msgh_local_port;
-        reply->hdr.msgh_local_port = MACH_PORT_NULL;
+        reply->hdr.msgh_remote_port = MACH_PORT_NULL;
+        reply->hdr.msgh_local_port = hdr->msgh_local_port;
         reply->hdr.msgh_id = msg_id + 100;  /* 4911 */
         reply->NDR = NDR_record;
         reply->retval = kr;
@@ -382,8 +382,8 @@ static bool handle_mig_message(void *buf, uint64_t options,
         reply->hdr.msgh_bits =
             MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
         reply->hdr.msgh_size = sizeof(*reply);
-        reply->hdr.msgh_remote_port = hdr->msgh_local_port;
-        reply->hdr.msgh_local_port = MACH_PORT_NULL;
+        reply->hdr.msgh_remote_port = MACH_PORT_NULL;
+        reply->hdr.msgh_local_port = hdr->msgh_local_port;
         reply->hdr.msgh_id = msg_id + 100;  /* 8100 */
         reply->NDR = NDR_record;
         reply->retval = KERN_SUCCESS;
@@ -408,8 +408,8 @@ static bool handle_mig_message(void *buf, uint64_t options,
         reply->hdr.msgh_bits =
             MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
         reply->hdr.msgh_size = sizeof(*reply);
-        reply->hdr.msgh_remote_port = hdr->msgh_local_port;
-        reply->hdr.msgh_local_port = MACH_PORT_NULL;
+        reply->hdr.msgh_remote_port = MACH_PORT_NULL;
+        reply->hdr.msgh_local_port = hdr->msgh_local_port;
         reply->hdr.msgh_id = msg_id + 100;  /* 8101 */
         reply->NDR = NDR_record;
         reply->retval = KERN_SUCCESS;
@@ -443,8 +443,8 @@ static bool handle_mig_message(void *buf, uint64_t options,
         reply->hdr.msgh_bits = MACH_MSGH_BITS_COMPLEX |
                                MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
         reply->hdr.msgh_size = sizeof(*reply);
-        reply->hdr.msgh_remote_port = hdr->msgh_local_port;
-        reply->hdr.msgh_local_port = MACH_PORT_NULL;
+        reply->hdr.msgh_remote_port = MACH_PORT_NULL;
+        reply->hdr.msgh_local_port = hdr->msgh_local_port;
         reply->hdr.msgh_id = msg_id + 100;  /* 3509 */
         reply->body.msgh_descriptor_count = 1;
         reply->special_port.name = port;
@@ -487,8 +487,8 @@ static bool handle_mig_message(void *buf, uint64_t options,
         reply->hdr.msgh_size = sizeof(mach_msg_header_t) +
                                sizeof(NDR_record_t) + 8 +
                                count * sizeof(integer_t);
-        reply->hdr.msgh_remote_port = hdr->msgh_local_port;
-        reply->hdr.msgh_local_port = MACH_PORT_NULL;
+        reply->hdr.msgh_remote_port = MACH_PORT_NULL;
+        reply->hdr.msgh_local_port = hdr->msgh_local_port;
         reply->hdr.msgh_id = msg_id + 100;  /* 3505 */
         reply->NDR = NDR_record;
         reply->retval = kr;
@@ -528,8 +528,8 @@ static bool handle_mig_message(void *buf, uint64_t options,
         reply->hdr.msgh_bits =
             MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
         reply->hdr.msgh_size = sizeof(*reply);
-        reply->hdr.msgh_remote_port = hdr->msgh_local_port;
-        reply->hdr.msgh_local_port = MACH_PORT_NULL;
+        reply->hdr.msgh_remote_port = MACH_PORT_NULL;
+        reply->hdr.msgh_local_port = hdr->msgh_local_port;
         reply->hdr.msgh_id = msg_id + 100;  /* 3510 */
         reply->NDR = NDR_record;
         reply->retval = kr;
@@ -559,6 +559,8 @@ static bool handle_mig_message(void *buf, uint64_t options,
 #define MACH_TRAP_PORT_EXTRACT_MEMBER           (-23)
 #define MACH_TRAP_PORT_CONSTRUCT                (-24)
 #define MACH_TRAP_PORT_DESTRUCT                 (-25)
+#define MACH_TRAP_PORT_REQUEST_NOTIFICATION     (-70)
+#define MACH_TRAP_PORT_GET_ATTRIBUTES           (-71)
 #define MACH_TRAP_REPLY_PORT                    (-26)
 #define MACH_TRAP_THREAD_SELF                   (-27)
 #define MACH_TRAP_TASK_SELF                     (-28)
@@ -797,6 +799,8 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
     case MACH_TRAP_PORT_EXTRACT_MEMBER:
     case MACH_TRAP_PORT_CONSTRUCT:
     case MACH_TRAP_PORT_DESTRUCT:
+    case MACH_TRAP_PORT_REQUEST_NOTIFICATION:
+    case MACH_TRAP_PORT_GET_ATTRIBUTES:
     case MACH_TRAP_PORT_TYPE:
         /*
          * Port management traps — forward to host kernel.
@@ -828,6 +832,44 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                                              (mach_port_name_t)arg2,
                                              (mach_port_t)arg3,
                                              (mach_msg_type_name_t)arg4);
+            } else if (trap_num == MACH_TRAP_PORT_CONSTRUCT) {
+                mach_port_options_t opts;
+                memset(&opts, 0, sizeof(opts));
+                if (arg2) {
+                    memcpy(&opts, g2h_untagged(arg2), sizeof(opts));
+                }
+                mach_port_name_t name = MACH_PORT_NULL;
+                ret = mach_port_construct(mach_task_self(), &opts,
+                                          (mach_port_context_t)arg3,
+                                          &name);
+                if (ret == KERN_SUCCESS && arg4) {
+                    memcpy(g2h_untagged(arg4), &name, sizeof(name));
+                }
+            } else if (trap_num == MACH_TRAP_PORT_DESTRUCT) {
+                ret = mach_port_destruct(mach_task_self(),
+                                         (mach_port_name_t)arg2,
+                                         (mach_port_delta_t)arg3,
+                                         (mach_port_context_t)arg4);
+            } else if (trap_num == MACH_TRAP_PORT_REQUEST_NOTIFICATION) {
+                /*
+                 * _kernelrpc_mach_port_request_notification_trap
+                 * arg1=task, arg2=name, arg3=msgid, arg4=sync,
+                 * arg5=notify, arg6=notifyPoly, arg7=guest prev_ptr
+                 *
+                 * Forward to host for ports in our namespace.
+                 * Write MACH_PORT_NULL as previous.
+                 */
+                if (arg7) {
+                    mach_port_name_t prev = MACH_PORT_NULL;
+                    memcpy(g2h_untagged(arg7), &prev, sizeof(prev));
+                }
+                ret = KERN_SUCCESS;
+            } else if (trap_num == MACH_TRAP_PORT_GET_ATTRIBUTES) {
+                /*
+                 * _kernelrpc_mach_port_get_attributes_trap — stub.
+                 * Return status with all zeroes.
+                 */
+                ret = KERN_SUCCESS;
             } else {
                 ret = KERN_SUCCESS;
             }

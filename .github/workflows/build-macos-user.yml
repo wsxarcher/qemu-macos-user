@@ -30,7 +30,7 @@ on:
 jobs:
   build-macos-user:
     name: Build QEMU macOS User Mode (ARM64)
-    runs-on: macos-14
+    runs-on: macos-26
     env:
       PATH: /opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 
