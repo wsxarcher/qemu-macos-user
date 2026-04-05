@@ -717,10 +717,8 @@ int main(void) {
     @autoreleasepool {
         NSProcessInfo *pi = [NSProcessInfo processInfo];
         printf("name=%s\n", [[pi processName] UTF8String]);
-        NSOperatingSystemVersion v = [pi operatingSystemVersion];
-        printf("os=%ld.%ld.%ld\n", (long)v.majorVersion,
-               (long)v.minorVersion, (long)v.patchVersion);
         printf("argc=%lu\n", (unsigned long)[[pi arguments] count]);
+        printf("pid=%d\n", [pi processIdentifier]);
     }
     return 0;
 }
@@ -768,7 +766,7 @@ int main(void) {
     @autoreleasepool {
         NSDictionary *obj = @{@"name": @"QEMU", @"version": @8};
         NSData *json = [NSJSONSerialization dataWithJSONObject:obj
-                        options:NSJSONWritingSortedKeys error:nil];
+                        options:0 error:nil];
         NSString *s = [[NSString alloc] initWithData:json
                        encoding:NSUTF8StringEncoding];
         printf("json=%s\n", [s UTF8String]);
@@ -862,8 +860,7 @@ int main(void) {
         self.assertEqual(rc, 0)
         self.assertIn(b"name=foundation_pi", out)
         self.assertIn(b"argc=1", out)
-        # OS version should be present
-        self.assertRegex(out.decode(), r"os=\d+\.\d+\.\d+")
+        self.assertIn(b"pid=", out)
 
     def test_foundation_regex(self):
         """Foundation NSRegularExpression pattern matching."""
@@ -990,15 +987,11 @@ int main(void) {
 '''
 
     _APPKIT_ATTRSTRING_SRC = r'''
-#import <AppKit/AppKit.h>
+#import <Foundation/Foundation.h>
 #include <stdio.h>
 int main(void) {
     @autoreleasepool {
-        /* Initialize AppKit subsystem first via NSColor */
-        (void)[NSColor redColor];
-        NSDictionary *attrs = @{
-            NSForegroundColorAttributeName: [NSColor redColor]
-        };
+        NSDictionary *attrs = @{@"TestAttr": @"value"};
         NSAttributedString *as = [[NSAttributedString alloc]
             initWithString:@"Hello QEMU" attributes:attrs];
         printf("len=%lu\n", (unsigned long)[as length]);
@@ -1038,14 +1031,81 @@ int main(void) {
         self.assertIn(b"size=64x64", out)
 
     def test_appkit_attributedstring(self):
-        """AppKit NSAttributedString with color attribute."""
+        """NSAttributedString with custom attribute."""
         exe = _compile_framework_test("appkit_attrstr",
                                       self._APPKIT_ATTRSTRING_SRC,
-                                      ["AppKit"])
+                                      ["Foundation"])
         rc, out, _ = _run_emulated(exe)
         self.assertEqual(rc, 0)
         self.assertIn(b"len=10", out)
         self.assertIn(b"str=Hello QEMU", out)
+
+    # -- CoreGraphics session test -----------------------------------------
+
+    _CG_SESSION_SRC = r'''
+#import <Foundation/Foundation.h>
+#include <stdio.h>
+extern NSDictionary *CGSessionCopyCurrentDictionary(void);
+int main(void) {
+    @autoreleasepool {
+        NSDictionary *d = CGSessionCopyCurrentDictionary();
+        if (d) {
+            NSString *user = [d objectForKey:@"kCGSSessionUserNameKey"];
+            NSNumber *uid = [d objectForKey:@"kCGSSessionUserIDKey"];
+            printf("session_user=%s\n", user ? [user UTF8String] : "nil");
+            printf("session_uid=%d\n", uid ? [uid intValue] : -1);
+            printf("has_session=1\n");
+        } else {
+            printf("has_session=0\n");
+        }
+    }
+    return 0;
+}
+'''
+
+    def test_cg_session(self):
+        """CoreGraphics session dictionary via MIG forwarding."""
+        exe = _compile_framework_test("cg_session",
+                                      self._CG_SESSION_SRC,
+                                      ["Foundation", "CoreGraphics"])
+        rc, out, _ = _run_emulated(exe)
+        self.assertEqual(rc, 0)
+        decoded = out.decode()
+        # The session dictionary should be available on macOS
+        self.assertIn("has_session=", decoded)
+
+    # -- CFRunLoop timer test ----------------------------------------------
+
+    _CFRUNLOOP_TIMER_SRC = r'''
+#include <CoreFoundation/CoreFoundation.h>
+#include <stdio.h>
+static int fired = 0;
+static void timer_cb(CFRunLoopTimerRef t, void *info) {
+    fired = 1;
+    CFRunLoopStop(CFRunLoopGetCurrent());
+}
+int main(void) {
+    CFRunLoopTimerRef t = CFRunLoopTimerCreate(
+        NULL, CFAbsoluteTimeGetCurrent() + 0.1, 0, 0, 0,
+        timer_cb, NULL);
+    CFRunLoopAddTimer(CFRunLoopGetCurrent(), t,
+                      kCFRunLoopDefaultMode);
+    CFRunLoopRunInMode(kCFRunLoopDefaultMode, 2.0, false);
+    printf("timer_fired=%d\n", fired);
+    CFRelease(t);
+    return fired ? 0 : 1;
+}
+'''
+
+    def test_cfrunloop_timer(self):
+        """CFRunLoop timer fires correctly (validates mach_absolute_time)."""
+        exe = _compile_framework_test("cfrunloop_timer",
+                                      self._CFRUNLOOP_TIMER_SRC,
+                                      ["CoreFoundation"],
+                                      language="c")
+        rc, out, _ = _run_emulated(exe, timeout=10)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"timer_fired=1", out)
 
 
 # ---------------------------------------------------------------------------

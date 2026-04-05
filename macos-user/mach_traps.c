@@ -1007,10 +1007,9 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
             } else {
                 addr = (mach_vm_address_t)result;
                 if (do_strace) {
-                    fprintf(stderr, "  vm_map: allocated at 0x%llx "
-                            "(host=%p, prot=%d)\n",
-                            (unsigned long long)addr,
-                            g2h_untagged(addr), host_prot);
+                    fprintf(stderr, "  vm_map_trap: at 0x%llx size=0x%zx "
+                            "prot=%d\n",
+                            (unsigned long long)addr, size, host_prot);
                 }
                 if (arg2) {
                     memcpy(g2h_untagged(arg2), &addr, sizeof(addr));
@@ -1097,21 +1096,39 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                  * _kernelrpc_mach_port_request_notification_trap
                  * arg1=task, arg2=name, arg3=msgid, arg4=sync,
                  * arg5=notify, arg6=notifyPoly, arg7=guest prev_ptr
-                 *
-                 * Stub: write MACH_PORT_NULL as previous if pointer
-                 * looks like a valid guest stack/heap address.
                  */
+                mach_port_t previous = MACH_PORT_NULL;
+                ret = mach_port_request_notification(
+                    mach_task_self(),
+                    (mach_port_name_t)arg2,
+                    (mach_msg_id_t)arg3,
+                    (mach_port_mscount_t)arg4,
+                    (mach_port_t)arg5,
+                    (mach_msg_type_name_t)arg6,
+                    &previous);
                 if (arg7 > 0x1000) {
-                    mach_port_name_t prev = MACH_PORT_NULL;
-                    memcpy(g2h_untagged(arg7), &prev, sizeof(prev));
+                    memcpy(g2h_untagged(arg7), &previous,
+                           sizeof(previous));
                 }
-                ret = KERN_SUCCESS;
             } else if (trap_num == MACH_TRAP_PORT_GET_ATTRIBUTES) {
                 /*
-                 * _kernelrpc_mach_port_get_attributes_trap — stub.
-                 * Return status with all zeroes.
+                 * _kernelrpc_mach_port_get_attributes_trap
+                 * arg1=task, arg2=name, arg3=flavor,
+                 * arg4=guest info_ptr, arg5=guest count_ptr
                  */
-                ret = KERN_SUCCESS;
+                mach_msg_type_number_t count = 0;
+                if (arg5) {
+                    memcpy(&count, g2h_untagged(arg5), sizeof(count));
+                }
+                mach_port_info_t info = g2h_untagged(arg4);
+                ret = mach_port_get_attributes(
+                    mach_task_self(),
+                    (mach_port_name_t)arg2,
+                    (mach_port_flavor_t)arg3,
+                    info, &count);
+                if (ret == KERN_SUCCESS && arg5) {
+                    memcpy(g2h_untagged(arg5), &count, sizeof(count));
+                }
             } else if (trap_num == MACH_TRAP_PORT_INSERT_MEMBER) {
                 ret = mach_port_insert_member(mach_task_self(),
                                               (mach_port_name_t)arg2,
