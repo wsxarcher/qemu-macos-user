@@ -28,6 +28,7 @@
 #include "user/guest-host.h"
 #include "user/page-protection.h"
 #include "gdbstub/user.h"
+#include "exec/mmap-lock.h"
 #include "trace.h"
 
 /*
@@ -405,8 +406,22 @@ void host_signal_handler(int host_sig, siginfo_t *info, void *puc)
 
 /* ---- do_sigaction ---- */
 
-int do_sigaction(int sig, const struct target_sigaction *act,
-                 struct target_sigaction *oact)
+/*
+ * Apple's abort() resets SIGABRT to SIG_DFL *before* raising the signal,
+ * which prevents guest handlers from ever running.  This differs from POSIX
+ * which says the first raise(SIGABRT) should invoke the handler.
+ *
+ * When a guest installs a custom SIGABRT handler and it is subsequently
+ * reset to SIG_DFL (the abort() pattern), we save the custom handler here.
+ * handle_pending_signal() will use the saved handler for the next SIGABRT
+ * delivery, allowing siglongjmp-based abort recovery to work.  This is
+ * critical for catching framework aborts (e.g. CFPrefsPlistSource) that
+ * would otherwise kill the emulated process.
+ */
+static struct target_sigaction saved_sigabrt_handler;
+static bool sigabrt_handler_saved;
+
+int do_sigaction(int sig, abi_ulong act_addr, abi_ulong oact_addr)
 {
     struct target_sigaction *k;
     struct sigaction act1;
@@ -417,25 +432,56 @@ int do_sigaction(int sig, const struct target_sigaction *act,
         return -TARGET_EINVAL;
     }
 
-    if ((sig == TARGET_SIGKILL || sig == TARGET_SIGSTOP) &&
-        act != NULL && act->_sa_handler != TARGET_SIG_DFL) {
-        return -TARGET_EINVAL;
-    }
-
     if (block_signals()) {
         return -TARGET_ERESTART;
     }
 
     k = &sigact_table[sig - 1];
-    if (oact) {
-        oact->_sa_handler = k->_sa_handler;
-        oact->sa_flags = k->sa_flags;
-        oact->sa_mask = k->sa_mask;
+
+    /*
+     * macOS sigaction guest struct layout (ARM64):
+     *   offset 0: sa_handler (8 bytes, pointer)
+     *   offset 8: sa_mask    (4 bytes, uint32_t sigset_t)
+     *   offset 12: sa_flags  (4 bytes, int)
+     * Total: 16 bytes
+     */
+    if (oact_addr) {
+        uint8_t *oact = g2h_untagged(oact_addr);
+        *(uint64_t *)(oact + 0) = k->_sa_handler;
+        *(uint64_t *)(oact + 8) = k->sa_tramp;
+        *(uint32_t *)(oact + 16) = (uint32_t)k->sa_mask;
+        *(uint32_t *)(oact + 20) = (uint32_t)k->sa_flags;
     }
-    if (act) {
-        k->_sa_handler = act->_sa_handler;
-        k->sa_flags = act->sa_flags;
-        k->sa_mask = act->sa_mask;
+    if (act_addr) {
+        const uint8_t *act = g2h_untagged(act_addr);
+        abi_ulong new_handler = *(uint64_t *)(act + 0);
+        abi_ulong new_tramp = *(uint64_t *)(act + 8);
+        abi_ulong new_mask = *(uint32_t *)(act + 16);
+        abi_ulong new_flags = *(uint32_t *)(act + 20);
+
+        if ((sig == TARGET_SIGKILL || sig == TARGET_SIGSTOP) &&
+            new_handler != TARGET_SIG_DFL) {
+            return -TARGET_EINVAL;
+        }
+
+        /*
+         * Detect the abort() pattern: SIGABRT handler being reset from
+         * a custom handler to SIG_DFL.  Save the custom handler so it
+         * can be used for the next SIGABRT delivery.
+         */
+        if (sig == TARGET_SIGABRT &&
+            new_handler == TARGET_SIG_DFL &&
+            k->_sa_handler != TARGET_SIG_DFL &&
+            k->_sa_handler != TARGET_SIG_IGN &&
+            k->_sa_handler != TARGET_SIG_ERR) {
+            saved_sigabrt_handler = *k;
+            sigabrt_handler_saved = true;
+        }
+
+        k->_sa_handler = new_handler;
+        k->sa_tramp = new_tramp;
+        k->sa_flags = new_flags;
+        k->sa_mask = new_mask;
 
         /* Update the host signal state. */
         host_sig = target_to_host_signal(sig);
@@ -544,6 +590,19 @@ out:
 
 /* ---- signal_init ---- */
 
+/*
+ * Persistent sigreturn trampoline page.  Allocated once during
+ * signal_init() and mapped as read+execute.  This avoids writing
+ * executable code on the guest stack (which conflicts with QEMU's
+ * TB write-protection mechanism).
+ */
+static abi_ulong sigreturn_trampoline_addr;
+
+abi_ulong get_sigreturn_trampoline_addr(void)
+{
+    return sigreturn_trampoline_addr;
+}
+
 void signal_init(void)
 {
     TaskState *ts = get_task_state(thread_cpu);
@@ -583,6 +642,35 @@ void signal_init(void)
         }
     }
     sigaction(host_interrupt_signal, &act, NULL);
+
+    /*
+     * Allocate a persistent read+execute page for the sigreturn
+     * trampoline.  The trampoline code:
+     *   MOV X0, X28         ; frame_addr (saved in callee-saved reg)
+     *   MOV X16, #184       ; sigreturn syscall number
+     *   SVC #0x80           ; invoke BSD syscall
+     */
+    sigreturn_trampoline_addr = target_mmap(0, TARGET_PAGE_SIZE,
+                                            PROT_READ | PROT_WRITE,
+                                            MAP_PRIVATE | MAP_ANONYMOUS,
+                                            -1, 0);
+    if (sigreturn_trampoline_addr == (abi_ulong)-1) {
+        fprintf(stderr, "qemu: failed to allocate sigreturn trampoline\n");
+        _exit(1);
+    }
+    uint32_t *tramp = g2h_untagged(sigreturn_trampoline_addr);
+    tramp[0] = 0xAA1C03E0;  /* MOV X0, X28 */
+    tramp[1] = 0xD2801710;  /* MOV X16, #184 (sigreturn) */
+    tramp[2] = 0xD4001001;  /* SVC #0x80 */
+
+    /* Make the trampoline page executable (host side) and register in
+     * QEMU's page table.  Use the host page size for mprotect. */
+    mprotect(tramp, qemu_real_host_page_size(), PROT_READ | PROT_EXEC);
+    mmap_lock();
+    page_set_flags(sigreturn_trampoline_addr,
+                   sigreturn_trampoline_addr + TARGET_PAGE_SIZE - 1,
+                   PAGE_READ | PAGE_EXEC | PAGE_VALID, ~0);
+    mmap_unlock();
 }
 
 /* ---- Signal frame setup ---- */
@@ -697,23 +785,41 @@ static void handle_pending_signal(CPUArchState *env, int sig,
 
     if (handler == TARGET_SIG_DFL) {
         /*
-         * Default handler: ignore some signals.  The rest are job
-         * control or fatal.
+         * For SIGABRT, check if abort() recently reset a custom handler.
+         * If so, use the saved handler instead — this makes abort()
+         * catchable, matching POSIX semantics where the first raise()
+         * inside abort() should invoke the installed handler.
          */
-        if (sig == TARGET_SIGTSTP || sig == TARGET_SIGTTIN ||
-            sig == TARGET_SIGTTOU) {
-            kill(getpid(), SIGSTOP);
-        } else if (sig != TARGET_SIGCHLD && sig != TARGET_SIGURG &&
-                   sig != TARGET_SIGINFO && sig != TARGET_SIGWINCH &&
-                   sig != TARGET_SIGCONT) {
-            dump_core_and_abort(sig);
+        if (sig == TARGET_SIGABRT && sigabrt_handler_saved) {
+            sa = &saved_sigabrt_handler;
+            handler = sa->_sa_handler;
+            sigabrt_handler_saved = false;
+            /* Fall through to the custom handler path below */
+        } else {
+            /*
+             * Default handler: ignore some signals.  The rest are job
+             * control or fatal.
+             */
+            if (sig == TARGET_SIGTSTP || sig == TARGET_SIGTTIN ||
+                sig == TARGET_SIGTTOU) {
+                kill(getpid(), SIGSTOP);
+            } else if (sig != TARGET_SIGCHLD && sig != TARGET_SIGURG &&
+                       sig != TARGET_SIGINFO && sig != TARGET_SIGWINCH &&
+                       sig != TARGET_SIGCONT) {
+                dump_core_and_abort(sig);
+            }
+            return;
         }
     } else if (handler == TARGET_SIG_IGN) {
         /* ignore sig */
+        return;
     } else if (handler == TARGET_SIG_ERR) {
         dump_core_and_abort(sig);
-    } else {
-        /* Compute the blocked signals during handler execution. */
+        return;
+    }
+
+    /* Custom handler — set up the guest signal frame. */
+    {
         sigset_t *blocked_set;
 
         target_to_host_sigset(&set, &sa->sa_mask);
@@ -759,6 +865,16 @@ void process_pending_signals(CPUArchState *env)
     while (qatomic_read(&ts->signal_pending)) {
         sigfillset(&set);
         sigprocmask(SIG_SETMASK, &set, 0);
+
+        if (do_strace) {
+            for (int i = 1; i <= TARGET_NSIG; i++) {
+                if (ts->sigtab[i - 1].pending) {
+                    fprintf(stderr, "process_pending_signals: sig=%d pending "
+                            "handler=0x%lx\n", i,
+                            (unsigned long)sigact_table[i - 1]._sa_handler);
+                }
+            }
+        }
 
     restart_scan:
         sig = ts->sync_signal.pending;
