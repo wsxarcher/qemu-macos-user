@@ -21,6 +21,7 @@
 #include "user/page-protection.h"
 #include "exec/mmap-lock.h"
 #include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <mach/mach_time.h>
 #include <mach/clock.h>
 
@@ -49,6 +50,7 @@ extern mach_port_t thread_get_special_reply_port(void);
  */
 #define IPC_RECV_TIMEOUT_MS   5000   /* 5s per attempt */
 #define IPC_RECV_MAX_RETRY    3      /* then PORT_DIED */
+#define WORKLOOP_POLL_SLICE_MS 100
 
 static mach_port_name_t ipc_timeout_port;
 static int ipc_timeout_count;
@@ -363,8 +365,10 @@ static bool handle_mig_message(void *buf, uint64_t options,
     case 4811: {
         /*
          * mach_vm_map — MIG subsystem mach_vm, routine 11.
-         * Maps memory into the task's address space.  We translate this
-         * into a guest mmap via target_mmap.
+         * Maps memory into the task's address space. Anonymous mappings
+         * are handled with target_mmap(); mappings backed by a memory
+         * object are installed with host mach_vm_map() at the matching
+         * host address inside the guest reservation.
          *
          * Request (COMPLEX): header(24) + body(4) + port_desc(12) +
          *   NDR(8) + address(8) + size(8) + mask(8) + flags(4) +
@@ -391,6 +395,11 @@ static bool handle_mig_message(void *buf, uint64_t options,
         uint64_t size = req->size;
         int flags = req->flags;
         int cur_prot = req->cur_protection;
+        int max_prot = req->max_protection;
+        vm_inherit_t inheritance = req->inheritance;
+        memory_object_name_t object = req->object.name;
+        mach_vm_offset_t offset = req->offset;
+        boolean_t copy = req->copy;
 
         int host_prot = 0;
         if (cur_prot & VM_PROT_READ)    host_prot |= PROT_READ;
@@ -414,6 +423,8 @@ static bool handle_mig_message(void *buf, uint64_t options,
         }
 
         abi_long result;
+        bool used_object = false;
+        abi_long reserved_start = 0;
 
         /*
          * For PROT_NONE reservations at a fixed address (no OVERWRITE),
@@ -428,7 +439,45 @@ static bool handle_mig_message(void *buf, uint64_t options,
          * falls back to target_mmap when mprotect fails on pages
          * that were never host-mapped.
          */
-        if (host_prot == PROT_NONE && guest_start != 0 &&
+        if (MACH_PORT_VALID(object)) {
+            mach_vm_address_t host_addr;
+            kern_return_t kr;
+            int map_flags = flags;
+
+            used_object = true;
+            if (flags & VM_FLAGS_ANYWHERE) {
+                abi_long reserve = target_mmap(0, size, PROT_NONE,
+                                               MAP_PRIVATE | MAP_ANONYMOUS,
+                                               -1, 0);
+                if (reserve < 0) {
+                    result = -1;
+                    goto mach_vm_map_done;
+                }
+                reserved_start = reserve;
+                guest_start = reserved_start;
+                host_addr = (mach_vm_address_t)(uintptr_t)
+                    g2h_untagged(guest_start);
+                map_flags = (flags & ~VM_FLAGS_ANYWHERE) | VM_FLAGS_OVERWRITE;
+            } else {
+                host_addr = guest_start;
+                if (guest_base) {
+                    host_addr = (mach_vm_address_t)(uintptr_t)
+                        g2h_untagged(guest_start);
+                }
+            }
+
+            kr = mach_vm_map(mach_task_self(), &host_addr, size,
+                             req->mask, map_flags, object, offset, copy,
+                             cur_prot, max_prot, inheritance);
+            if (kr == KERN_SUCCESS && h2g_valid(host_addr)) {
+                result = h2g(host_addr);
+            } else {
+                if (reserved_start) {
+                    target_munmap(reserved_start, size);
+                }
+                result = -1;
+            }
+        } else if (host_prot == PROT_NONE && guest_start != 0 &&
             !(flags & 0x4000)) {
             /*
              * Walk the range in page-sized chunks: mmap(PROT_NONE)
@@ -474,11 +523,15 @@ static bool handle_mig_message(void *buf, uint64_t options,
             }
         }
 
+mach_vm_map_done:
+
         if (do_strace) {
             fprintf(stderr, "  MIG mach_vm_map: addr=0x%llx size=0x%llx "
-                    "flags=0x%x prot=%d → result=0x%llx\n",
+                    "flags=0x%x prot=%d object=0x%x %s→ result=0x%llx\n",
                     (unsigned long long)addr, (unsigned long long)size,
-                    flags, cur_prot, (unsigned long long)result);
+                    flags, cur_prot, object,
+                    used_object ? "" : "(anon) ",
+                    (unsigned long long)result);
         }
 
         struct __attribute__((packed)) {
@@ -493,6 +546,20 @@ static bool handle_mig_message(void *buf, uint64_t options,
             kr = KERN_NO_SPACE;
             reply->address = 0;
         } else {
+            if (used_object) {
+                int page_flags = PAGE_VALID;
+
+                if (host_prot & PROT_READ) {
+                    page_flags |= PAGE_READ;
+                }
+                if (host_prot & PROT_WRITE) {
+                    page_flags |= PAGE_WRITE;
+                }
+                if (host_prot & PROT_EXEC) {
+                    page_flags |= PAGE_EXEC;
+                }
+                page_set_flags(result, result + size - 1, page_flags, ~0);
+            }
             kr = KERN_SUCCESS;
             reply->address = (uint64_t)result;
         }
@@ -1481,6 +1548,9 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                     (mach_port_t)arg5,
                     (mach_msg_type_name_t)arg6,
                     &previous);
+                if (ret == KERN_SUCCESS) {
+                    record_workq_notification_port((mach_port_t)arg5);
+                }
                 if (arg7 > 0x1000) {
                     memcpy(g2h_untagged(arg7), &previous,
                            sizeof(previous));
@@ -1815,6 +1885,9 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
 #define OPT_SEND   0x1
 #define OPT_RCV    0x2
 #define OPT_TMOUT  0x100
+                    if ((vec_opts & (OPT_SEND | OPT_RCV)) == OPT_RCV) {
+                        service_pending_workloop_reqs();
+                    }
                     if ((vec_opts & (OPT_SEND | OPT_RCV)) == OPT_RCV
                         && !(vec_opts & OPT_TMOUT)
                         && vec_tmout == 0) {
@@ -1826,18 +1899,42 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
 #undef OPT_RCV
 #undef OPT_TMOUT
 
-                    ret = host_mach_msg2_trap(host_data, vec_opts,
-                                              (uint64_t)arg3,
-                                              (uint64_t)arg4,
-                                              (uint64_t)arg5,
-                                              (uint64_t)arg6,
-                                              (uint64_t)arg7,
-                                              vec_tmout);
+                    if (vec_added_tmout) {
+                        uint64_t remaining = vec_tmout;
 
-                    if (vec_added_tmout && ret == 0x10004003) {
-                        uint32_t rcv_name =
-                            (uint32_t)((uint64_t)arg6 >> 32);
-                        ret = ipc_timeout_result(rcv_name, do_strace);
+                        while (1) {
+                            uint64_t slice = remaining > WORKLOOP_POLL_SLICE_MS
+                                ? WORKLOOP_POLL_SLICE_MS : remaining;
+
+                            service_workloop_machport_events();
+                            service_workq_notification_events();
+                            ret = host_mach_msg2_trap(host_data, vec_opts,
+                                                      (uint64_t)arg3,
+                                                      (uint64_t)arg4,
+                                                      (uint64_t)arg5,
+                                                      (uint64_t)arg6,
+                                                      (uint64_t)arg7,
+                                                      slice);
+                            if (ret != 0x10004003) {
+                                break;
+                            }
+                            if (remaining <= slice) {
+                                uint32_t rcv_name =
+                                    (uint32_t)((uint64_t)arg6 >> 32);
+                                ret = ipc_timeout_result(rcv_name, do_strace);
+                                break;
+                            }
+                            remaining -= slice;
+                            service_pending_workloop_reqs();
+                        }
+                    } else {
+                        ret = host_mach_msg2_trap(host_data, vec_opts,
+                                                  (uint64_t)arg3,
+                                                  (uint64_t)arg4,
+                                                  (uint64_t)arg5,
+                                                  (uint64_t)arg6,
+                                                  (uint64_t)arg7,
+                                                  vec_tmout);
                     }
 
                     if (do_strace && ret != KERN_SUCCESS) {
@@ -1921,6 +2018,9 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
 #define OPT_SEND   0x1
 #define OPT_RCV    0x2
 #define OPT_TMOUT  0x100
+                    if ((trap_options & (OPT_SEND | OPT_RCV)) == OPT_RCV) {
+                        service_pending_workloop_reqs();
+                    }
                     if ((trap_options & (OPT_SEND | OPT_RCV)) == OPT_RCV
                         && !(trap_options & OPT_TMOUT)
                         && trap_timeout == 0) {
@@ -1932,18 +2032,42 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
 #undef OPT_RCV
 #undef OPT_TMOUT
 
-                    ret = host_mach_msg2_trap(host_data, trap_options,
-                                              (uint64_t)arg3,
-                                              (uint64_t)arg4,
-                                              (uint64_t)arg5,
-                                              (uint64_t)arg6,
-                                              (uint64_t)arg7,
-                                              trap_timeout);
+                    if (added_timeout) {
+                        uint64_t remaining = trap_timeout;
 
-                    if (added_timeout && ret == 0x10004003) {
-                        uint32_t rcv_name =
-                            (uint32_t)((uint64_t)arg6 >> 32);
-                        ret = ipc_timeout_result(rcv_name, do_strace);
+                        while (1) {
+                            uint64_t slice = remaining > WORKLOOP_POLL_SLICE_MS
+                                ? WORKLOOP_POLL_SLICE_MS : remaining;
+
+                            service_workloop_machport_events();
+                            service_workq_notification_events();
+                            ret = host_mach_msg2_trap(host_data, trap_options,
+                                                      (uint64_t)arg3,
+                                                      (uint64_t)arg4,
+                                                      (uint64_t)arg5,
+                                                      (uint64_t)arg6,
+                                                      (uint64_t)arg7,
+                                                      slice);
+                            if (ret != 0x10004003) {
+                                break;
+                            }
+                            if (remaining <= slice) {
+                                uint32_t rcv_name =
+                                    (uint32_t)((uint64_t)arg6 >> 32);
+                                ret = ipc_timeout_result(rcv_name, do_strace);
+                                break;
+                            }
+                            remaining -= slice;
+                            service_pending_workloop_reqs();
+                        }
+                    } else {
+                        ret = host_mach_msg2_trap(host_data, trap_options,
+                                                  (uint64_t)arg3,
+                                                  (uint64_t)arg4,
+                                                  (uint64_t)arg5,
+                                                  (uint64_t)arg6,
+                                                  (uint64_t)arg7,
+                                                  trap_timeout);
                     }
 
                     if (do_strace && ret == KERN_SUCCESS &&
