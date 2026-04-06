@@ -352,6 +352,15 @@ void host_signal_handler(int host_sig, siginfo_t *info, void *puc)
                     mmap_unlock();
                     return; /* retry the faulting instruction */
                 }
+            } else if ((pflags & (PAGE_VALID | PAGE_READ | PAGE_WRITE)) ==
+                       (PAGE_VALID | PAGE_READ | PAGE_WRITE)) {
+                /*
+                 * Another thread already materialised this page between
+                 * our fault and our signal-handler entry (concurrent
+                 * demand-page race).  The host page is now accessible —
+                 * just retry the faulting instruction.
+                 */
+                return;
             }
         }
 
