@@ -171,6 +171,10 @@ void dump_core_and_abort(int sig);
 /* Thread support */
 CPUArchState *cpu_copy(CPUArchState *env);
 void cpu_loop(CPUArchState *env);
+void service_pending_workloop_reqs(void);
+void service_workloop_machport_events(void);
+void record_workq_notification_port(mach_port_t port);
+void service_workq_notification_events(void);
 
 static inline void begin_parallel_context(CPUState *cs)
 {
