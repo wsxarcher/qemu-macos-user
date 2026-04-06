@@ -173,6 +173,8 @@ CPUArchState *cpu_copy(CPUArchState *env);
 void cpu_loop(CPUArchState *env);
 void service_pending_workloop_reqs(void);
 void service_workloop_machport_events(void);
+void mark_active_rcv_port(mach_port_t port);
+void unmark_active_rcv_port(mach_port_t port);
 void record_workq_notification_port(mach_port_t port);
 void service_workq_notification_events(void);
 
