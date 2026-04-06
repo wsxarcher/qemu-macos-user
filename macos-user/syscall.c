@@ -525,12 +525,6 @@ static bool machport_has_pending_message(mach_port_t port)
     return kr == KERN_SUCCESS && status.mps_msgcount > 0;
 }
 
-static bool is_mach_notification_msg(const mach_msg_header_t *hdr)
-{
-    return hdr->msgh_id >= MACH_NOTIFY_FIRST &&
-        hdr->msgh_id <= MACH_NOTIFY_LAST;
-}
-
 static void release_prereceived_workloop_event(struct kevent_qos_s *event)
 {
     if (event->filter == EVFILT_MACHPORT && event->ext[0] && event->ext[1]) {
@@ -540,55 +534,18 @@ static void release_prereceived_workloop_event(struct kevent_qos_s *event)
     }
 }
 
-static bool workloop_event_is_mach_notification(
-    const struct kevent_qos_s *event)
-{
-    mach_msg_header_t *gh;
-
-    if (event->filter != EVFILT_MACHPORT ||
-        event->fflags != 0 ||
-        !event->ext[0]) {
-        return false;
-    }
-
-    gh = (mach_msg_header_t *)g2h_untagged((abi_ulong)event->ext[0]);
-    return is_mach_notification_msg(gh);
-}
-
 static int filter_workloop_notification_events(struct kevent_qos_s *events,
                                                int nevents)
 {
-    int out = 0;
-
-    for (int i = 0; i < nevents; i++) {
-        bool drop = false;
-
-        if (workloop_event_is_mach_notification(&events[i])) {
-            abi_ulong guest_buf = (abi_ulong)events[i].ext[0];
-            mach_msg_header_t *gh =
-                (mach_msg_header_t *)g2h_untagged(guest_buf);
-
-            if (do_strace) {
-                fprintf(stderr, "  workloop wl MACHPORT 0x%llx: "
-                        "dropping Mach notification id=%u\n",
-                        (unsigned long long)events[i].ident,
-                        gh->msgh_id);
-            }
-            mmap_lock();
-            target_munmap(guest_buf, gh->msgh_size + MAX_TRAILER_SIZE);
-            mmap_unlock();
-            drop = true;
-        }
-
-        if (!drop) {
-            if (out != i) {
-                events[out] = events[i];
-            }
-            out++;
-        }
-    }
-
-    return out;
+    /*
+     * Mach notifications (PORT_DESTROYED id=69, DEAD_NAME id=72, etc.)
+     * must be delivered to the guest so dispatch/XPC can tear down dead
+     * connections.  Previously this function dropped all such messages,
+     * which prevented dispatch from learning that a channel was dead
+     * and caused workloop threads to spin forever: the THREAD_REQ kept
+     * being re-delivered but the receive always failed on the dead port.
+     */
+    return nevents;
 }
 
 static void store_pending_workloop_req(uint64_t wl_id,
@@ -1045,6 +1002,8 @@ void service_workloop_machport_events(void)
         parked = has_parked_workloop_thread(snapshot[i].workloop_id);
         notification_port = is_workq_notification_port(snapshot[i].port);
         if (notification_port && !parked) {
+            bool wants_msg =
+                template_needs_prereceived_msg(&snapshot[i].template_kev);
             got = prereceive_machport_drain_timeout(&snapshot[i].template_kev,
                                                     drained,
                                                     ARRAY_SIZE(drained), 0);
@@ -1052,13 +1011,24 @@ void service_workloop_machport_events(void)
                 got = filter_workloop_notification_events(drained, got);
             }
             if (got > 0) {
-                int stashed = stash_workloop_port_events(snapshot[i].port,
-                                                         drained, got);
-                if (do_strace) {
-                    fprintf(stderr, "  workloop wl=0x%llx: stashed %d deferred "
-                            "notification event(s) on 0x%x\n",
-                            (unsigned long long)snapshot[i].workloop_id,
-                            stashed, (unsigned)snapshot[i].port);
+                if (!wants_msg) {
+                    if (do_strace) {
+                        fprintf(stderr, "  workloop wl=0x%llx: delivering %d "
+                                "notification event(s) on 0x%x\n",
+                                (unsigned long long)snapshot[i].workloop_id,
+                                got, (unsigned)snapshot[i].port);
+                    }
+                    deliver_workloop_events_to_thread(snapshot[i].workloop_id,
+                                                      drained, got);
+                } else {
+                    int stashed = stash_workloop_port_events(snapshot[i].port,
+                                                             drained, got);
+                    if (do_strace) {
+                        fprintf(stderr, "  workloop wl=0x%llx: stashed %d deferred "
+                                "notification event(s) on 0x%x\n",
+                                (unsigned long long)snapshot[i].workloop_id,
+                                stashed, (unsigned)snapshot[i].port);
+                    }
                 }
             } else if (do_strace) {
                 fprintf(stderr, "  workloop wl=0x%llx: deferring notification "
@@ -1699,6 +1669,7 @@ static void *workq_kqueue_monitor_func(void *arg)
                 }
 
                 if (notification_port && !parked) {
+                    bool wants_msg = template_needs_prereceived_msg(&events_qos[i]);
                     int got = prereceive_machport_drain(&events_qos[i],
                                                         drained,
                                                         ARRAY_SIZE(drained));
@@ -1706,16 +1677,30 @@ static void *workq_kqueue_monitor_func(void *arg)
                         got = filter_workloop_notification_events(drained, got);
                     }
                     if (got > 0) {
-                        int stashed = stash_workloop_port_events(
-                            (mach_port_t)events_qos[i].ident, drained, got);
-                        if (do_strace) {
-                            fprintf(stderr,
-                                    "  workq_monitor: stashed %d deferred "
-                                    "notification event(s) on port 0x%x "
-                                    "for wl=0x%llx\n",
-                                    stashed,
-                                    (unsigned)events_qos[i].ident,
-                                    (unsigned long long)wl_id);
+                        if (!wants_msg) {
+                            if (do_strace) {
+                                fprintf(stderr,
+                                        "  workq_monitor: delivering %d "
+                                        "notification event(s) on port 0x%x "
+                                        "for wl=0x%llx\n",
+                                        got,
+                                        (unsigned)events_qos[i].ident,
+                                        (unsigned long long)wl_id);
+                            }
+                            deliver_workloop_events_to_thread(wl_id, drained,
+                                                              got);
+                        } else {
+                            int stashed = stash_workloop_port_events(
+                                (mach_port_t)events_qos[i].ident, drained, got);
+                            if (do_strace) {
+                                fprintf(stderr,
+                                        "  workq_monitor: stashed %d deferred "
+                                        "notification event(s) on port 0x%x "
+                                        "for wl=0x%llx\n",
+                                        stashed,
+                                        (unsigned)events_qos[i].ident,
+                                        (unsigned long long)wl_id);
+                            }
                         }
                     } else if (do_strace) {
                         fprintf(stderr,
