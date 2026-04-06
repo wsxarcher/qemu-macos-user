@@ -791,9 +791,14 @@ static bool handle_mig_message(void *buf, uint64_t options,
  * We patch the embedded pointer(s) before forwarding the message.
  *
  * Known routines:
+ *   2880  io_connect_method
+ *         Variable layout: selector(4) + scalar_input(var) + inband_input(var)
+ *         + ool_input(8) + ool_input_size(8) + counts(8) + ool_output(8)
  *   2888  io_registry_entry_get_properties_bin_buf
  *         Request: Head(24) + NDR(8) + buf(8) + bufsize(8) = 48
  *         buf at offset 32 (mach_vm_address_t)
+ *   2889  io_registry_entry_get_property_bin_buf
+ *         Variable layout: planeCnt + plane + nameCnt + name + opts + buf(8)
  */
 static void fixup_mig_request_addrs(void *msg_buf, uint32_t send_size)
 {
@@ -804,6 +809,41 @@ static void fixup_mig_request_addrs(void *msg_buf, uint32_t send_size)
     }
 
     switch (hdr->msgh_id) {
+    case 2880: {
+        /*
+         * io_connect_method — variable layout (pack(4)):
+         *   Head(24) + NDR(8) + selector(4)
+         *   + scalar_inputCnt(4) + scalar_input[cnt*8]
+         *   + inband_inputCnt(4) + inband_input[cnt,pad4]
+         *   + ool_input(8) + ool_input_size(8)
+         *   + inband_outputCnt(4) + scalar_outputCnt(4)
+         *   + ool_output(8) + ool_output_size(8)
+         */
+        uint8_t *p = (uint8_t *)hdr;
+        if (send_size < 56) break;
+        uint32_t off = 36;  /* after Head+NDR+selector */
+        uint32_t scnt = *(uint32_t *)(p + off);
+        off += 4 + scnt * 8;
+        if (off + 4 > send_size) break;
+        uint32_t icnt = *(uint32_t *)(p + off);
+        off += 4 + ((icnt + 3) & ~3u);
+        if (off + 16 > send_size) break;
+        /* ool_input */
+        uint64_t *ool_in = (uint64_t *)(p + off);
+        if (*ool_in != 0) {
+            *ool_in += (uint64_t)guest_base;
+        }
+        off += 16;  /* skip ool_input + ool_input_size */
+        off += 8;   /* skip inband_outputCnt + scalar_outputCnt */
+        if (off + 8 > send_size) break;
+        /* ool_output */
+        uint64_t *ool_out = (uint64_t *)(p + off);
+        if (*ool_out != 0) {
+            *ool_out += (uint64_t)guest_base;
+        }
+        break;
+    }
+
     case 2888: /* io_registry_entry_get_properties_bin_buf */
         /* Request: Head(24) + NDR(8) + buf(8) + bufsize(8) = 48 */
         if (send_size >= 48) {
