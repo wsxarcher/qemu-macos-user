@@ -29,6 +29,94 @@ extern mach_port_t mach_reply_port(void);
 extern mach_port_t thread_get_special_reply_port(void);
 
 /*
+ * XPC receive timeout tracking.
+ *
+ * When we inject a timeout into an XPC receive-only call (see
+ * OPT_STRICT below), the library will retry on MACH_RCV_INTERRUPTED.
+ * If the service genuinely won't reply (e.g. cfprefsd for emulated
+ * processes), we need to escalate so XPC tears down the connection
+ * instead of looping forever.
+ *
+ * Strategy:
+ *   1st–2nd timeout on a port → MACH_RCV_INTERRUPTED  (XPC retries)
+ *   3rd timeout on same port  → fake MACH_NOTIFY_SEND_ONCE
+ *                                (XPC tears down connection)
+ *   After total budget exhausted → immediate fake notification
+ *                                  (prevent reconnect loops)
+ */
+#define XPC_TIMEOUT_MS        2000   /* 2 seconds per attempt */
+#define XPC_TIMEOUT_MAX_RETRY 2      /* retries before escalation */
+#define XPC_TIMEOUT_BUDGET    6      /* total timeouts before fast-fail */
+
+static mach_port_name_t xpc_timeout_port;
+static int xpc_timeout_count;
+static int xpc_timeout_total;
+
+static void xpc_fill_send_once_notification(void *rcv_buf,
+                                            mach_port_name_t rcv_port)
+{
+    mach_msg_header_t *fake = (mach_msg_header_t *)rcv_buf;
+    fake->msgh_bits = 0;
+    fake->msgh_size = sizeof(mach_msg_header_t);
+    fake->msgh_remote_port = MACH_PORT_NULL;
+    fake->msgh_local_port = MACH_PORT_NULL;
+    fake->msgh_voucher_port = MACH_PORT_NULL;
+    fake->msgh_id = 71;  /* MACH_NOTIFY_SEND_ONCE */
+}
+
+static bool xpc_should_fast_fail(void)
+{
+    return xpc_timeout_total > XPC_TIMEOUT_BUDGET;
+}
+
+static kern_return_t xpc_timeout_result(mach_port_name_t rcv_port,
+                                        void *rcv_buf,
+                                        bool do_strace)
+{
+    xpc_timeout_total++;
+
+    if (rcv_port == xpc_timeout_port) {
+        xpc_timeout_count++;
+    } else {
+        xpc_timeout_port = rcv_port;
+        xpc_timeout_count = 1;
+    }
+
+    if (xpc_timeout_count <= XPC_TIMEOUT_MAX_RETRY) {
+        if (do_strace) {
+            fprintf(stderr, "  xpc timeout %d/%d on port 0x%x "
+                    "(total=%d)\n",
+                    xpc_timeout_count, XPC_TIMEOUT_MAX_RETRY,
+                    rcv_port, xpc_timeout_total);
+        }
+        return 0x10004005;  /* MACH_RCV_INTERRUPTED */
+    }
+
+    /*
+     * Exhausted per-port retries.  Synthesize a
+     * MACH_NOTIFY_SEND_ONCE notification (msgh_id = 71) so XPC
+     * cleanly tears down the connection.
+     */
+    xpc_timeout_port = 0;
+    xpc_timeout_count = 0;
+    if (rcv_buf) {
+        xpc_fill_send_once_notification(rcv_buf, rcv_port);
+        if (do_strace) {
+            fprintf(stderr, "  xpc timeout exhausted on port 0x%x "
+                    "-> fake SEND_ONCE (total=%d)\n",
+                    rcv_port, xpc_timeout_total);
+        }
+        return KERN_SUCCESS;
+    }
+    if (do_strace) {
+        fprintf(stderr, "  xpc timeout exhausted on port 0x%x "
+                "(no buffer, total=%d)\n",
+                rcv_port, xpc_timeout_total);
+    }
+    return 0x10004003;  /* MACH_RCV_TIMED_OUT */
+}
+
+/*
  * Raw mach_msg2_trap via inline assembly.
  * On modern macOS, the old mach_msg_trap (-31) is killed by message
  * filters.  All Mach IPC must go through mach_msg2_trap (-47).
@@ -779,13 +867,33 @@ static void fixup_mig_reply_ool(void *reply_buf)
             dp += sizeof(mach_msg_ool_descriptor_t);
             break;
         }
-        case MACH_MSG_OOL_PORTS_DESCRIPTOR:
+        case MACH_MSG_OOL_PORTS_DESCRIPTOR: {
+            mach_msg_ool_ports_descriptor_t *op =
+                (mach_msg_ool_ports_descriptor_t *)dp;
+            if (do_strace) {
+                fprintf(stderr,
+                    "  OOL_PORTS desc[%u]: count=%u disp=%u\n",
+                    i, op->count, op->disposition);
+            }
             dp += sizeof(mach_msg_ool_ports_descriptor_t);
             break;
-        case MACH_MSG_PORT_DESCRIPTOR:
+        }
+        case MACH_MSG_PORT_DESCRIPTOR: {
+            mach_msg_port_descriptor_t *pd =
+                (mach_msg_port_descriptor_t *)dp;
+            if (do_strace) {
+                fprintf(stderr,
+                    "  PORT desc[%u]: name=0x%x disp=%u\n",
+                    i, pd->name, pd->disposition);
+            }
             dp += sizeof(mach_msg_port_descriptor_t);
             break;
+        }
         default:
+            if (do_strace) {
+                fprintf(stderr,
+                    "  UNKNOWN desc[%u]: type=%u\n", i, td->type);
+            }
             /* Unknown descriptor — skip using guarded size */
             dp += sizeof(mach_msg_ool_descriptor_t);
             break;
@@ -858,9 +966,11 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
 
     if (do_strace && trap_num != MACH_TRAP_ABSTIME &&
         trap_num != MACH_TRAP_CONTTIME) {
-        fprintf(stderr, "mach_trap[%d] = %lx, %lx, %lx, %lx, %lx, %lx\n",
+        fprintf(stderr,
+                "mach_trap[%d] = %lx, %lx, %lx, %lx, %lx, %lx, %lx, %lx\n",
                 trap_num, (long)arg1, (long)arg2, (long)arg3,
-                (long)arg4, (long)arg5, (long)arg6);
+                (long)arg4, (long)arg5, (long)arg6,
+                (long)arg7, (long)arg8);
     }
 
     switch (trap_num) {
@@ -1341,14 +1451,10 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
             void *host_data;
 
             /*
-             * Strip MACH64_SEND_KOBJECT_CALL and MACH64_SEND_MQ_CALL.
-             * These are kernel optimization hints telling the kernel
-             * the target is a kernel object or MQ port.  When forwarding
-             * guest messages through the host, these hints can cause
-             * MACH_SEND_INVALID_DATA because the emulator's port
-             * namespace doesn't match what the kernel expects for
-             * these fast-paths.  Keep them for now — stripping them
-             * causes SIGKILL from message filters.
+             * Do NOT strip MACH64_SEND_KOBJECT_CALL or MACH64_SEND_MQ_CALL.
+             * These are kernel optimization hints that are REQUIRED by
+             * message filters — stripping them causes SIGKILL even with
+             * MACH_SEND_FILTER_NONFATAL set.
              */
 
             if (options & MACH64_MSG_VECTOR) {
@@ -1413,11 +1519,13 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                         fprintf(stderr,
                             "  mach_msg2[vec]: bits=0x%x size=%u "
                             "remote=0x%x local=0x%x id=%u "
-                            "opts=0x%llx\n",
+                            "opts=0x%llx send_sz=%u rcv_sz=%u\n",
                             hdr->msgh_bits, hdr->msgh_size,
                             hdr->msgh_remote_port,
                             hdr->msgh_local_port,
-                            hdr->msgh_id, options);
+                            hdr->msgh_id, options,
+                            vec[0].msgv_send_size,
+                            vec[0].msgv_rcv_size);
                     }
                 }
 
@@ -1430,13 +1538,72 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                                                   &mig_ret)) {
                     ret = mig_ret;
                 } else {
-                    ret = host_mach_msg2_trap(host_data, options,
+                    uint64_t vec_opts = options;
+                    uint64_t vec_tmout = (uint64_t)arg8;
+                    bool vec_added_tmout = false;
+
+#define OPT_SEND   0x1
+#define OPT_RCV    0x2
+#define OPT_TMOUT  0x100
+#define OPT_STRICT 0x200
+                    if ((vec_opts & (OPT_SEND | OPT_RCV)) == OPT_RCV
+                        && (vec_opts & OPT_STRICT)
+                        && !(vec_opts & OPT_TMOUT)
+                        && vec_tmout == 0) {
+                        /* Fast-fail: skip syscall entirely */
+                        if (xpc_should_fast_fail()) {
+                            uint32_t rcv_name =
+                                (uint32_t)((uint64_t)arg6 >> 32);
+                            void *rcv_buf;
+                            if (nentries >= 2 &&
+                                vec[1].msgv_rcv_addr) {
+                                rcv_buf = (void *)(uintptr_t)
+                                          vec[1].msgv_rcv_addr;
+                            } else {
+                                rcv_buf = (void *)(uintptr_t)
+                                          vec[0].msgv_data;
+                            }
+                            ret = xpc_timeout_result(rcv_name,
+                                rcv_buf, do_strace);
+                            goto vec_msg_done;
+                        }
+                        vec_opts |= OPT_TMOUT;
+                        vec_tmout = XPC_TIMEOUT_MS;
+                        vec_added_tmout = true;
+                    }
+#undef OPT_SEND
+#undef OPT_RCV
+#undef OPT_TMOUT
+#undef OPT_STRICT
+
+                    ret = host_mach_msg2_trap(host_data, vec_opts,
                                               (uint64_t)arg3,
                                               (uint64_t)arg4,
                                               (uint64_t)arg5,
                                               (uint64_t)arg6,
                                               (uint64_t)arg7,
-                                              (uint64_t)arg8);
+                                              vec_tmout);
+
+                    if (vec_added_tmout && ret == 0x10004003) {
+                        uint32_t rcv_name =
+                            (uint32_t)((uint64_t)arg6 >> 32);
+                        void *rcv_buf;
+                        if (nentries >= 2 && vec[1].msgv_rcv_addr) {
+                            rcv_buf = (void *)(uintptr_t)
+                                      vec[1].msgv_rcv_addr;
+                        } else {
+                            rcv_buf = (void *)(uintptr_t)
+                                      vec[0].msgv_data;
+                        }
+                        ret = xpc_timeout_result(rcv_name, rcv_buf,
+                                                 do_strace);
+                    }
+
+                    if (do_strace && ret != KERN_SUCCESS) {
+                        fprintf(stderr,
+                            "  mach_msg2[vec] FAILED: ret=0x%x\n",
+                            (unsigned)ret);
+                    }
                     /* Translate OOL descriptors in the reply */
                     if (ret == KERN_SUCCESS && (options & 0x2)) {
                         void *rcv_buf;
@@ -1449,6 +1616,7 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                             fixup_mig_reply_ool(rcv_buf);
                         }
                     }
+                vec_msg_done: ;
                 }
 
                 /* Restore guest pointers */
@@ -1467,13 +1635,25 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                 if (do_strace && host_data) {
                     mach_msg_header_t *hdr =
                         (mach_msg_header_t *)host_data;
+                    /*
+                     * macOS 15 mach_msg2 uses 8 register args:
+                     *   X0=data X1=opts X2=bits_send_sz
+                     *   X3=remote_local X4=voucher_id
+                     *   X5=desc_rcvname X6=rcvsz_pri X7=timeout
+                     * Our arg3-arg8 map to X2-X7.
+                     * rcv_name = upper32 of X5 = upper32 of arg6
+                     * rcv_size = lower32 of X6 = lower32 of arg7
+                     */
                     fprintf(stderr,
                         "  mach_msg2: bits=0x%x size=%u remote=0x%x "
-                        "local=0x%x id=%u opts=0x%llx\n",
+                        "local=0x%x id=%u opts=0x%llx "
+                        "rcvname=0x%x rcvsize=%u\n",
                         hdr->msgh_bits, hdr->msgh_size,
                         hdr->msgh_remote_port,
                         hdr->msgh_local_port,
-                        hdr->msgh_id, options);
+                        hdr->msgh_id, options,
+                        (uint32_t)((uint64_t)arg6 >> 32),
+                        (uint32_t)((uint64_t)arg7));
                 }
 
                 kern_return_t mig_ret;
@@ -1481,18 +1661,85 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                                        (uint64_t)arg3, &mig_ret)) {
                     ret = mig_ret;
                 } else {
-                    ret = host_mach_msg2_trap(host_data, options,
+                    uint64_t trap_options = options;
+                    uint64_t trap_timeout = (uint64_t)arg8;
+                    bool added_timeout = false;
+
+                    /*
+                     * Prevent infinite hangs on XPC reply receives.
+                     * See xpc_timeout_result() for the retry strategy.
+                     */
+#define OPT_SEND   0x1
+#define OPT_RCV    0x2
+#define OPT_TMOUT  0x100
+#define OPT_STRICT 0x200
+                    if ((trap_options & (OPT_SEND | OPT_RCV)) == OPT_RCV
+                        && (trap_options & OPT_STRICT)
+                        && !(trap_options & OPT_TMOUT)
+                        && trap_timeout == 0) {
+                        /* Fast-fail: skip syscall entirely */
+                        if (xpc_should_fast_fail() && host_data) {
+                            uint32_t rcv_name =
+                                (uint32_t)((uint64_t)arg6 >> 32);
+                            ret = xpc_timeout_result(rcv_name,
+                                host_data, do_strace);
+                            goto direct_msg_done;
+                        }
+                        trap_options |= OPT_TMOUT;
+                        trap_timeout = XPC_TIMEOUT_MS;
+                        added_timeout = true;
+                    }
+#undef OPT_SEND
+#undef OPT_RCV
+#undef OPT_TMOUT
+#undef OPT_STRICT
+
+                    ret = host_mach_msg2_trap(host_data, trap_options,
                                               (uint64_t)arg3,
                                               (uint64_t)arg4,
                                               (uint64_t)arg5,
                                               (uint64_t)arg6,
                                               (uint64_t)arg7,
-                                              (uint64_t)arg8);
+                                              trap_timeout);
+
+                    if (added_timeout && ret == 0x10004003) {
+                        uint32_t rcv_name =
+                            (uint32_t)((uint64_t)arg6 >> 32);
+                        ret = xpc_timeout_result(rcv_name, host_data,
+                                                 do_strace);
+                    }
+                    if (do_strace && ret == KERN_SUCCESS &&
+                        (options & 0x2) && host_data) {
+                        mach_msg_header_t *rhdr =
+                            (mach_msg_header_t *)host_data;
+                        fprintf(stderr,
+                            "  mach_msg2 reply: bits=0x%x size=%u "
+                            "id=%u\n",
+                            rhdr->msgh_bits, rhdr->msgh_size,
+                            rhdr->msgh_id);
+                    }
+                    if (do_strace && ret != KERN_SUCCESS) {
+                        fprintf(stderr,
+                            "  mach_msg2 FAILED: ret=0x%x\n",
+                            (unsigned)ret);
+                        if (host_data) {
+                            mach_msg_header_t *hdr =
+                                (mach_msg_header_t *)host_data;
+                            fprintf(stderr,
+                                "  reply: bits=0x%x size=%u "
+                                "remote=0x%x local=0x%x id=%u\n",
+                                hdr->msgh_bits, hdr->msgh_size,
+                                hdr->msgh_remote_port,
+                                hdr->msgh_local_port,
+                                hdr->msgh_id);
+                        }
+                    }
                     /* Translate OOL descriptors in the reply */
                     if (ret == KERN_SUCCESS && host_data &&
                         (options & 0x2)) {
                         fixup_mig_reply_ool(host_data);
                     }
+                direct_msg_done: ;
                 }
             }
         }
