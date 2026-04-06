@@ -51,6 +51,7 @@ extern mach_port_t thread_get_special_reply_port(void);
 #define IPC_RECV_TIMEOUT_MS   5000   /* 5s per attempt */
 #define IPC_RECV_MAX_RETRY    3      /* then PORT_DIED */
 #define WORKLOOP_POLL_SLICE_MS 100
+#define DISPATCH_MACH_CHECKIN_MSGID 0x77303074U
 
 static mach_port_name_t ipc_timeout_port;
 static int ipc_timeout_count;
@@ -2234,33 +2235,55 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                             /*
                              * Send-only (external) port with zero timeout.
                              * The remote service may not have started its
-                             * receive loop yet.  Retry with a small non-zero
-                             * timeout to avoid a spurious MACH_SEND_TIMED_OUT
-                             * that would otherwise lead to an infinite hang
-                             * waiting for a send_possible notification that
-                             * never arrives.
+                             * receive loop yet, or its queue is temporarily
+                             * full due to a circular dependency in the XPC
+                             * bootstrap chain.  Retry with escalating
+                             * timeouts, servicing events between attempts
+                             * so the host service can make progress.
                              */
-#define EXT_SEND_RETRY_MS 100
-                            service_pending_workloop_reqs();
-                            service_workloop_machport_events();
-                            service_workq_notification_events();
-                            ret = host_mach_msg2_trap(host_data, vec_opts,
-                                                      (uint64_t)arg3,
-                                                      (uint64_t)arg4,
-                                                      (uint64_t)arg5,
-                                                      (uint64_t)arg6,
-                                                      (uint64_t)arg7,
-                                                      EXT_SEND_RETRY_MS);
-                            if (do_strace) {
-                                fprintf(stderr,
-                                    "  mach_msg2[vec]: ext-send retry %s "
-                                    "for port 0x%x tmout=%dms\n",
-                                    ret == KERN_SUCCESS
-                                        ? "succeeded" : "failed",
-                                    retry_hdr->msgh_remote_port,
-                                    EXT_SEND_RETRY_MS);
+                            static const int ext_retry_ms[] = {
+                                50, 100, 200, 500, 1000
+                            };
+                            for (int ri = 0;
+                                 ri < (int)(sizeof(ext_retry_ms) /
+                                            sizeof(ext_retry_ms[0]));
+                                 ri++) {
+                                service_pending_workloop_reqs();
+                                service_workloop_machport_events();
+                                service_workq_notification_events();
+                                ret = host_mach_msg2_trap(
+                                    host_data, vec_opts,
+                                    (uint64_t)arg3, (uint64_t)arg4,
+                                    (uint64_t)arg5, (uint64_t)arg6,
+                                    (uint64_t)arg7,
+                                    (uint64_t)ext_retry_ms[ri]);
+                                if (do_strace) {
+                                    fprintf(stderr,
+                                        "  mach_msg2[vec]: ext-send "
+                                        "retry[%d] %s for port 0x%x "
+                                        "tmout=%dms\n",
+                                        ri,
+                                        ret == KERN_SUCCESS
+                                            ? "succeeded" : "TIMED_OUT",
+                                        retry_hdr->msgh_remote_port,
+                                        ext_retry_ms[ri]);
+                                }
+                                if (ret != 0x10000004) {
+                                    break;
+                                }
                             }
-#undef EXT_SEND_RETRY_MS
+                            if (ret == MACH_SEND_TIMED_OUT &&
+                                retry_hdr->msgh_id ==
+                                DISPATCH_MACH_CHECKIN_MSGID) {
+                                if (do_strace) {
+                                    fprintf(stderr,
+                                        "  mach_msg2[vec]: remapping failed "
+                                        "dispatch_mach checkin timeout on "
+                                        "port 0x%x to INVALID_DEST\n",
+                                        retry_hdr->msgh_remote_port);
+                                }
+                                ret = MACH_SEND_INVALID_DEST;
+                            }
                         }
                     }
 
@@ -2449,9 +2472,11 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                         mach_msg_header_t *retry_hdr =
                             (mach_msg_header_t *)host_data;
                         mach_port_type_t retry_ptype = 0;
-                        if (mach_port_type(mach_task_self(),
+                        kern_return_t ptype_rc =
+                            mach_port_type(mach_task_self(),
                                            retry_hdr->msgh_remote_port,
-                                           &retry_ptype) == KERN_SUCCESS &&
+                                           &retry_ptype);
+                        if (ptype_rc == KERN_SUCCESS &&
                             (retry_ptype & MACH_PORT_TYPE_RECEIVE)) {
                             mach_port_limits_t retry_limits = {
                                 .mpl_qlimit = MACH_PORT_QLIMIT_SMALL,
@@ -2478,6 +2503,57 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                                     "  mach_msg2: local-send retry "
                                     "succeeded for port 0x%x qlimit_ret=%d\n",
                                     retry_hdr->msgh_remote_port, retry_lret);
+                            }
+                        } else if (ptype_rc == KERN_SUCCESS &&
+                                   (retry_ptype & MACH_PORT_TYPE_SEND) &&
+                                   !(retry_ptype & MACH_PORT_TYPE_RECEIVE) &&
+                                   trap_timeout == 0) {
+                            /*
+                             * Send-only (external) port with zero timeout.
+                             * Same escalating retry as the vector path.
+                             */
+                            static const int ext_retry_ms[] = {
+                                50, 100, 200, 500, 1000
+                            };
+                            for (int ri = 0;
+                                 ri < (int)(sizeof(ext_retry_ms) /
+                                            sizeof(ext_retry_ms[0]));
+                                 ri++) {
+                                service_pending_workloop_reqs();
+                                service_workloop_machport_events();
+                                service_workq_notification_events();
+                                ret = host_mach_msg2_trap(
+                                    host_data, trap_options,
+                                    (uint64_t)arg3, (uint64_t)arg4,
+                                    (uint64_t)arg5, (uint64_t)arg6,
+                                    (uint64_t)arg7,
+                                    (uint64_t)ext_retry_ms[ri]);
+                                if (do_strace) {
+                                    fprintf(stderr,
+                                        "  mach_msg2: ext-send "
+                                        "retry[%d] %s for port 0x%x "
+                                        "tmout=%dms\n",
+                                        ri,
+                                        ret == KERN_SUCCESS
+                                            ? "succeeded" : "TIMED_OUT",
+                                        retry_hdr->msgh_remote_port,
+                                        ext_retry_ms[ri]);
+                                }
+                                if (ret != 0x10000004) {
+                                    break;
+                                }
+                            }
+                            if (ret == MACH_SEND_TIMED_OUT &&
+                                retry_hdr->msgh_id ==
+                                DISPATCH_MACH_CHECKIN_MSGID) {
+                                if (do_strace) {
+                                    fprintf(stderr,
+                                        "  mach_msg2: remapping failed "
+                                        "dispatch_mach checkin timeout on "
+                                        "port 0x%x to INVALID_DEST\n",
+                                        retry_hdr->msgh_remote_port);
+                                }
+                                ret = MACH_SEND_INVALID_DEST;
                             }
                         }
                     }
