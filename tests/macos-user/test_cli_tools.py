@@ -1650,6 +1650,44 @@ int main(void) {
         self.assertRegex(decoded, r"windows=\d+")
         self.assertRegex(decoded, r"queried=\d+")
 
+    # -- CoreGraphics display info test ----------------------------------------
+
+    _CG_DISPLAY_SRC = r'''
+#include <CoreGraphics/CoreGraphics.h>
+#include <stdio.h>
+#include <unistd.h>
+
+int main(void) {
+    alarm(10);
+
+    CGDirectDisplayID mainDisp = CGMainDisplayID();
+    fprintf(stderr, "main_display=0x%x\n", mainDisp);
+
+    CGRect bounds = CGDisplayBounds(mainDisp);
+    fprintf(stderr, "bounds=%.0fx%.0f\n", bounds.size.width,
+            bounds.size.height);
+
+    size_t w = CGDisplayPixelsWide(mainDisp);
+    size_t h = CGDisplayPixelsHigh(mainDisp);
+    fprintf(stderr, "pixels=%zux%zu\n", w, h);
+
+    fprintf(stderr, "done\n");
+    return 0;
+}
+'''
+
+    def test_cg_display_info(self):
+        """CoreGraphics display queries work under emulation."""
+        exe = _compile_framework_test("cg_display", self._CG_DISPLAY_SRC,
+                                      ["CoreGraphics"], language="c")
+        rc, _, err = _run_emulated(exe, timeout=15)
+        decoded = err.decode(errors="replace")
+        self.assertEqual(rc, 0, f"cg_display failed: {decoded}")
+        self.assertRegex(decoded, r"main_display=0x[0-9a-f]+")
+        self.assertRegex(decoded, r"bounds=\d+x\d+")
+        self.assertRegex(decoded, r"pixels=\d+x\d+")
+        self.assertIn("done", decoded)
+
 
 # ---------------------------------------------------------------------------
 # Helper: compile Objective-C / C test programs from source strings

@@ -821,8 +821,9 @@ static void deliver_workloop_events_to_thread(uint64_t workloop_id,
     pthread_mutex_unlock(&parked_workloop_lock);
 
     if (pw) {
-        pw->delivered_events = g_memdup2(events,
-            nevents * sizeof(struct kevent_qos_s));
+        pw->delivered_events = (events && nevents > 0)
+            ? g_memdup2(events, nevents * sizeof(struct kevent_qos_s))
+            : NULL;
         pw->delivered_nevents = nevents;
         pw->workloop_id = workloop_id;
 
@@ -892,7 +893,9 @@ static void deliver_workloop_events_to_thread(uint64_t workloop_id,
     abi_ulong kqid_addr = sp;
     abi_ulong keventlist = sp + sizeof(uint64_t);
     *(uint64_t *)g2h_untagged(kqid_addr) = workloop_id;
-    memcpy(g2h_untagged(keventlist), events, events_sz);
+    if (events && events_sz > 0) {
+        memcpy(g2h_untagged(keventlist), events, events_sz);
+    }
 
     sp -= 256;  /* headroom */
     sp &= ~(abi_ulong)0xF;
@@ -3276,8 +3279,11 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
          * guest workqueue threads.  These ports are dispatch-internal
          * (not in CFRunLoop port sets), so kqueue monitoring is safe.
          *
-         * WORKLOOP (EVFILT_WORKLOOP) events remain no-ops — we handle
-         * thread creation ourselves when MACHPORT events fire.
+         * WORKLOOP (EVFILT_WORKLOOP) events remain no-ops for now.
+         * Serial queues that rely on workloop thread requests don't
+         * work yet — this requires emulating the kernel's workloop
+         * thread scheduling, which is complex.  Global queue dispatch
+         * and dispatch_apply work because they use WQOPS_QUEUE_REQTHREADS.
          */
         if (cl && nchanges > 0) {
             bool have_machport = false;
@@ -3288,22 +3294,16 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                 }
             }
             if (have_machport) {
-                /* Ensure monitor thread is running */
                 TaskState *ts = get_task_state(
                     env_cpu((CPUArchState *)cpu_env));
                 ensure_workq_monitor((CPUArchState *)cpu_env, ts);
-                /*
-                 * Register MACHPORT events on our workq kqueue.
-                 * Use kevent64 since kevent_qos doesn't work on
-                 * regular kqueues.
-                 */
                 int kq = get_workq_kqueue();
+
                 for (int i = 0; i < nchanges; i++) {
                     if (cl[i].filter == EVFILT_MACHPORT) {
                         struct kevent64_s k64;
                         kqos_to_k64(&cl[i], &k64);
                         int rc = kevent64(kq, &k64, 1, NULL, 0, 0, NULL);
-                        /* Track workloop→port mapping (arg1 is wl ID) */
                         add_workloop_port(arg1,
                             (mach_port_t)cl[i].ident);
                         if (do_strace) {
