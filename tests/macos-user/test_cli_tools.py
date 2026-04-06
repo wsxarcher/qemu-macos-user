@@ -1688,6 +1688,49 @@ int main(void) {
         self.assertRegex(decoded, r"pixels=\d+x\d+")
         self.assertIn("done", decoded)
 
+    # -- dispatch_async serial queue test --------------------------------------
+
+    _DISPATCH_SERIAL_SRC = r'''
+#include <dispatch/dispatch.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <stdatomic.h>
+
+int main(void) {
+    alarm(10);
+
+    dispatch_queue_t q = dispatch_queue_create("test.serial",
+                                               DISPATCH_QUEUE_SERIAL);
+    __block atomic_int count = 0;
+
+    for (int i = 0; i < 5; i++) {
+        dispatch_async(q, ^{
+            atomic_fetch_add(&count, 1);
+            fprintf(stderr, "block %d\n", atomic_load(&count));
+        });
+    }
+
+    /* Poll-wait for serial queue to drain */
+    for (int i = 0; i < 50 && atomic_load(&count) < 5; i++) {
+        usleep(100000);
+    }
+
+    int final = atomic_load(&count);
+    fprintf(stderr, "count=%d\n", final);
+    return (final == 5) ? 0 : 1;
+}
+'''
+
+    def test_dispatch_serial_queue(self):
+        """dispatch_async on serial queues works under emulation."""
+        exe = _compile_framework_test("dispatch_serial",
+                                      self._DISPATCH_SERIAL_SRC,
+                                      [], language="c")
+        rc, _, err = _run_emulated(exe, timeout=15)
+        decoded = err.decode(errors="replace")
+        self.assertEqual(rc, 0, f"dispatch_serial failed: {decoded}")
+        self.assertIn("count=5", decoded)
+
 
 # ---------------------------------------------------------------------------
 # Helper: compile Objective-C / C test programs from source strings

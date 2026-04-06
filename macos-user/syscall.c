@@ -218,6 +218,93 @@ static workloop_port_entry workloop_ports[MAX_WORKLOOP_PORTS];
 static int workloop_port_count = 0;
 static pthread_mutex_t workloop_port_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Forward declaration */
+static void deliver_workloop_events_to_thread(uint64_t workloop_id,
+                                               struct kevent_qos_s *events,
+                                               int nevents);
+
+/*
+ * Pending workloop thread requests.  Instead of immediately creating
+ * workloop threads on kevent_id (which crashes framework-internal
+ * workloops), we defer the creation.  The thread is created only when
+ * __semwait_signal detects the main thread is blocked waiting for
+ * serial queue work.
+ */
+#define MAX_PENDING_WL 16
+typedef struct {
+    uint64_t workloop_id;
+    struct kevent_qos_s event;
+    bool active;
+} pending_workloop_req;
+
+static pending_workloop_req pending_wl_reqs[MAX_PENDING_WL];
+static int pending_wl_count = 0;
+static pthread_mutex_t pending_wl_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void add_pending_workloop_req(uint64_t wl_id,
+                                     const struct kevent_qos_s *ev)
+{
+    pthread_mutex_lock(&pending_wl_lock);
+    /* If already pending → this is a repeat request → service immediately */
+    for (int i = 0; i < pending_wl_count; i++) {
+        if (pending_wl_reqs[i].workloop_id == wl_id
+            && pending_wl_reqs[i].active) {
+            pending_wl_reqs[i].active = false;
+            pthread_mutex_unlock(&pending_wl_lock);
+
+            /*
+             * Use the NEW event (from this call), not the saved one.
+             * The dq_state may have changed since the first request.
+             */
+            struct kevent_qos_s fresh_ev = *ev;
+            if (fresh_ev.ext[1]) {
+                uint64_t *dq_state_p = (uint64_t *)
+                    g2h_untagged(fresh_ev.ext[1]);
+                fresh_ev.ext[3] = *dq_state_p;
+            }
+
+            if (do_strace) {
+                fprintf(stderr, "    WORKLOOP THREAD_REQ wl=0x%llx"
+                        " -> repeat, creating thread now\n",
+                        (unsigned long long)wl_id);
+            }
+            deliver_workloop_events_to_thread(wl_id, &fresh_ev, 1);
+            return;
+        }
+    }
+    /* First request — defer */
+    if (pending_wl_count < MAX_PENDING_WL) {
+        pending_wl_reqs[pending_wl_count].workloop_id = wl_id;
+        pending_wl_reqs[pending_wl_count].event = *ev;
+        pending_wl_reqs[pending_wl_count].active = true;
+        pending_wl_count++;
+    }
+    pthread_mutex_unlock(&pending_wl_lock);
+}
+
+static void service_pending_workloop_reqs(void)
+{
+    pthread_mutex_lock(&pending_wl_lock);
+    for (int i = 0; i < pending_wl_count; i++) {
+        if (!pending_wl_reqs[i].active) {
+            continue;
+        }
+        pending_wl_reqs[i].active = false;
+        struct kevent_qos_s ev = pending_wl_reqs[i].event;
+        uint64_t wl_id = pending_wl_reqs[i].workloop_id;
+        pthread_mutex_unlock(&pending_wl_lock);
+
+        if (do_strace) {
+            fprintf(stderr, "  semwait: servicing pending workloop "
+                    "wl=0x%llx\n", (unsigned long long)wl_id);
+        }
+        deliver_workloop_events_to_thread(wl_id, &ev, 1);
+
+        pthread_mutex_lock(&pending_wl_lock);
+    }
+    pthread_mutex_unlock(&pending_wl_lock);
+}
+
 static void add_workloop_port(uint64_t wl_id, mach_port_t port)
 {
     pthread_mutex_lock(&workloop_port_lock);
@@ -2400,6 +2487,14 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
             int64_t tv_sec = (int64_t)arg5;
             int32_t tv_nsec = (int32_t)arg6;
 
+            /*
+             * Service any pending workloop thread requests.
+             * This is where deferred kevent_id THREAD_REQUEST handling
+             * kicks in — the caller is blocked waiting for serial queue
+             * work to complete.
+             */
+            service_pending_workloop_reqs();
+
             if (has_timeout && (tv_sec > 0 || tv_nsec > 0)) {
                 struct timespec ts;
                 ts.tv_sec = tv_sec;
@@ -3264,73 +3359,85 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                 for (int i = 0; i < nchanges; i++) {
                     fprintf(stderr, "    kev[%d]: filter=%d "
                             "ident=0x%llx flags=0x%x "
-                            "fflags=0x%x ext0=0x%llx\n",
+                            "fflags=0x%x ext=[0x%llx,0x%llx,0x%llx,0x%llx]\n",
                             i, cl[i].filter,
                             (unsigned long long)cl[i].ident,
                             cl[i].flags, cl[i].fflags,
-                            (unsigned long long)cl[i].ext[0]);
+                            (unsigned long long)cl[i].ext[0],
+                            (unsigned long long)cl[i].ext[1],
+                            (unsigned long long)cl[i].ext[2],
+                            (unsigned long long)cl[i].ext[3]);
                 }
             }
         }
 
         /*
-         * kevent_id: register MACHPORT events on our workq kqueue so
-         * the monitor thread can detect incoming messages and create
-         * guest workqueue threads.  These ports are dispatch-internal
-         * (not in CFRunLoop port sets), so kqueue monitoring is safe.
+         * kevent_id: used by libdispatch for workloop kqueues.
          *
-         * WORKLOOP (EVFILT_WORKLOOP) events remain no-ops for now.
-         * Serial queues that rely on workloop thread requests don't
-         * work yet — this requires emulating the kernel's workloop
-         * thread scheduling, which is complex.  Global queue dispatch
-         * and dispatch_apply work because they use WQOPS_QUEUE_REQTHREADS.
+         * MACHPORT events go to our workq kqueue for manual monitoring.
+         *
+         * WORKLOOP events with NOTE_WL_THREAD_REQUEST tell us GCD
+         * needs a thread to service a workloop (serial queue).  We
+         * create a guest workloop thread with the THREAD_REQUEST event
+         * so libdispatch can process queued blocks.
          */
+#define NOTE_WL_THREAD_REQUEST 0x00000001
         if (cl && nchanges > 0) {
-            bool have_machport = false;
+            TaskState *ts = get_task_state(
+                env_cpu((CPUArchState *)cpu_env));
+            /* Ensure monitor is initialized for thread creation */
+            ensure_workq_monitor((CPUArchState *)cpu_env, ts);
+
             for (int i = 0; i < nchanges; i++) {
                 if (cl[i].filter == EVFILT_MACHPORT) {
-                    have_machport = true;
-                    break;
-                }
-            }
-            if (have_machport) {
-                TaskState *ts = get_task_state(
-                    env_cpu((CPUArchState *)cpu_env));
-                ensure_workq_monitor((CPUArchState *)cpu_env, ts);
-                int kq = get_workq_kqueue();
-
-                for (int i = 0; i < nchanges; i++) {
-                    if (cl[i].filter == EVFILT_MACHPORT) {
-                        struct kevent64_s k64;
-                        kqos_to_k64(&cl[i], &k64);
-                        int rc = kevent64(kq, &k64, 1, NULL, 0, 0, NULL);
-                        add_workloop_port(arg1,
-                            (mach_port_t)cl[i].ident);
-                        if (do_strace) {
-                            fprintf(stderr, "    MACHPORT ident=0x%llx"
-                                    " -> kqueue reg rc=%d wl=0x%llx%s\n",
-                                    (unsigned long long)cl[i].ident,
-                                    rc, (unsigned long long)arg1,
-                                    rc < 0 ? " (FAILED)" : "");
-                        }
-                    } else {
-                        if (do_strace) {
-                            fprintf(stderr,
-                                    "    WORKLOOP ident=0x%llx -> no-op\n",
-                                    (unsigned long long)cl[i].ident);
-                        }
+                    int kq = get_workq_kqueue();
+                    struct kevent64_s k64;
+                    kqos_to_k64(&cl[i], &k64);
+                    int rc = kevent64(kq, &k64, 1, NULL, 0, 0, NULL);
+                    add_workloop_port(arg1,
+                        (mach_port_t)cl[i].ident);
+                    if (do_strace) {
+                        fprintf(stderr, "    MACHPORT ident=0x%llx"
+                                " -> kqueue reg rc=%d wl=0x%llx%s\n",
+                                (unsigned long long)cl[i].ident,
+                                rc, (unsigned long long)arg1,
+                                rc < 0 ? " (FAILED)" : "");
                     }
-                }
-            } else {
-                if (do_strace) {
-                    for (int i = 0; i < nchanges; i++) {
-                        fprintf(stderr, "    WORKLOOP ident=0x%llx"
-                                " -> no-op\n",
+                } else if ((cl[i].fflags & NOTE_WL_THREAD_REQUEST)
+                           && cl[i].filter == EVFILT_WORKLOOP_PRIVATE) {
+                    /*
+                     * GCD serial queue needs a servicer thread.
+                     * Defer thread creation to avoid crashing on
+                     * framework-internal workloops.  The thread will
+                     * be created when __semwait_signal detects the
+                     * caller is blocked waiting for serial queue work.
+                     *
+                     * ext layout (libdispatch private):
+                     *   ext[0] = WL_LANE
+                     *   ext[1] = WL_ADDR  (&dq->dq_state)
+                     *   ext[2] = WL_MASK
+                     *   ext[3] = WL_VALUE (current dq_state)
+                     */
+                    struct kevent_qos_s wl_ev = cl[i];
+                    /* Read current dq_state if WL_ADDR is set */
+                    if (wl_ev.ext[1]) {
+                        uint64_t *dq_state_p = (uint64_t *)
+                            g2h_untagged(wl_ev.ext[1]);
+                        wl_ev.ext[3] = *dq_state_p;
+                    }
+                    add_pending_workloop_req(arg1, &wl_ev);
+                    /* strace is printed inside add_pending_workloop_req
+                     * for the repeat case, or here for the first defer */
+                } else {
+                    if (do_strace) {
+                        fprintf(stderr,
+                                "    WORKLOOP ident=0x%llx -> no-op\n",
                                 (unsigned long long)cl[i].ident);
                     }
                 }
             }
         }
+#undef NOTE_WL_THREAD_REQUEST
 
         ret = 0;
         if (do_strace) {
