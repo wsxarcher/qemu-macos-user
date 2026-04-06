@@ -318,6 +318,43 @@ void host_signal_handler(int host_sig, siginfo_t *info, void *puc)
 
         MMUAccessType access_type = adjust_signal_pc(&pc, is_write);
 
+        /*
+         * Demand-materialise pages from PROT_NONE reservations.
+         *
+         * Large mach_vm_map(PROT_NONE) reservations (e.g. xzone malloc's
+         * 24 GB region) are registered in the QEMU page table as
+         * PAGE_VALID only — no host backing exists yet.  When guest code
+         * (or the allocator itself) accesses a page inside such a
+         * reservation, the host delivers SIGSEGV (SEGV_ACCERR) or
+         * SIGBUS (BUS_ADRALN for atomics on PROT_NONE pages).
+         *
+         * Detect this case: the guest page is PAGE_VALID but lacks
+         * PAGE_READ / PAGE_WRITE.  Materialise a RW host mapping at the
+         * correct host address and retry the instruction.
+         */
+        if (h2g_valid(host_addr)) {
+            int pflags = page_get_flags(guest_addr);
+            if ((pflags & PAGE_VALID) && !(pflags & (PAGE_READ | PAGE_WRITE))) {
+                unsigned long host_page = qemu_real_host_page_size();
+                abi_ulong page_start = guest_addr & ~(host_page - 1);
+                abi_ulong page_size = host_page;
+                /*
+                 * The host address is within our PROT_NONE guest reservation.
+                 * Use mprotect (not mmap) to materialise the page, since the
+                 * backing VMA already exists.
+                 */
+                int rc = mprotect(g2h_untagged(page_start), page_size,
+                                  PROT_READ | PROT_WRITE);
+                if (rc == 0) {
+                    mmap_lock();
+                    page_set_flags(page_start, page_start + page_size - 1,
+                                   PAGE_VALID | PAGE_READ | PAGE_WRITE, ~0);
+                    mmap_unlock();
+                    return; /* retry the faulting instruction */
+                }
+            }
+        }
+
         if (host_sig == SIGSEGV) {
             bool maperr = true;
 
@@ -358,6 +395,17 @@ void host_signal_handler(int host_sig, siginfo_t *info, void *puc)
             /* NOTREACHED */
         } else {
             sigprocmask(SIG_SETMASK, &uc->uc_sigmask, NULL);
+            if (do_strace) {
+                fprintf(stderr, "qemu: SIGBUS guest_addr=0x%llx "
+                        "host_addr=%p code=%d write=%d "
+                        "page_flags=0x%x pc=0x%llx\n",
+                        (unsigned long long)guest_addr,
+                        (void *)host_addr,
+                        info->si_code,
+                        is_write,
+                        page_get_flags(guest_addr),
+                        (unsigned long long)pc);
+            }
             if (info->si_code == BUS_ADRALN) {
                 cpu_loop_exit_sigbus(cpu, guest_addr, access_type, pc);
                 /* NOTREACHED */

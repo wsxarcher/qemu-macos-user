@@ -1432,6 +1432,39 @@ int main(void) {
                 self.assertGreater(n, 5, "expected many nonzero bytes")
 
     # -- CFPreferences: XPC timeout handling --------------------------------
+
+    # -- malloc stress: validates PROT_NONE page materialisation -------------
+    _MALLOC_STRESS_SRC = r'''
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(void) {
+    /* Allocate 1000 blocks without freeing — exercises xzone_malloc's
+       large PROT_NONE reservation and triggers demand-page
+       materialisation in the signal handler. */
+    int ok = 1;
+    for (int i = 0; i < 1000; i++) {
+        void *p = malloc(4096);
+        if (!p) { ok = 0; break; }
+        /* Touch the allocation to ensure the page is backed */
+        *(volatile char *)p = (char)i;
+    }
+    printf("malloc_stress=%s\n", ok ? "pass" : "fail");
+    return ok ? 0 : 1;
+}
+'''
+
+    def test_malloc_stress(self):
+        """1000 mallocs without free (validates PROT_NONE materialisation)."""
+        exe = _compile_framework_test("malloc_stress",
+                                      self._MALLOC_STRESS_SRC,
+                                      [],
+                                      language="c")
+        rc, out, _ = _run_emulated(exe, timeout=15)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"malloc_stress=pass", out)
+
+    # -- CFPreferences: XPC timeout handling --------------------------------
     _CF_PREFERENCES_SRC = r'''
 #include <CoreFoundation/CoreFoundation.h>
 #include <signal.h>

@@ -407,7 +407,9 @@ static MemOp check_atomic_align(DisasContext *s, int rn, MemOp mop)
                                    MO_ATOM_IFALIGN_PAIR);
     }
     if (dc_isar_feature(aa64_lse2, s)) {
-        check_lse2_align(s, rn, 0, true, mop);
+        if (!s->naa) {
+            check_lse2_align(s, rn, 0, true, mop);
+        }
     } else {
         mop |= MO_ALIGN;
     }

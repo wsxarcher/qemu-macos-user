@@ -558,19 +558,32 @@ int main(int argc, char **argv, char **envp)
     }
 
     /*
-     * Disable Pointer Authentication (PAC) to match macOS arm64 behavior.
+     * Disable Pointer Authentication (PAC) for arm64 guest processes.
      *
      * The macOS kernel disables PAC for arm64 (non-arm64e) processes by
-     * clearing SCTLR_EL1.{EnIA,EnIB,EnDA,EnDB}.  This makes PACIA/PACIB
-     * instructions behave as NOPs — pointers are never signed.
+     * clearing SCTLR_EL1.{EnIA, EnIB, EnDA, EnDB}.  This makes AUTIA,
+     * AUTIB, AUTDA, AUTDB behave as NOPs, which is correct for arm64
+     * binaries that use BLR directly without authentication.
      *
-     * Without this, the arm64e shared cache code signs function pointers
-     * via PACIA/PACIB, and our arm64 guest code (which uses plain BLR
-     * without authentication) jumps to corrupted addresses with PAC bits
-     * still set in bits 48-55.
+     * The arm64e shared cache contains some PAC-signed data pointers,
+     * but dlsym and the dynamic linker strip PAC bits before returning
+     * pointers to arm64 callers.  With PAC disabled, those pointers
+     * are already clean.
      */
     env->cp15.sctlr_el[1] &= ~(SCTLR_EnIA | SCTLR_EnIB |
-                                SCTLR_EnDA | SCTLR_EnDB);
+                                 SCTLR_EnDA | SCTLR_EnDB);
+
+    /*
+     * Enable non-aligned atomics (SCTLR_EL1.nAA).
+     *
+     * Apple Silicon handles unaligned atomics/exclusives natively,
+     * even across 16-byte boundaries.  QEMU's TCG generates alignment
+     * faults for these (via check_lse2_align), which crashes macOS
+     * allocators like xzone_malloc that use unaligned LDXR/STXR on
+     * tightly packed metadata.  Setting nAA tells the translator to
+     * skip these alignment checks.
+     */
+    env->cp15.sctlr_el[1] |= SCTLR_nAA;
     arm_rebuild_hflags(env);
 
     thread_cpu = cpu;
