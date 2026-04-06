@@ -135,9 +135,17 @@ static inline G_NORETURN void target_cpu_loop(CPUARMState *env)
 
         case EXCP_PREFETCH_ABORT:
         case EXCP_DATA_ABORT:
-            /* We should only arrive here with EC in {DATAABORT, INSNABORT} */
             ec = syn_get_ec(env->exception.syndrome);
-            assert(ec == EC_DATAABORT || ec == EC_INSNABORT);
+            if (ec != EC_DATAABORT && ec != EC_INSNABORT) {
+                fprintf(stderr, "qemu: unexpected exception class EC=0x%x "
+                        "syndrome=0x%x PC=0x%lx vaddr=0x%lx\n",
+                        ec, env->exception.syndrome,
+                        (unsigned long)env->pc,
+                        (unsigned long)env->exception.vaddress);
+                force_sig_fault(TARGET_SIGSEGV, TARGET_SEGV_MAPERR,
+                                env->exception.vaddress);
+                break;
+            }
 
             /* Both EC have the same format for FSC, or close enough */
             fsc = extract32(env->exception.syndrome, 0, 6);

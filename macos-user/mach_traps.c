@@ -489,10 +489,15 @@ static bool handle_mig_message(void *buf, uint64_t options,
                                          -1, 0);
                 result = (r == (abi_long)guest_start) ? guest_start : -1;
             } else {
-                /* Too large — just register in guest page table */
+                /*
+                 * Too large — just register in guest page table.
+                 * Use clr_flags=0 to preserve existing page flags
+                 * (e.g. the sigreturn trampoline) that may already
+                 * be mapped within this range.
+                 */
                 mmap_lock();
                 page_set_flags(guest_start, guest_start + size - 1,
-                               PAGE_VALID, ~0);
+                               PAGE_VALID, 0);
                 mmap_unlock();
                 result = guest_start;
             }

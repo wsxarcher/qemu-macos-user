@@ -137,8 +137,8 @@ void force_sig_fault(int sig, int code, abi_ulong addr);
 void queue_signal(CPUArchState *env, int sig, int si_type,
                   target_siginfo_t *info);
 void process_pending_signals(CPUArchState *env);
-int do_sigaction(int sig, const struct target_sigaction *act,
-                 struct target_sigaction *oact);
+int do_sigaction(int sig, abi_ulong act_addr, abi_ulong oact_addr);
+abi_ulong get_sigreturn_trampoline_addr(void);
 
 /* Signal conversion helpers */
 int host_to_target_signal(int sig);

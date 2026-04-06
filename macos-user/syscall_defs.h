@@ -533,9 +533,19 @@ typedef struct target_siginfo {
     } _sifields;
 } target_siginfo_t;
 
-/* sigaction structure */
+/*
+ * sigaction internal representation — used in sigact_table[].
+ * Fields use abi_ulong for internal convenience.
+ * do_sigaction() handles conversion from the macOS guest layout:
+ *   offset 0:  sa_handler  (8 bytes, pointer)
+ *   offset 8:  sa_tramp    (8 bytes, pointer to signal trampoline)
+ *   offset 16: sa_mask     (4 bytes, uint32_t sigset_t)
+ *   offset 20: sa_flags    (4 bytes, int)
+ * Total: 24 bytes
+ */
 struct target_sigaction {
     abi_ulong _sa_handler;
+    abi_ulong sa_tramp;
     abi_ulong sa_flags;
     abi_ulong sa_mask;
 };

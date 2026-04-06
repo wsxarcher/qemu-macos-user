@@ -21,6 +21,7 @@ void setup_frame(int sig, struct target_sigaction *ka,
  * They are stripped before writing to guest memory.
  */
 #define QEMU_SI_NOINFO   0
+#define QEMU_SI_KILL     0      /* si_pid and si_uid are valid */
 #define QEMU_SI_FAULT    1
 #define QEMU_SI_TIMER    2
 #define QEMU_SI_MESGQ    3

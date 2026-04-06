@@ -1457,9 +1457,7 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
         break;
 
     case TARGET_MACOS_NR_sigaction:
-        ret = do_sigaction(arg1,
-                           arg2 ? g2h_untagged(arg2) : NULL,
-                           arg3 ? g2h_untagged(arg3) : NULL);
+        ret = do_sigaction(arg1, arg2, arg3);
         break;
 
     case TARGET_MACOS_NR_sigprocmask:
@@ -1478,20 +1476,47 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
 
     case TARGET_MACOS_NR_kill:
         /* kill(pid_t pid, int sig) */
-        ret = get_errno(kill(arg1, target_to_host_signal(arg2)));
+        if ((pid_t)arg1 == getpid() && arg2 != 0) {
+            /* Self-signal: queue directly for guest delivery */
+            int guest_sig = target_to_host_signal(arg2);
+            if (guest_sig >= 1 && guest_sig <= TARGET_NSIG) {
+                target_siginfo_t info = {};
+                info.si_signo = guest_sig;
+                info.si_code = SI_USER;
+                info.si_pid = getpid();
+                info.si_uid = getuid();
+                queue_signal(cpu_env, guest_sig, QEMU_SI_KILL, &info);
+                ret = 0;
+            } else {
+                ret = -TARGET_EINVAL;
+            }
+        } else {
+            ret = get_errno(kill(arg1, target_to_host_signal(arg2)));
+        }
         break;
 
     case TARGET_MACOS_NR___pthread_kill:
         /*
          * __pthread_kill(pthread_t thread, int sig)
-         * We're single-threaded — the only thread is self.  Forward
-         * directly to the host kill(getpid(), sig).  If sig is 0 it
-         * is a validity check and always succeeds.
+         * We're single-threaded — the only thread is self.  Queue the
+         * signal directly for guest delivery instead of using host kill(),
+         * which may fail if the host signal mask blocks it.
          */
         if (arg2 == 0) {
             ret = 0;
         } else {
-            ret = get_errno(kill(getpid(), target_to_host_signal(arg2)));
+            int guest_sig = arg2;
+            if (guest_sig >= 1 && guest_sig <= TARGET_NSIG) {
+                target_siginfo_t info = {};
+                info.si_signo = guest_sig;
+                info.si_code = SI_USER;
+                info.si_pid = getpid();
+                info.si_uid = getuid();
+                queue_signal(cpu_env, guest_sig, QEMU_SI_KILL, &info);
+                ret = 0;
+            } else {
+                ret = -TARGET_EINVAL;
+            }
         }
         break;
 

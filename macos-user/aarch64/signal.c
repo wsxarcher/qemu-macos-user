@@ -17,16 +17,31 @@ abi_long set_sigtramp_args(CPUARMState *env, int sig,
                            struct target_sigaction *ka)
 {
     /*
-     * macOS AArch64 signal handler calling convention:
-     *   X0 = signal number
-     *   X1 = pointer to siginfo  (not yet passed; future work)
-     *   X2 = pointer to ucontext (not yet passed; future work)
-     *   SP = frame address
-     *   PC = handler address
-     *   LR = signal trampoline return address (TODO: set up trampoline)
+     * macOS AArch64 signal delivery.
+     *
+     * On real macOS the kernel calls sa_tramp (__sigtramp) which
+     * then calls the handler and sigreturn.  We instead run the
+     * handler directly and use a persistent sigreturn trampoline
+     * page (allocated during signal_init) as the return address.
+     *
+     * We save frame_addr in X28 (callee-saved per AAPCS64, so the
+     * handler must preserve it).  The trampoline copies X28 to X0
+     * (the sigreturn argument) then invokes the sigreturn syscall.
+     *
+     * Registers on entry to handler:
+     *   X0  = signal number
+     *   X28 = frame address (for sigreturn trampoline)
+     *   LR  = sigreturn trampoline address
+     *   SP  = below signal frame (16-byte aligned)
+     *   PC  = handler address
      */
+
+    abi_ulong tramp_addr = get_sigreturn_trampoline_addr();
+
     env->xregs[0] = sig;
-    env->xregs[31] = frame_addr;
+    env->xregs[28] = frame_addr;        /* saved for sigreturn trampoline */
+    env->xregs[30] = tramp_addr;        /* LR = sigreturn trampoline */
+    env->xregs[31] = frame_addr & ~15;  /* SP aligned at frame */
     env->pc = ka->_sa_handler;
     return 0;
 }
