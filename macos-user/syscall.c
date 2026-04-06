@@ -18,6 +18,7 @@
 #include <poll.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <mach/mach_time.h>
 #include "qemu.h"
 #include "user/guest-host.h"
 #include "user-internals.h"
@@ -421,6 +422,10 @@ static bool workq_monitor_started;
 static CPUArchState *workq_monitor_parent_env;
 static TaskState *workq_monitor_parent_ts;
 
+/* Saved udata and QoS from EVFILT_USER registration on workq kqueue */
+static uint64_t saved_evfilt_user_udata;
+static uint32_t saved_evfilt_user_qos;
+
 /* Stack allocation constants (must match WQOPS_QUEUE_REQTHREADS) */
 #define PTH_DEFAULT_STACKSZ    (512 * 1024)
 #define PTHREAD_T_OFFSET_ARM64 (12 * 1024)
@@ -441,6 +446,81 @@ static void deliver_kevents_to_thread(struct kevent_qos_s *events,
 static void deliver_workloop_events_to_thread(uint64_t workloop_id,
                                                struct kevent_qos_s *events,
                                                int nevents);
+
+/*
+ * Create a standard (non-kevent, non-workloop) workqueue thread.
+ * Used when kevent_qos WORKQ gets NOTE_TRIGGER on EVFILT_USER,
+ * indicating libdispatch needs a thread for pending work (timers, etc.).
+ */
+static int create_guest_thread_for_wq(CPUArchState *env, uint32_t qos)
+{
+    if (!saved_wqthread || !workq_monitor_parent_env) {
+        return -1;
+    }
+
+    /* Try to wake a parked thread first */
+    parked_wq_thread *pw = NULL;
+    pthread_mutex_lock(&parked_lock);
+    if (parked_list) {
+        pw = parked_list;
+        parked_list = pw->next;
+        pw->next = NULL;
+    }
+    pthread_mutex_unlock(&parked_lock);
+
+    uint32_t flags = WQ_FLAG_THREAD_NEWSPI
+                   | WQ_FLAG_THREAD_TSD_BASE_SET
+                   | WQ_FLAG_THREAD_PRIO_QOS
+                   | (qos & 0xF);
+
+    if (pw) {
+        uint32_t reuse_flags = (flags & ~WQ_FLAG_THREAD_TSD_BASE_SET)
+                             | WQ_FLAG_THREAD_REUSE;
+        pthread_mutex_lock(&pw->mutex);
+        pw->new_flags = reuse_flags;
+        pw->has_work = true;
+        pthread_cond_signal(&pw->cond);
+        pthread_mutex_unlock(&pw->mutex);
+        return 0;
+    }
+
+    size_t page_sz = qemu_real_host_page_size();
+    size_t guardsize = page_sz;
+    size_t pthsize = saved_pthsize ? saved_pthsize : 0x4000;
+    size_t total = guardsize + PTH_DEFAULT_STACKSZ
+                 + PTHREAD_T_OFFSET_ARM64 + pthsize;
+
+    mmap_lock();
+    abi_ulong stackaddr = target_mmap(0, total,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    mmap_unlock();
+    if (stackaddr == (abi_ulong)-1) {
+        return -1;
+    }
+
+    mmap_lock();
+    target_mprotect(stackaddr, guardsize, PROT_NONE);
+    mmap_unlock();
+
+    abi_ulong stack_bottom = stackaddr + guardsize;
+    abi_ulong self_addr = stackaddr + guardsize + PTH_DEFAULT_STACKSZ
+                        + PTHREAD_T_OFFSET_ARM64;
+    abi_ulong stack_top = self_addr & ~(abi_ulong)0xF;
+    abi_ulong tsd_base = self_addr;
+    if (saved_tsd_offset) {
+        tsd_base = self_addr + saved_tsd_offset;
+    }
+
+    TaskState *parent_ts = workq_monitor_parent_ts;
+
+    return create_guest_thread(
+        workq_monitor_parent_env,
+        saved_wqthread, stack_top,
+        self_addr, 0, stack_bottom,
+        0, flags, 0, tsd_base, parent_ts,
+        true, self_addr, stack_top, stack_bottom, tsd_base);
+}
 
 /*
  * Convert kevent_qos_s to kevent64_s for registration on regular kqueues.
@@ -503,14 +583,16 @@ static int workq_kqueue_register(const struct kevent_qos_s *changelist,
     int registered = 0;
 
     for (int i = 0; i < nchanges; i++) {
-        if (changelist[i].filter == EVFILT_MACHPORT) {
+        if (changelist[i].filter == EVFILT_MACHPORT ||
+            changelist[i].filter == EVFILT_TIMER) {
             struct kevent64_s k64;
             kqos_to_k64(&changelist[i], &k64);
             int rc = kevent64(kq, &k64, 1, NULL, 0, 0, NULL);
             if (rc < 0) {
                 if (do_strace) {
                     fprintf(stderr, "  workq_kqueue_register: "
-                            "MACHPORT ident=0x%llx failed errno=%d\n",
+                            "filter=%d ident=0x%llx failed errno=%d\n",
+                            changelist[i].filter,
                             (unsigned long long)changelist[i].ident,
                             errno);
                 }
@@ -671,11 +753,18 @@ static void *workq_kqueue_monitor_func(void *arg)
     struct kevent64_s events64[8];
     struct kevent_qos_s events_qos[8];
     int kq = get_workq_kqueue();
+    /*
+     * Use a short timeout so we periodically re-trigger EVFILT_USER.
+     * libdispatch defers NOTE_TRIGGER pokes, so the manager thread
+     * may park before dispatch_after adds its timer.  Periodic
+     * re-triggering ensures the manager wakes to process new work.
+     */
+    struct timespec poll_ts = { .tv_sec = 0, .tv_nsec = 50000000 }; /* 50ms */
 
     rcu_register_thread();
 
     while (1) {
-        int n = kevent64(kq, NULL, 0, events64, 8, 0, NULL);
+        int n = kevent64(kq, NULL, 0, events64, 8, 0, &poll_ts);
         if (n < 0) {
             if (errno == EINTR) {
                 continue;
@@ -684,6 +773,20 @@ static void *workq_kqueue_monitor_func(void *arg)
             continue;
         }
         if (n == 0) {
+            /*
+             * Timeout — create a plain workqueue thread to drain
+             * pending dispatch work (e.g., dispatch_after timers).
+             * libdispatch defers NOTE_TRIGGER pokes, so the manager
+             * may miss new work.  A plain thread drains the root
+             * queue and processes timers.
+             */
+            static int idle_ticks;
+            idle_ticks++;
+            if (idle_ticks >= 2 && saved_wqthread
+                && workq_monitor_parent_env) {
+                idle_ticks = 0;
+                create_guest_thread_for_wq(workq_monitor_parent_env, 4);
+            }
             continue;
         }
 
@@ -696,11 +799,13 @@ static void *workq_kqueue_monitor_func(void *arg)
             fprintf(stderr, "  workq_monitor: %d events fired\n", n);
             for (int i = 0; i < n; i++) {
                 fprintf(stderr, "    event[%d]: filter=%d ident=0x%llx "
-                        "flags=0x%x fflags=0x%x data=%lld\n",
+                        "flags=0x%x fflags=0x%x data=%lld "
+                        "udata=0x%llx\n",
                         i, events_qos[i].filter,
                         (unsigned long long)events_qos[i].ident,
                         events_qos[i].flags, events_qos[i].fflags,
-                        (long long)events_qos[i].data);
+                        (long long)events_qos[i].data,
+                        (unsigned long long)events_qos[i].udata);
             }
         }
 
@@ -845,22 +950,53 @@ static void deliver_kevents_to_thread(struct kevent_qos_s *events,
         tsd_base = self_addr + saved_tsd_offset;
     }
 
-    /* Copy events onto the new thread's stack (below stack_top) */
-    size_t events_sz = nevents * sizeof(struct kevent_qos_s);
+    /*
+     * Allocate keventlist on the new thread's stack.
+     * libdispatch reuses this buffer for deferred items (up to 16),
+     * so allocate at least 16 slots even if we only have a few events.
+     */
+#define DISPATCH_DEFERRED_ITEMS_MAX 16
+    int keventlist_slots = nevents > DISPATCH_DEFERRED_ITEMS_MAX
+                         ? nevents : DISPATCH_DEFERRED_ITEMS_MAX;
+    size_t keventlist_sz = keventlist_slots * sizeof(struct kevent_qos_s);
     abi_ulong sp = stack_top;
-    sp -= events_sz;
+    sp -= keventlist_sz;
     sp &= ~(abi_ulong)0xF;
-    memcpy(g2h_untagged(sp), events, events_sz);
+    memset(g2h_untagged(sp), 0, keventlist_sz);
+    memcpy(g2h_untagged(sp), events,
+           nevents * sizeof(struct kevent_qos_s));
     abi_ulong keventlist = sp;
+#undef DISPATCH_DEFERRED_ITEMS_MAX
 
     sp -= 256;  /* headroom */
     sp &= ~(abi_ulong)0xF;
 
     uint32_t flags = WQ_FLAG_THREAD_NEWSPI
                    | WQ_FLAG_THREAD_TSD_BASE_SET
-                   | WQ_FLAG_THREAD_PRIO_QOS
-                   | WQ_FLAG_THREAD_KEVENT
-                   | 4;  /* QoS default */
+                   | WQ_FLAG_THREAD_KEVENT;
+
+    /*
+     * If the EVFILT_USER was registered with event manager QoS
+     * (by libdispatch's _dispatch_kq_init), mark this thread as
+     * the event manager.  XNU sets EVENT_MANAGER *without*
+     * PRIO_QOS — they are mutually exclusive.
+     */
+#define _PTHREAD_PRIORITY_EVENT_MANAGER_FLAG 0x02000000
+    bool is_event_manager = false;
+    for (int i = 0; i < nevents; i++) {
+        if ((events[i].filter == EVFILT_USER ||
+             events[i].filter == EVFILT_TIMER) &&
+            (saved_evfilt_user_qos & _PTHREAD_PRIORITY_EVENT_MANAGER_FLAG)) {
+            is_event_manager = true;
+            break;
+        }
+    }
+    if (is_event_manager) {
+        flags |= WQ_FLAG_THREAD_EVENT_MANAGER;
+    } else {
+        flags |= WQ_FLAG_THREAD_PRIO_QOS | 4;  /* QoS default */
+    }
+#undef _PTHREAD_PRIORITY_EVENT_MANAGER_FLAG
 
     if (do_strace) {
         fprintf(stderr, "  workq_monitor: creating kevent thread "
@@ -1597,13 +1733,23 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
         break;
 
     case TARGET_MACOS_NR_gettimeofday:
-        /* gettimeofday(struct timeval *tv, struct timezone *tz) */
+        /*
+         * gettimeofday(struct timeval *tv, struct timezone *tz,
+         *              uint64_t *mach_absolute_time)
+         * macOS extends POSIX gettimeofday with a third argument.
+         * When non-NULL, the kernel writes mach_absolute_time() there.
+         * libdispatch uses this to arm timers.
+         */
         {
             struct timeval tv;
             ret = get_errno(gettimeofday(&tv, NULL));
             if (!is_error(ret)) {
                 if (arg1 && copy_to_user_timeval(arg1, &tv)) {
                     ret = -TARGET_EFAULT;
+                }
+                if (arg3) {
+                    uint64_t mat = mach_absolute_time();
+                    *(uint64_t *)g2h_untagged(arg3) = mat;
                 }
             }
         }
@@ -2474,19 +2620,14 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
          * __semwait_signal(int cond_sem, int mutex_sem, int timeout,
          *                  int relative, int64_t tv_sec, int32_t tv_nsec)
          *
-         * Used by pthread_cond_wait/timed-wait internals.  The semaphore
-         * arguments are Mach port names.  We can't forward these to the
-         * host kernel because the port namespace is guest-local.
+         * Used by pthread_cond_wait/timed-wait and dispatch internals.
+         * Mach semaphore ports are real host ports (created via real
+         * semaphore_create trap), so forward directly to the host kernel.
          *
-         * If there's a timeout, sleep for the requested duration and
-         * return ETIMEDOUT.  Otherwise do a short sleep and return EINTR
-         * to let the caller retry.
+         * If the port is invalid (e.g. psynch handle), fall back to
+         * a timed sleep so the caller retries gracefully.
          */
         {
-            int has_timeout = (int)arg3;
-            int64_t tv_sec = (int64_t)arg5;
-            int32_t tv_nsec = (int32_t)arg6;
-
             /*
              * Service any pending workloop thread requests.
              * This is where deferred kevent_id THREAD_REQUEST handling
@@ -2495,17 +2636,42 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
              */
             service_pending_workloop_reqs();
 
-            if (has_timeout && (tv_sec > 0 || tv_nsec > 0)) {
-                struct timespec ts;
-                ts.tv_sec = tv_sec;
-                ts.tv_nsec = tv_nsec;
-                nanosleep(&ts, NULL);
+            int sysno = (num == TARGET_MACOS_NR___semwait_signal)
+                ? SYS___semwait_signal
+                : SYS___semwait_signal_nocancel;
+            int rv = syscall(sysno,
+                             (int)arg1,       /* cond_sem */
+                             (int)arg2,       /* mutex_sem */
+                             (int)arg3,       /* timeout */
+                             (int)arg4,       /* relative */
+                             (int64_t)arg5,   /* tv_sec */
+                             (int32_t)arg6);  /* tv_nsec */
+            if (rv == 0) {
+                ret = 0;
+            } else if (errno == ETIMEDOUT) {
                 ret = -TARGET_ETIMEDOUT;
-            } else {
-                /* Tiny sleep to avoid busy-spinning */
-                struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 };
-                nanosleep(&ts, NULL);
+            } else if (errno == EINTR) {
                 ret = -TARGET_EINTR;
+            } else {
+                /*
+                 * Real syscall failed (EINVAL = invalid semaphore).
+                 * Fall back to a timed sleep so the caller retries.
+                 */
+                int has_timeout = (int)arg3;
+                int64_t tv_sec = (int64_t)arg5;
+                int32_t tv_nsec = (int32_t)arg6;
+                if (has_timeout && (tv_sec > 0 || tv_nsec > 0)) {
+                    struct timespec ts;
+                    ts.tv_sec = tv_sec;
+                    ts.tv_nsec = tv_nsec;
+                    nanosleep(&ts, NULL);
+                    ret = -TARGET_ETIMEDOUT;
+                } else {
+                    struct timespec ts = { .tv_sec = 0,
+                                           .tv_nsec = 1000000 };
+                    nanosleep(&ts, NULL);
+                    ret = -TARGET_EINTR;
+                }
             }
         }
         break;
@@ -3130,22 +3296,52 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                 }
                 pthread_mutex_unlock(&pk.mutex);
 
-                /* Copy delivered events to guest stack */
+                /* Copy delivered events to guest stack.
+                 * Allocate at least 16 slots because libdispatch
+                 * reuses this buffer for deferred items.
+                 */
                 CPUArchState *env = (CPUArchState *)cpu_env;
-                size_t ev_sz = pk.delivered_nevents
+#define DISPATCH_DEFERRED_ITEMS_MAX 16
+                int reuse_slots = pk.delivered_nevents
+                    > DISPATCH_DEFERRED_ITEMS_MAX
+                    ? pk.delivered_nevents : DISPATCH_DEFERRED_ITEMS_MAX;
+                size_t ev_sz = reuse_slots
                              * sizeof(struct kevent_qos_s);
                 abi_ulong sp = pk.stack_top;
                 sp -= ev_sz;
                 sp &= ~(abi_ulong)0xF;
-                memcpy(g2h_untagged(sp), pk.delivered_events, ev_sz);
+                memset(g2h_untagged(sp), 0, ev_sz);
+                memcpy(g2h_untagged(sp), pk.delivered_events,
+                       pk.delivered_nevents
+                       * sizeof(struct kevent_qos_s));
                 abi_ulong keventlist = sp;
+#undef DISPATCH_DEFERRED_ITEMS_MAX
                 sp -= 256;
                 sp &= ~(abi_ulong)0xF;
 
                 uint32_t reuse_flags = WQ_FLAG_THREAD_KEVENT
                     | WQ_FLAG_THREAD_REUSE
-                    | WQ_FLAG_THREAD_NEWSPI
-                    | WQ_FLAG_THREAD_PRIO_QOS | 4;
+                    | WQ_FLAG_THREAD_NEWSPI;
+
+                /* Check if delivered events need event manager flag.
+                 * EVENT_MANAGER and PRIO_QOS are mutually exclusive. */
+#define _PTHREAD_PRIORITY_EVENT_MANAGER_FLAG 0x02000000
+                bool reuse_is_mgr = false;
+                for (int ei = 0; ei < pk.delivered_nevents; ei++) {
+                    if ((pk.delivered_events[ei].filter == EVFILT_USER ||
+                         pk.delivered_events[ei].filter == EVFILT_TIMER) &&
+                        (saved_evfilt_user_qos &
+                         _PTHREAD_PRIORITY_EVENT_MANAGER_FLAG)) {
+                        reuse_is_mgr = true;
+                        break;
+                    }
+                }
+                if (reuse_is_mgr) {
+                    reuse_flags |= WQ_FLAG_THREAD_EVENT_MANAGER;
+                } else {
+                    reuse_flags |= WQ_FLAG_THREAD_PRIO_QOS | 4;
+                }
+#undef _PTHREAD_PRIORITY_EVENT_MANAGER_FLAG
 
                 env->pc = saved_wqthread;
                 env->xregs[31] = sp;
@@ -3251,27 +3447,38 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
     }
 
     case TARGET_MACOS_NR_kevent_qos: {
-        /*
-         * kevent_qos(int kq, const struct kevent_qos_s *changelist,
-         *            int nchanges, struct kevent_qos_s *eventlist,
-         *            int nevents, void *data_out,
-         *            size_t *data_available, unsigned int flags)
-         *
-         * When fd == -1 and flags & KEVENT_FLAG_WORKQ, libdispatch is
-         * using the per-process workqueue kqueue.  Forward event
-         * registrations to our workq kqueue and start the monitor
-         * thread which creates workqueue threads when events fire.
-         */
         int kq = (int)arg1;
         unsigned int flags = (unsigned int)arg8;
+
+        if (do_strace && kq != -1) {
+            struct kevent_qos_s *cl_dbg = arg2
+                ? (struct kevent_qos_s *)g2h_untagged(arg2) : NULL;
+            fprintf(stderr, "  kevent_qos: kq=%d nchanges=%d "
+                    "nevents=%d flags=0x%x\n",
+                    kq, (int)arg3, (int)arg5, flags);
+            if (cl_dbg) {
+                for (int i = 0; i < (int)arg3; i++) {
+                    fprintf(stderr, "    cl[%d]: filter=%d "
+                            "ident=0x%llx fflags=0x%x\n",
+                            i, cl_dbg[i].filter,
+                            (unsigned long long)cl_dbg[i].ident,
+                            cl_dbg[i].fflags);
+                }
+            }
+        }
 
         if (kq == -1 && (flags & KEVENT_FLAG_WORKQ)) {
             /*
              * Workqueue kqueue: libdispatch registers events here.
-             * Return success without registering on kqueue.
-             * MACHPORT events from kevent_id are handled separately;
-             * kevent_qos WORKQ ports may overlap with MIG reply ports
-             * and must NOT be put on our kqueue.
+             *
+             * Register EVFILT_USER and EVFILT_TIMER events on our
+             * workq kqueue so the monitor thread can deliver them
+             * to workqueue threads.  This enables dispatch_after
+             * and dispatch_source timers.
+             *
+             * MACHPORT events from kevent_qos WORKQ are NOT registered
+             * here — they overlap with MIG reply ports and are handled
+             * separately via kevent_id.
              */
             struct kevent_qos_s *cl = arg2
                 ? (struct kevent_qos_s *)g2h_untagged(arg2) : NULL;
@@ -3284,17 +3491,74 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                 if (cl) {
                     for (int i = 0; i < nchanges; i++) {
                         fprintf(stderr, "    kev[%d]: filter=%d "
-                                "ident=0x%llx fflags=0x%x\n",
+                                "ident=0x%llx fflags=0x%x flags=0x%x "
+                                "udata=0x%llx qos=0x%x\n",
                                 i, cl[i].filter,
                                 (unsigned long long)cl[i].ident,
-                                cl[i].fflags);
+                                cl[i].fflags, cl[i].flags,
+                                (unsigned long long)cl[i].udata,
+                                cl[i].qos);
                     }
                 }
             }
 
+            /*
+             * Forward EVFILT_USER, EVFILT_TIMER, and EVFILT_MACHPORT
+             * to our kqueue.  The monitor thread will pick up fired
+             * events and deliver them to workqueue threads.
+             *
+             * MACHPORT events here may be timer ports (mk_timer) that
+             * dispatch_after needs.  The monitor pre-receives Mach
+             * messages before delivering MACHPORT events.
+             */
+#define EVFILT_USER_PRIVATE (-10)
+#define EVFILT_TIMER_PRIVATE (-7)
+            if (cl && nchanges > 0 && saved_wqthread) {
+                TaskState *ts = get_task_state(
+                    env_cpu((CPUArchState *)cpu_env));
+                ensure_workq_monitor((CPUArchState *)cpu_env, ts);
+
+                int wkq = get_workq_kqueue();
+                for (int i = 0; i < nchanges; i++) {
+                    int f = cl[i].filter;
+                    if (f == EVFILT_USER_PRIVATE
+                        || f == EVFILT_TIMER_PRIVATE
+                        || f == EVFILT_MACHPORT) {
+                        struct kevent64_s k64;
+                        kqos_to_k64(&cl[i], &k64);
+                        /* Translate MACHPORT ext ptrs */
+                        if (f == EVFILT_MACHPORT && k64.ext[0]) {
+                            k64.ext[0] = (uint64_t)(uintptr_t)
+                                g2h_untagged((abi_ptr)k64.ext[0]);
+                        }
+                        /* Save udata/qos for EVFILT_USER re-triggers.
+                         * Only save from the initial EV_ADD registration,
+                         * not from NOTE_TRIGGER pokes which have qos=0. */
+                        if (f == EVFILT_USER_PRIVATE && k64.udata
+                            && (cl[i].flags & EV_ADD)) {
+                            saved_evfilt_user_udata = k64.udata;
+                            saved_evfilt_user_qos = cl[i].qos;
+                        }
+                        int rc = kevent64(wkq, &k64, 1, NULL, 0, 0,
+                                          NULL);
+                        if (do_strace) {
+                            fprintf(stderr, "    registered filter=%d"
+                                    " ident=0x%llx on workq kqueue"
+                                    " rc=%d%s\n",
+                                    cl[i].filter,
+                                    (unsigned long long)cl[i].ident,
+                                    rc,
+                                    rc < 0 ? " (FAILED)" : "");
+                        }
+                    }
+                }
+            }
+#undef EVFILT_USER_PRIVATE
+#undef EVFILT_TIMER_PRIVATE
+
             ret = 0;
             if (do_strace) {
-                fprintf(stderr, "    kevent_qos WORKQ -> 0 (no-op)\n");
+                fprintf(stderr, "    kevent_qos WORKQ -> 0\n");
             }
             break;
         }
@@ -4039,10 +4303,17 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
     case TARGET_MACOS_NR_abort_with_payload:
     case TARGET_MACOS_NR_terminate_with_payload:
         /*
-         * abort_with_payload / terminate_with_payload
-         * These terminate the process with a crash reason.
-         * Just exit with a non-zero status.
+         * abort_with_payload(reason_namespace, reason_code,
+         *                    payload, payload_size,
+         *                    reason_string, reason_flags)
          */
+        {
+            const char *reason = arg5
+                ? (const char *)g2h_untagged(arg5) : "(null)";
+            fprintf(stderr, "abort_with_payload: ns=%lu code=0x%lx "
+                    "reason=\"%s\"\n",
+                    (unsigned long)arg1, (unsigned long)arg2, reason);
+        }
         _exit(arg1 ? (int)arg1 : 1);
         break;
 
