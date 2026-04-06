@@ -915,6 +915,90 @@ static void fixup_mig_request_addrs(void *msg_buf, uint32_t send_size)
 }
 
 /*
+ * fixup_send_ool -- translate OOL descriptors in outgoing complex messages.
+ *
+ * When the guest sends a complex message, OOL descriptor addresses point
+ * into guest address space.  The host kernel's copyin() operates on host
+ * virtual addresses, so we add guest_base to each OOL pointer.
+ * We also save original guest addresses to restore after the trap.
+ */
+#define MAX_OOL_SAVE 16
+struct ool_save {
+    int count;
+    struct { void **addr_ptr; void *orig; } entries[MAX_OOL_SAVE];
+};
+
+static void fixup_send_ool(void *msg_buf, uint32_t send_size,
+                            struct ool_save *save)
+{
+    save->count = 0;
+    mach_msg_header_t *hdr = (mach_msg_header_t *)msg_buf;
+
+    if (!guest_base) {
+        return;
+    }
+    if (!(hdr->msgh_bits & MACH_MSGH_BITS_COMPLEX)) {
+        return;
+    }
+    if (send_size < sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t)) {
+        return;
+    }
+
+    mach_msg_body_t *body = (mach_msg_body_t *)(hdr + 1);
+    uint8_t *dp = (uint8_t *)(body + 1);
+    uint8_t *end = (uint8_t *)hdr + send_size;
+
+    for (uint32_t i = 0; i < body->msgh_descriptor_count; i++) {
+        if (dp + sizeof(mach_msg_type_descriptor_t) > end) break;
+        mach_msg_type_descriptor_t *td = (mach_msg_type_descriptor_t *)dp;
+
+        switch (td->type) {
+        case MACH_MSG_OOL_DESCRIPTOR:
+        case MACH_MSG_OOL_VOLATILE_DESCRIPTOR: {
+            mach_msg_ool_descriptor_t *ool = (mach_msg_ool_descriptor_t *)dp;
+            if (ool->address && save->count < MAX_OOL_SAVE) {
+                save->entries[save->count].addr_ptr =
+                    (void **)&ool->address;
+                save->entries[save->count].orig = ool->address;
+                save->count++;
+                ool->address = (void *)((uintptr_t)ool->address +
+                                        (uintptr_t)guest_base);
+            }
+            dp += sizeof(mach_msg_ool_descriptor_t);
+            break;
+        }
+        case MACH_MSG_OOL_PORTS_DESCRIPTOR: {
+            mach_msg_ool_ports_descriptor_t *op =
+                (mach_msg_ool_ports_descriptor_t *)dp;
+            if (op->address && save->count < MAX_OOL_SAVE) {
+                save->entries[save->count].addr_ptr =
+                    (void **)&op->address;
+                save->entries[save->count].orig = op->address;
+                save->count++;
+                op->address = (void *)((uintptr_t)op->address +
+                                       (uintptr_t)guest_base);
+            }
+            dp += sizeof(mach_msg_ool_ports_descriptor_t);
+            break;
+        }
+        case MACH_MSG_PORT_DESCRIPTOR:
+            dp += sizeof(mach_msg_port_descriptor_t);
+            break;
+        default:
+            dp += sizeof(mach_msg_ool_descriptor_t);
+            break;
+        }
+    }
+}
+
+static void restore_send_ool(struct ool_save *save)
+{
+    for (int i = 0; i < save->count; i++) {
+        *save->entries[i].addr_ptr = save->entries[i].orig;
+    }
+}
+
+/*
  * fixup_mig_reply_ool -- translate OOL descriptors in MIG replies.
  *
  * When the host kernel returns a complex MIG reply, any out-of-line (OOL)
@@ -979,7 +1063,27 @@ static void fixup_mig_reply_ool(void *reply_buf)
         case MACH_MSG_OOL_PORTS_DESCRIPTOR: {
             mach_msg_ool_ports_descriptor_t *op =
                 (mach_msg_ool_ports_descriptor_t *)dp;
-            if (do_strace) {
+            void *host_addr = op->address;
+            mach_msg_size_t count = op->count;
+
+            if (host_addr && count > 0) {
+                mach_msg_size_t size = count * sizeof(mach_port_t);
+                abi_long guest_addr = target_mmap(0, size,
+                    PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                if (guest_addr > 0) {
+                    memcpy(g2h_untagged(guest_addr), host_addr, size);
+                    munmap(host_addr, size);
+                    op->address = (void *)(uintptr_t)guest_addr;
+                    if (do_strace) {
+                        fprintf(stderr,
+                            "    OOL_PORTS[%u]: host %p -> guest "
+                            "0x%llx count=%u\n",
+                            i, host_addr,
+                            (unsigned long long)guest_addr, count);
+                    }
+                }
+            } else if (do_strace) {
                 fprintf(stderr,
                     "  OOL_PORTS desc[%u]: count=%u disp=%u\n",
                     i, op->count, op->disposition);
@@ -1692,9 +1796,12 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                     ret = mig_ret;
                 } else {
                     /* Translate guest addresses in MIG requests */
+                    struct ool_save ool_sv = {0};
                     if (msg_buf && (options & 0x1)) {
                         fixup_mig_request_addrs(msg_buf,
                             vec[0].msgv_send_size);
+                        fixup_send_ool(msg_buf,
+                            vec[0].msgv_send_size, &ool_sv);
                     }
 
                     uint64_t vec_opts = options;
@@ -1746,6 +1853,8 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                             fixup_mig_reply_ool(rcv_buf);
                         }
                     }
+                    /* Restore OOL descriptor addresses in send buffer */
+                    restore_send_ool(&ool_sv);
                 }
 
                 /* Restore guest pointers */
@@ -1791,11 +1900,14 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                     ret = mig_ret;
                 } else {
                     /* Translate guest addresses in MIG requests */
+                    struct ool_save ool_sv = {0};
                     if (host_data && (options & 0x1)) {
                         mach_msg_header_t *shdr =
                             (mach_msg_header_t *)host_data;
                         fixup_mig_request_addrs(host_data,
                             shdr->msgh_size);
+                        fixup_send_ool(host_data,
+                            shdr->msgh_size, &ool_sv);
                     }
 
                     uint64_t trap_options = options;
@@ -1861,6 +1973,8 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                         (options & 0x2)) {
                         fixup_mig_reply_ool(host_data);
                     }
+                    /* Restore OOL descriptor addresses in send buffer */
+                    restore_send_ool(&ool_sv);
                 }
             }
         }
