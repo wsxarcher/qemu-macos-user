@@ -73,10 +73,10 @@ static kern_return_t ipc_timeout_result(mach_port_name_t rcv_port,
                 ipc_timeout_count, IPC_RECV_MAX_RETRY, rcv_port);
         }
         /*
-         * Return PORT_CHANGED — makes XPC/dispatch retry the receive.
-         * PORT_CHANGED is safe; INTERRUPTED and TIMED_OUT cause aborts.
+         * Return MACH_RCV_INTERRUPTED — makes XPC/dispatch retry the receive.
+         * MACH_RCV_TIMED_OUT must NOT be returned — dispatch aborts on it.
          */
-        return 0x10004005;  /* MACH_RCV_PORT_CHANGED */
+        return 0x10004005;  /* MACH_RCV_INTERRUPTED */
     }
 
     ipc_timeout_port = 0;
@@ -86,7 +86,7 @@ static kern_return_t ipc_timeout_result(mach_port_name_t rcv_port,
             "  ipc timeout exhausted on port 0x%x — port died\n",
             rcv_port);
     }
-    return 0x10004008;  /* MACH_RCV_PORT_DIED — graceful teardown */
+    return 0x10004009;  /* MACH_RCV_PORT_DIED — graceful teardown */
 }
 
 static mach_timespec_t timeout_ms_to_mach_timespec(uint64_t timeout_ms)
@@ -2136,11 +2136,15 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                     uint64_t vec_opts = options;
                     uint64_t vec_tmout = (uint64_t)arg8;
                     bool vec_added_tmout = false;
+                    mach_port_name_t vec_rcv_port = MACH_PORT_NULL;
 
 #define OPT_SEND   0x1
 #define OPT_RCV    0x2
 #define OPT_TMOUT  0x100
                     if ((vec_opts & (OPT_SEND | OPT_RCV)) == OPT_RCV) {
+                        vec_rcv_port =
+                            (uint32_t)((uint64_t)arg6 >> 32);
+                        mark_active_rcv_port(vec_rcv_port);
                         service_pending_workloop_reqs();
                     }
                     if ((vec_opts & (OPT_SEND | OPT_RCV)) == OPT_RCV
@@ -2191,6 +2195,7 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                                                   (uint64_t)arg7,
                                                   vec_tmout);
                     }
+                    unmark_active_rcv_port(vec_rcv_port);
 
                     if (ret == 0x10000004 && msg_buf && (vec_opts & 0x1)) {
                         mach_msg_header_t *retry_hdr =
@@ -2293,16 +2298,19 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                              * to the appropriate workq thread.
                              */
                             service_workq_notification_events();
-                            /*
-                             * Do NOT remap MACH_SEND_TIMED_OUT to
-                             * MACH_SEND_INVALID_DEST here.  The port is
-                             * still valid (we have a send right and
-                             * mach_port_type succeeded); returning
-                             * INVALID_DEST would cause libdispatch to
-                             * cancel the mach channel entirely.  Return
-                             * TIMED_OUT so dispatch re-arms SEND_POSSIBLE
-                             * and retries via the normal notification path.
-                             */
+                            if (ret == 0x10000004 &&
+                                retry_hdr->msgh_id ==
+                                DISPATCH_MACH_CHECKIN_MSGID) {
+                                /*
+                                 * Retries have been exhausted without any
+                                 * SEND_POSSIBLE completion.  Report the
+                                 * dispatch_mach checkin as INVALID_DEST so
+                                 * libdispatch tears the dead channel down
+                                 * instead of waiting forever on the reply
+                                 * receive port.
+                                 */
+                                ret = MACH_SEND_INVALID_DEST;
+                            }
                         }
                     }
 
@@ -2430,11 +2438,15 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                     uint64_t trap_options = options;
                     uint64_t trap_timeout = (uint64_t)arg8;
                     bool added_timeout = false;
+                    mach_port_name_t direct_rcv_port = MACH_PORT_NULL;
 
 #define OPT_SEND   0x1
 #define OPT_RCV    0x2
 #define OPT_TMOUT  0x100
                     if ((trap_options & (OPT_SEND | OPT_RCV)) == OPT_RCV) {
+                        direct_rcv_port =
+                            (uint32_t)((uint64_t)arg6 >> 32);
+                        mark_active_rcv_port(direct_rcv_port);
                         service_pending_workloop_reqs();
                     }
                     if ((trap_options & (OPT_SEND | OPT_RCV)) == OPT_RCV
@@ -2485,6 +2497,7 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                                                   (uint64_t)arg7,
                                                   trap_timeout);
                     }
+                    unmark_active_rcv_port(direct_rcv_port);
 
                     if (ret == 0x10000004 && host_data &&
                         (trap_options & 0x1)) {
@@ -2568,7 +2581,11 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                                 }
                             }
                             service_workq_notification_events();
-                            /* Return TIMED_OUT, not INVALID_DEST — see vec path. */
+                            if (ret == 0x10000004 &&
+                                retry_hdr->msgh_id ==
+                                DISPATCH_MACH_CHECKIN_MSGID) {
+                                ret = MACH_SEND_INVALID_DEST;
+                            }
                         }
                     }
 
