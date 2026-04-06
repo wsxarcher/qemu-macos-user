@@ -38,31 +38,51 @@ extern mach_port_t thread_get_special_reply_port(void);
  * instead of looping forever.
  *
  * Strategy:
- *   1st–2nd timeout on a port → MACH_RCV_INTERRUPTED  (XPC retries)
- *   3rd timeout on same port  → fake MACH_NOTIFY_SEND_ONCE
- *                                (XPC tears down connection)
- *   After total budget exhausted → immediate fake notification
- *                                  (prevent reconnect loops)
+ *   1st timeout on a port → MACH_RCV_INTERRUPTED  (XPC retries once)
+ *   2nd timeout on same port → destroy receive right
+ *                              (XPC tears down connection)
+ *   Dead-service tracking: when a reply port times out, mark the
+ *   remote service port as dead; future sends fail immediately.
  */
-#define XPC_TIMEOUT_MS        2000   /* 2 seconds per attempt */
-#define XPC_TIMEOUT_MAX_RETRY 2      /* retries before escalation */
+#define XPC_TIMEOUT_MS        100    /* 100ms per attempt */
+#define XPC_TIMEOUT_MAX_RETRY 0      /* immediate escalation */
 #define XPC_TIMEOUT_BUDGET    6      /* total timeouts before fast-fail */
+
+/*
+ * Dead service port tracking.
+ * When XPC sends to service S and the reply times out, we record S
+ * as dead.  Future send-only messages to S return MACH_SEND_INVALID_DEST
+ * immediately, preventing the slow retry loop.
+ */
+#define XPC_DEAD_PORTS_MAX    32
+static mach_port_name_t xpc_dead_ports[XPC_DEAD_PORTS_MAX];
+static int xpc_dead_port_count;
+
+/* Last send target, set before send-only messages with STRICT reply */
+static mach_port_name_t xpc_last_send_remote;
+
+static void xpc_mark_dead(mach_port_name_t remote_port)
+{
+    if (remote_port == 0) return;
+    for (int i = 0; i < xpc_dead_port_count; i++) {
+        if (xpc_dead_ports[i] == remote_port) return;
+    }
+    if (xpc_dead_port_count < XPC_DEAD_PORTS_MAX) {
+        xpc_dead_ports[xpc_dead_port_count++] = remote_port;
+    }
+}
+
+static bool xpc_is_dead(mach_port_name_t remote_port)
+{
+    for (int i = 0; i < xpc_dead_port_count; i++) {
+        if (xpc_dead_ports[i] == remote_port) return true;
+    }
+    return false;
+}
 
 static mach_port_name_t xpc_timeout_port;
 static int xpc_timeout_count;
 static int xpc_timeout_total;
-
-static void xpc_fill_send_once_notification(void *rcv_buf,
-                                            mach_port_name_t rcv_port)
-{
-    mach_msg_header_t *fake = (mach_msg_header_t *)rcv_buf;
-    fake->msgh_bits = 0;
-    fake->msgh_size = sizeof(mach_msg_header_t);
-    fake->msgh_remote_port = MACH_PORT_NULL;
-    fake->msgh_local_port = MACH_PORT_NULL;
-    fake->msgh_voucher_port = MACH_PORT_NULL;
-    fake->msgh_id = 71;  /* MACH_NOTIFY_SEND_ONCE */
-}
 
 static bool xpc_should_fast_fail(void)
 {
@@ -70,7 +90,6 @@ static bool xpc_should_fast_fail(void)
 }
 
 static kern_return_t xpc_timeout_result(mach_port_name_t rcv_port,
-                                        void *rcv_buf,
                                         bool do_strace)
 {
     xpc_timeout_total++;
@@ -93,27 +112,21 @@ static kern_return_t xpc_timeout_result(mach_port_name_t rcv_port,
     }
 
     /*
-     * Exhausted per-port retries.  Synthesize a
-     * MACH_NOTIFY_SEND_ONCE notification (msgh_id = 71) so XPC
-     * cleanly tears down the connection.
+     * Exhausted per-port retries.  Mark the service port as dead
+     * and destroy the reply port's receive right so XPC tears down
+     * the connection.
      */
+    xpc_mark_dead(xpc_last_send_remote);
     xpc_timeout_port = 0;
     xpc_timeout_count = 0;
-    if (rcv_buf) {
-        xpc_fill_send_once_notification(rcv_buf, rcv_port);
-        if (do_strace) {
-            fprintf(stderr, "  xpc timeout exhausted on port 0x%x "
-                    "-> fake SEND_ONCE (total=%d)\n",
-                    rcv_port, xpc_timeout_total);
-        }
-        return KERN_SUCCESS;
-    }
+    mach_port_mod_refs(mach_task_self(), rcv_port,
+                       MACH_PORT_RIGHT_RECEIVE, -1);
     if (do_strace) {
-        fprintf(stderr, "  xpc timeout exhausted on port 0x%x "
-                "(no buffer, total=%d)\n",
-                rcv_port, xpc_timeout_total);
+        fprintf(stderr, "  xpc timeout exhausted: destroyed port "
+                "0x%x, dead service 0x%x (total=%d)\n",
+                rcv_port, xpc_last_send_remote, xpc_timeout_total);
     }
-    return 0x10004003;  /* MACH_RCV_TIMED_OUT */
+    return 0x10004002;  /* MACH_RCV_INVALID_NAME */
 }
 
 /*
@@ -1546,6 +1559,27 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
 #define OPT_RCV    0x2
 #define OPT_TMOUT  0x100
 #define OPT_STRICT 0x200
+                    /*
+                     * Track send-only messages for dead-port detection.
+                     * When a send targets a known-dead service, fail
+                     * immediately to avoid the slow timeout-retry cycle.
+                     */
+                    if ((vec_opts & OPT_SEND) && msg_buf) {
+                        mach_msg_header_t *shdr =
+                            (mach_msg_header_t *)msg_buf;
+                        mach_port_name_t remote = shdr->msgh_remote_port;
+                        if (xpc_is_dead(remote)) {
+                            if (do_strace) {
+                                fprintf(stderr,
+                                    "  xpc dead service 0x%x — "
+                                    "failing send\n", remote);
+                            }
+                            ret = 0x10000004; /* MACH_SEND_INVALID_DEST */
+                            goto vec_msg_done;
+                        }
+                        xpc_last_send_remote = remote;
+                    }
+
                     if ((vec_opts & (OPT_SEND | OPT_RCV)) == OPT_RCV
                         && (vec_opts & OPT_STRICT)
                         && !(vec_opts & OPT_TMOUT)
@@ -1554,17 +1588,8 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                         if (xpc_should_fast_fail()) {
                             uint32_t rcv_name =
                                 (uint32_t)((uint64_t)arg6 >> 32);
-                            void *rcv_buf;
-                            if (nentries >= 2 &&
-                                vec[1].msgv_rcv_addr) {
-                                rcv_buf = (void *)(uintptr_t)
-                                          vec[1].msgv_rcv_addr;
-                            } else {
-                                rcv_buf = (void *)(uintptr_t)
-                                          vec[0].msgv_data;
-                            }
                             ret = xpc_timeout_result(rcv_name,
-                                rcv_buf, do_strace);
+                                do_strace);
                             goto vec_msg_done;
                         }
                         vec_opts |= OPT_TMOUT;
@@ -1587,16 +1612,7 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                     if (vec_added_tmout && ret == 0x10004003) {
                         uint32_t rcv_name =
                             (uint32_t)((uint64_t)arg6 >> 32);
-                        void *rcv_buf;
-                        if (nentries >= 2 && vec[1].msgv_rcv_addr) {
-                            rcv_buf = (void *)(uintptr_t)
-                                      vec[1].msgv_rcv_addr;
-                        } else {
-                            rcv_buf = (void *)(uintptr_t)
-                                      vec[0].msgv_data;
-                        }
-                        ret = xpc_timeout_result(rcv_name, rcv_buf,
-                                                 do_strace);
+                        ret = xpc_timeout_result(rcv_name, do_strace);
                     }
 
                     if (do_strace && ret != KERN_SUCCESS) {
@@ -1673,16 +1689,34 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
 #define OPT_RCV    0x2
 #define OPT_TMOUT  0x100
 #define OPT_STRICT 0x200
+                    /* Track sends for dead-port detection */
+                    if ((trap_options & OPT_SEND) && host_data) {
+                        mach_msg_header_t *shdr =
+                            (mach_msg_header_t *)host_data;
+                        mach_port_name_t remote =
+                            shdr->msgh_remote_port;
+                        if (xpc_is_dead(remote)) {
+                            if (do_strace) {
+                                fprintf(stderr,
+                                    "  xpc dead service 0x%x — "
+                                    "failing send\n", remote);
+                            }
+                            ret = 0x10000004;
+                            goto direct_msg_done;
+                        }
+                        xpc_last_send_remote = remote;
+                    }
+
                     if ((trap_options & (OPT_SEND | OPT_RCV)) == OPT_RCV
                         && (trap_options & OPT_STRICT)
                         && !(trap_options & OPT_TMOUT)
                         && trap_timeout == 0) {
                         /* Fast-fail: skip syscall entirely */
-                        if (xpc_should_fast_fail() && host_data) {
+                        if (xpc_should_fast_fail()) {
                             uint32_t rcv_name =
                                 (uint32_t)((uint64_t)arg6 >> 32);
                             ret = xpc_timeout_result(rcv_name,
-                                host_data, do_strace);
+                                do_strace);
                             goto direct_msg_done;
                         }
                         trap_options |= OPT_TMOUT;
@@ -1705,8 +1739,7 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                     if (added_timeout && ret == 0x10004003) {
                         uint32_t rcv_name =
                             (uint32_t)((uint64_t)arg6 >> 32);
-                        ret = xpc_timeout_result(rcv_name, host_data,
-                                                 do_strace);
+                        ret = xpc_timeout_result(rcv_name, do_strace);
                     }
                     if (do_strace && ret == KERN_SUCCESS &&
                         (options & 0x2) && host_data) {
