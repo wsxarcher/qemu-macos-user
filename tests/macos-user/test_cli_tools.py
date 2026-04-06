@@ -1074,6 +1074,80 @@ int main(void) {
         # The session dictionary should be available on macOS
         self.assertIn("has_session=", decoded)
 
+    _MACH_VM_OBJECT_MAP_SRC = r'''
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include <mach/vm_map.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+static void bail(int sig) { _exit(124); }
+
+int main(void) {
+    mach_vm_address_t src = 0;
+    mach_vm_address_t dst = 0;
+    mach_vm_size_t size = vm_page_size;
+    memory_object_size_t entry_size = size;
+    mach_port_t entry = MACH_PORT_NULL;
+    kern_return_t kr;
+
+    signal(SIGALRM, bail);
+    alarm(10);
+
+    kr = mach_vm_allocate(mach_task_self(), &src, size, VM_FLAGS_ANYWHERE);
+    if (kr != KERN_SUCCESS) {
+        printf("alloc_kr=%d\n", kr);
+        return 1;
+    }
+
+    strcpy((char *)(uintptr_t)src, "shared-before");
+    kr = mach_make_memory_entry_64(mach_task_self(), &entry_size, src,
+                                   VM_PROT_READ | VM_PROT_WRITE, &entry,
+                                   MACH_PORT_NULL);
+    printf("entry_kr=%d\n", kr);
+    if (kr != KERN_SUCCESS) {
+        mach_vm_deallocate(mach_task_self(), src, size);
+        return 1;
+    }
+
+    kr = mach_vm_map(mach_task_self(), &dst, size, 0, VM_FLAGS_ANYWHERE,
+                     entry, 0, FALSE, VM_PROT_READ, VM_PROT_READ,
+                     VM_INHERIT_NONE);
+    printf("map_kr=%d\n", kr);
+    if (kr != KERN_SUCCESS) {
+        mach_port_deallocate(mach_task_self(), entry);
+        mach_vm_deallocate(mach_task_self(), src, size);
+        return 1;
+    }
+
+    printf("initial=%s\n", (char *)(uintptr_t)dst);
+    strcpy((char *)(uintptr_t)src, "shared-after");
+    printf("updated=%s\n", (char *)(uintptr_t)dst);
+    int ok = strcmp((char *)(uintptr_t)dst, "shared-after") == 0;
+
+    mach_vm_deallocate(mach_task_self(), dst, size);
+    mach_port_deallocate(mach_task_self(), entry);
+    mach_vm_deallocate(mach_task_self(), src, size);
+
+    return ok ? 0 : 2;
+}
+'''
+
+    def test_mach_vm_map_memory_object(self):
+        """mach_vm_map preserves memory-object-backed shared mappings."""
+        exe = _compile_framework_test("mach_vm_object_map",
+                                      self._MACH_VM_OBJECT_MAP_SRC,
+                                      [],
+                                      language="c")
+        rc, out, _ = _run_emulated(exe, timeout=10)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"entry_kr=0", out)
+        self.assertIn(b"map_kr=0", out)
+        self.assertIn(b"initial=shared-before", out)
+        self.assertIn(b"updated=shared-after", out)
+
     # -- CFRunLoop timer test ----------------------------------------------
 
     _CFRUNLOOP_TIMER_SRC = r'''
@@ -1820,4 +1894,3 @@ if __name__ == "__main__":
         sys.exit(1)
 
     unittest.main(verbosity=2)
-
