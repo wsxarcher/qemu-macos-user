@@ -69,7 +69,11 @@ static kern_return_t ipc_timeout_result(mach_port_name_t rcv_port,
                 "  ipc timeout %d/%d on port 0x%x — interrupted\n",
                 ipc_timeout_count, IPC_RECV_MAX_RETRY, rcv_port);
         }
-        return 0x10004005;  /* MACH_RCV_INTERRUPTED — caller retries */
+        /*
+         * Return PORT_CHANGED — makes XPC/dispatch retry the receive.
+         * PORT_CHANGED is safe; INTERRUPTED and TIMED_OUT cause aborts.
+         */
+        return 0x10004005;  /* MACH_RCV_PORT_CHANGED */
     }
 
     ipc_timeout_port = 0;
@@ -79,7 +83,7 @@ static kern_return_t ipc_timeout_result(mach_port_name_t rcv_port,
             "  ipc timeout exhausted on port 0x%x — port died\n",
             rcv_port);
     }
-    return 0x10004006;  /* MACH_RCV_PORT_DIED — graceful teardown */
+    return 0x10004008;  /* MACH_RCV_PORT_DIED — graceful teardown */
 }
 
 /*
@@ -2042,16 +2046,32 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
     case MACH_TRAP_MK_TIMER_CREATE:
         /* mk_timer_create — returns a port name, not kern_return_t */
         ret = (abi_long)host_mk_timer_create();
+        if (do_strace) {
+            fprintf(stderr, "  mk_timer_create -> port=0x%lx\n",
+                    (unsigned long)ret);
+        }
         break;
 
     case MACH_TRAP_MK_TIMER_DESTROY:
         /* mk_timer_destroy(name) */
         ret = host_mk_timer_destroy((mach_port_name_t)arg1);
+        if (do_strace) {
+            fprintf(stderr, "  mk_timer_destroy(0x%lx) -> %ld\n",
+                    (unsigned long)arg1, (long)ret);
+        }
         break;
 
     case MACH_TRAP_MK_TIMER_ARM:
         /* mk_timer_arm(name, expire_time) */
+        if (do_strace) {
+            fprintf(stderr, "  mk_timer_arm(0x%lx, %llu)\n",
+                    (unsigned long)arg1,
+                    (unsigned long long)arg2);
+        }
         ret = host_mk_timer_arm((mach_port_name_t)arg1, (uint64_t)arg2);
+        if (do_strace) {
+            fprintf(stderr, "  mk_timer_arm -> %ld\n", (long)ret);
+        }
         break;
 
     case MACH_TRAP_MK_TIMER_CANCEL:
