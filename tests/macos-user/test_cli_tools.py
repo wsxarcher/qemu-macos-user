@@ -1506,6 +1506,77 @@ int main(void) {
         # Value may be NULL (daemon unreachable) or found — either is fine
         self.assertTrue(b"cfprefs=null" in out or b"cfprefs=found" in out)
 
+    # -- WindowServer query test (SkyLight framework) -----------------------
+
+    _WS_QUERY_SRC = r'''
+#include <CoreGraphics/CoreGraphics.h>
+#include <stdio.h>
+#include <signal.h>
+#include <unistd.h>
+
+extern int SLSMainConnectionID(void);
+extern CGError SLSGetDisplayList(uint32_t maxDisplays,
+    CGDirectDisplayID *displays, uint32_t *count);
+extern CGError SLSGetWindowList(int cid, int owner, uint32_t count,
+    uint32_t *list, uint32_t *outCount);
+extern CGError SLSGetScreenRectForWindow(int cid, uint32_t wid,
+    CGRect *rect);
+extern CGError SLSGetWindowLevel(int cid, uint32_t wid, int *level);
+extern CGError SLSGetWindowOwner(int cid, uint32_t wid, int *ownerCid);
+extern CGError SLSConnectionGetPID(int cid, pid_t *pid);
+
+int main(void) {
+    alarm(10);
+
+    int cid = SLSMainConnectionID();
+    fprintf(stderr, "cid=%d\n", cid);
+    if (cid <= 0) return 1;
+
+    CGDirectDisplayID displays[8];
+    uint32_t dcount = 0;
+    SLSGetDisplayList(8, displays, &dcount);
+    fprintf(stderr, "displays=%u\n", dcount);
+
+    uint32_t wids[128];
+    uint32_t wcount = 0;
+    SLSGetWindowList(cid, 0, 128, wids, &wcount);
+    fprintf(stderr, "windows=%u\n", wcount);
+
+    int queried = 0;
+    for (uint32_t i = 0; i < wcount && i < 3; i++) {
+        CGRect rect = {};
+        SLSGetScreenRectForWindow(cid, wids[i], &rect);
+        int level = 0;
+        SLSGetWindowLevel(cid, wids[i], &level);
+        int owner = 0;
+        SLSGetWindowOwner(cid, wids[i], &owner);
+        pid_t pid = 0;
+        SLSConnectionGetPID(owner, &pid);
+        fprintf(stderr, "wid=%u pid=%d level=%d w=%.0f h=%.0f\n",
+                wids[i], pid, level, rect.size.width, rect.size.height);
+        queried++;
+    }
+    fprintf(stderr, "queried=%d\n", queried);
+    return 0;
+}
+'''
+
+    def test_windowserver_query(self):
+        """Query WindowServer via SkyLight: displays, windows, properties."""
+        exe = _compile_framework_test("ws_query", self._WS_QUERY_SRC,
+                                      ["CoreGraphics"],
+                                      language="c",
+                                      extra_flags=[
+                                          "-F/System/Library/PrivateFrameworks",
+                                          "-framework", "SkyLight"])
+        rc, _, err = _run_emulated(exe, timeout=15)
+        decoded = err.decode(errors="replace")
+        self.assertEqual(rc, 0, f"ws_query failed: {decoded}")
+        self.assertRegex(decoded, r"cid=\d+")
+        self.assertRegex(decoded, r"displays=\d+")
+        self.assertRegex(decoded, r"windows=\d+")
+        self.assertRegex(decoded, r"queried=\d+")
+
 
 # ---------------------------------------------------------------------------
 # Helper: compile Objective-C / C test programs from source strings
@@ -1514,7 +1585,8 @@ int main(void) {
 _fw_build_cache: dict[str, Path] = {}
 
 
-def _compile_framework_test(name, source, frameworks=None, language="objc"):
+def _compile_framework_test(name, source, frameworks=None, language="objc",
+                            extra_flags=None):
     """Compile a C/ObjC source string into a dynamic arm64 binary."""
     if name in _fw_build_cache:
         return _fw_build_cache[name]
@@ -1529,6 +1601,7 @@ def _compile_framework_test(name, source, frameworks=None, language="objc"):
     cmd = ["clang", "-arch", "arm64", "-o", str(exe_path), str(src_path)]
     for fw in (frameworks or []):
         cmd += ["-framework", fw]
+    cmd += extra_flags or []
 
     subprocess.run(cmd, check=True, capture_output=True)
     _fw_build_cache[name] = exe_path
