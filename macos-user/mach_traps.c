@@ -44,9 +44,9 @@ extern mach_port_t thread_get_special_reply_port(void);
  *   Dead-service tracking: when a reply port times out, mark the
  *   remote service port as dead; future sends fail immediately.
  */
-#define XPC_TIMEOUT_MS        100    /* 100ms per attempt */
-#define XPC_TIMEOUT_MAX_RETRY 0      /* immediate escalation */
-#define XPC_TIMEOUT_BUDGET    6      /* total timeouts before fast-fail */
+#define XPC_TIMEOUT_MS        1000   /* 1s per attempt */
+#define XPC_TIMEOUT_MAX_RETRY 2      /* 2 retries per port */
+#define XPC_TIMEOUT_BUDGET    20     /* total timeouts before fast-fail */
 
 /*
  * Dead service port tracking.
@@ -900,9 +900,11 @@ static void fixup_mig_reply_ool(void *reply_buf)
             mach_msg_port_descriptor_t *pd =
                 (mach_msg_port_descriptor_t *)dp;
             if (do_strace) {
+                mach_port_type_t ptype = 0;
+                mach_port_type(mach_task_self(), pd->name, &ptype);
                 fprintf(stderr,
-                    "  PORT desc[%u]: name=0x%x disp=%u\n",
-                    i, pd->name, pd->disposition);
+                    "  PORT desc[%u]: name=0x%x disp=%u type=0x%x\n",
+                    i, pd->name, pd->disposition, ptype);
             }
             dp += sizeof(mach_msg_port_descriptor_t);
             break;
