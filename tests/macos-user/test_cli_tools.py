@@ -1508,9 +1508,10 @@ int main(void) {
                             b"cfprefs=found" in out)
         else:
             # rc=99 means SIGALRM fired — cfprefsd never replied.
-            # This is acceptable: the test verifies we don't hang
-            # the entire emulator, and SIGALRM proves alarm() works.
-            self.assertEqual(rc, 99, f"unexpected exit code: {rc}")
+            # rc=-6 means SIGABRT from XPC timeout assertion — the
+            # dispatch timer correctly fired the XPC deadline before
+            # the alarm.  Both are acceptable: neither hangs.
+            self.assertIn(rc, (99, -6), f"unexpected exit code: {rc}")
 
     # -- IOKit property access test -------------------------------------------
 
@@ -1730,6 +1731,49 @@ int main(void) {
         decoded = err.decode(errors="replace")
         self.assertEqual(rc, 0, f"dispatch_serial failed: {decoded}")
         self.assertIn("count=5", decoded)
+
+    # -- dispatch_after timer test --------------------------------------------
+
+    _DISPATCH_AFTER_SRC = r'''
+#include <dispatch/dispatch.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <stdatomic.h>
+
+int main(void) {
+    alarm(8);
+
+    __block atomic_int fired = 0;
+
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC),
+        dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0),
+        ^{
+            atomic_store(&fired, 1);
+            fprintf(stderr, "timer_fired\n");
+        });
+
+    /* Poll-wait for the timer to fire */
+    for (int i = 0; i < 80 && !atomic_load(&fired); i++) {
+        usleep(100000);  /* 100ms */
+    }
+
+    int ok = atomic_load(&fired);
+    fprintf(stderr, "dispatch_after=%s\n", ok ? "pass" : "fail");
+    return ok ? 0 : 1;
+}
+'''
+
+    def test_dispatch_after(self):
+        """dispatch_after timer fires under emulation."""
+        exe = _compile_framework_test("dispatch_after",
+                                      self._DISPATCH_AFTER_SRC,
+                                      [], language="c")
+        rc, _, err = _run_emulated(exe, timeout=15)
+        decoded = err.decode(errors="replace")
+        self.assertEqual(rc, 0, f"dispatch_after failed: {decoded}")
+        self.assertIn("timer_fired", decoded)
+        self.assertIn("dispatch_after=pass", decoded)
 
 
 # ---------------------------------------------------------------------------
