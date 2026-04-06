@@ -120,8 +120,15 @@ abi_long target_mmap(abi_ulong start, abi_ulong len, int prot,
         return -TARGET_ENOMEM;
     }
 
-    /* Convert host address back to guest address */
-    return h2g(ret);
+    /* Register pages in QEMU's internal page table */
+    abi_ulong guest_ret = h2g(ret);
+    int page_flags = PAGE_VALID;
+    if (prot & PROT_READ)  page_flags |= PAGE_READ;
+    if (prot & PROT_WRITE) page_flags |= PAGE_WRITE;
+    if (prot & PROT_EXEC)  page_flags |= PAGE_EXEC;
+    page_set_flags(guest_ret, guest_ret + len - 1, page_flags, ~0);
+
+    return guest_ret;
 }
 
 int target_munmap(abi_ulong start, abi_ulong len)
