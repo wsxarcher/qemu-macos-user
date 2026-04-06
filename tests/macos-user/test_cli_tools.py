@@ -1506,6 +1506,67 @@ int main(void) {
         # Value may be NULL (daemon unreachable) or found — either is fine
         self.assertTrue(b"cfprefs=null" in out or b"cfprefs=found" in out)
 
+    # -- IOKit property access test -------------------------------------------
+
+    _IOKIT_PROPS_SRC = r'''
+#include <IOKit/IOKitLib.h>
+#include <CoreFoundation/CoreFoundation.h>
+#include <stdio.h>
+#include <signal.h>
+
+int main(void) {
+    alarm(10);
+
+    /* Test 1: IORegistryEntryCreateCFProperties on IOService:/ (all props) */
+    io_registry_entry_t root = IORegistryEntryFromPath(
+        kIOMainPortDefault, "IOService:/");
+    if (!root) { fprintf(stderr, "no root\n"); return 1; }
+
+    CFMutableDictionaryRef props = NULL;
+    kern_return_t kr = IORegistryEntryCreateCFProperties(
+        root, &props, kCFAllocatorDefault, 0);
+    fprintf(stderr, "all_props: kr=%d count=%ld\n", kr,
+            kr == 0 && props ? CFDictionaryGetCount(props) : -1);
+    if (props) CFRelease(props);
+    if (kr != 0) { IOObjectRelease(root); return 2; }
+
+    /* Test 2: IORegistryEntryCreateCFProperty (single property) */
+    CFTypeRef val = IORegistryEntryCreateCFProperty(
+        root, CFSTR("IOKitBuildVersion"), kCFAllocatorDefault, 0);
+    fprintf(stderr, "single_prop: %s\n", val ? "ok" : "null");
+    if (val) CFRelease(val);
+
+    /* Test 3: IORegistryEntryCreateCFProperties on IOResources */
+    io_registry_entry_t res = IORegistryEntryFromPath(
+        kIOMainPortDefault, "IOService:/IOResources");
+    if (res) {
+        props = NULL;
+        kr = IORegistryEntryCreateCFProperties(
+            res, &props, kCFAllocatorDefault, 0);
+        fprintf(stderr, "ioresources: kr=%d count=%ld\n", kr,
+                kr == 0 && props ? CFDictionaryGetCount(props) : -1);
+        if (props) CFRelease(props);
+        IOObjectRelease(res);
+    }
+
+    IOObjectRelease(root);
+    fprintf(stderr, "done\n");
+    return 0;
+}
+'''
+
+    def test_iokit_properties(self):
+        """IORegistryEntryCreateCFProperties works for various entries."""
+        exe = _compile_framework_test("iokit_props", self._IOKIT_PROPS_SRC,
+                                      ["IOKit", "CoreFoundation"],
+                                      language="c")
+        rc, _, err = _run_emulated(exe, timeout=15)
+        decoded = err.decode(errors="replace")
+        self.assertEqual(rc, 0, f"iokit_props failed: {decoded}")
+        self.assertIn("all_props: kr=0", decoded)
+        self.assertIn("ioresources: kr=0", decoded)
+        self.assertIn("done", decoded)
+
     # -- WindowServer query test (SkyLight framework) -----------------------
 
     _WS_QUERY_SRC = r'''

@@ -782,6 +782,82 @@ static bool handle_mig_message(void *buf, uint64_t options,
 }
 
 /*
+ * fixup_mig_request_addrs -- translate guest addresses in MIG requests.
+ *
+ * Some MIG routines accept buffer addresses from user space so the kernel
+ * can copyout() data directly into a caller-provided buffer.  Under QEMU
+ * user-mode emulation the guest sees addresses relative to guest_base, but
+ * the host kernel's copyout() operates on real (host) virtual addresses.
+ * We patch the embedded pointer(s) before forwarding the message.
+ *
+ * Known routines:
+ *   2888  io_registry_entry_get_properties_bin_buf
+ *         Request: Head(24) + NDR(8) + buf(8) + bufsize(8) = 48
+ *         buf at offset 32 (mach_vm_address_t)
+ */
+static void fixup_mig_request_addrs(void *msg_buf, uint32_t send_size)
+{
+    mach_msg_header_t *hdr = (mach_msg_header_t *)msg_buf;
+
+    if (!guest_base) {
+        return;
+    }
+
+    switch (hdr->msgh_id) {
+    case 2888: /* io_registry_entry_get_properties_bin_buf */
+        /* Request: Head(24) + NDR(8) + buf(8) + bufsize(8) = 48 */
+        if (send_size >= 48) {
+            uint64_t *bufp = (uint64_t *)((uint8_t *)hdr + 32);
+            if (*bufp != 0) {
+                if (do_strace) {
+                    fprintf(stderr,
+                        "  MIG %u: translate buf 0x%llx -> 0x%llx\n",
+                        hdr->msgh_id, *bufp,
+                        *bufp + (uint64_t)guest_base);
+                }
+                *bufp += (uint64_t)guest_base;
+            }
+        }
+        break;
+
+    case 2889: {
+        /*
+         * io_registry_entry_get_property_bin_buf
+         * Request layout (pack(4)):
+         *   Head(24) + NDR(8) + planeCnt(4) + plane(var,pad4)
+         *   + nameCnt(4) + name(var,pad4) + options(4)
+         *   + buf(8) + bufsize(8)
+         */
+        uint8_t *p = (uint8_t *)hdr;
+        if (send_size < 48) break;
+        uint32_t plane_cnt = *(uint32_t *)(p + 32);
+        uint32_t plane_pad = (plane_cnt + 3) & ~3u;
+        uint32_t name_off = 36 + plane_pad;
+        if (name_off + 4 > send_size) break;
+        uint32_t name_cnt = *(uint32_t *)(p + name_off);
+        uint32_t name_pad = (name_cnt + 3) & ~3u;
+        uint32_t opts_off = name_off + 4 + name_pad;
+        uint32_t buf_off = opts_off + 4;
+        if (buf_off + 8 > send_size) break;
+        uint64_t *bufp = (uint64_t *)(p + buf_off);
+        if (*bufp != 0) {
+            if (do_strace) {
+                fprintf(stderr,
+                    "  MIG %u: translate buf @%u 0x%llx -> 0x%llx\n",
+                    hdr->msgh_id, buf_off, *bufp,
+                    *bufp + (uint64_t)guest_base);
+            }
+            *bufp += (uint64_t)guest_base;
+        }
+        break;
+    }
+
+    default:
+        break;
+    }
+}
+
+/*
  * fixup_mig_reply_ool -- translate OOL descriptors in MIG replies.
  *
  * When the host kernel returns a complex MIG reply, any out-of-line (OOL)
@@ -807,6 +883,11 @@ static void fixup_mig_reply_ool(void *reply_buf)
     mach_msg_body_t *body = (mach_msg_body_t *)(hdr + 1);
     uint8_t *dp = (uint8_t *)(body + 1);
 
+    if (do_strace && body->msgh_descriptor_count > 0) {
+        fprintf(stderr, "  OOL fixup: msg_id=%u desc_count=%u msg_size=%u\n",
+                hdr->msgh_id, body->msgh_descriptor_count, hdr->msgh_size);
+    }
+
     for (uint32_t i = 0; i < body->msgh_descriptor_count; i++) {
         mach_msg_type_descriptor_t *td = (mach_msg_type_descriptor_t *)dp;
 
@@ -828,9 +909,9 @@ static void fixup_mig_reply_ool(void *reply_buf)
                     ool->address = (void *)(uintptr_t)guest_addr;
                     if (do_strace) {
                         fprintf(stderr,
-                            "  OOL fixup: host %p -> guest 0x%llx "
+                            "    OOL[%u]: host %p -> guest 0x%llx "
                             "size=%u\n",
-                            host_addr,
+                            i, host_addr,
                             (unsigned long long)guest_addr, size);
                     }
                 }
@@ -873,8 +954,6 @@ static void fixup_mig_reply_ool(void *reply_buf)
         }
     }
 }
-
-/* Mach trap numbers (negated x16 values) */
 #define MACH_TRAP_ABSTIME                       (-3)
 #define MACH_TRAP_CONTTIME                      (-4)
 #define MACH_TRAP_VM_ALLOCATE                   (-10)
@@ -1555,6 +1634,12 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                                                   &mig_ret)) {
                     ret = mig_ret;
                 } else {
+                    /* Translate guest addresses in MIG requests */
+                    if (msg_buf && (options & 0x1)) {
+                        fixup_mig_request_addrs(msg_buf,
+                            vec[0].msgv_send_size);
+                    }
+
                     uint64_t vec_opts = options;
                     uint64_t vec_tmout = (uint64_t)arg8;
                     bool vec_added_tmout = false;
@@ -1648,6 +1733,14 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                                        (uint64_t)arg3, &mig_ret)) {
                     ret = mig_ret;
                 } else {
+                    /* Translate guest addresses in MIG requests */
+                    if (host_data && (options & 0x1)) {
+                        mach_msg_header_t *shdr =
+                            (mach_msg_header_t *)host_data;
+                        fixup_mig_request_addrs(host_data,
+                            shdr->msgh_size);
+                    }
+
                     uint64_t trap_options = options;
                     uint64_t trap_timeout = (uint64_t)arg8;
                     bool added_timeout = false;
