@@ -1107,7 +1107,18 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
             if (prot & VM_PROT_WRITE)   host_prot |= PROT_WRITE;
             if (prot & VM_PROT_EXECUTE) host_prot |= PROT_EXEC;
 
-            if (mprotect(addr, size, host_prot) == 0) {
+            /*
+             * Align to host page boundaries — macOS requires mprotect
+             * addresses to be aligned to the host page size (16K on
+             * Apple Silicon), but the guest may use 4K pages.
+             */
+            unsigned long hpgsz = qemu_real_host_page_size();
+            abi_ulong aligned_start = guest_addr & ~(hpgsz - 1);
+            abi_ulong aligned_end = (guest_addr + size + hpgsz - 1) & ~(hpgsz - 1);
+            size_t aligned_size = aligned_end - aligned_start;
+            void *aligned_addr = g2h_untagged(aligned_start);
+
+            if (mprotect(aligned_addr, aligned_size, host_prot) == 0) {
                 /* Host pages already mapped — just update QEMU page flags */
                 int qemu_flags = PAGE_VALID;
                 if (host_prot & PROT_READ)  qemu_flags |= PAGE_READ;
