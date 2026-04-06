@@ -48,7 +48,7 @@ extern mach_port_t thread_get_special_reply_port(void);
  * MACH_RCV_PORT_DIED is handled by dispatch (graceful teardown).
  */
 #define IPC_RECV_TIMEOUT_MS   5000   /* 5s per attempt */
-#define IPC_RECV_MAX_RETRY    6      /* then PORT_DIED */
+#define IPC_RECV_MAX_RETRY    3      /* then PORT_DIED */
 
 static mach_port_name_t ipc_timeout_port;
 static int ipc_timeout_count;
@@ -794,6 +794,9 @@ static bool handle_mig_message(void *buf, uint64_t options,
  *   2880  io_connect_method
  *         Variable layout: selector(4) + scalar_input(var) + inband_input(var)
  *         + ool_input(8) + ool_input_size(8) + counts(8) + ool_output(8)
+ *   2881  io_connect_async_method
+ *         Same as 2880 but prepended with body(4) + port_desc(12) + NDR(8)
+ *         + reference[8](64) + selector(4); scalar_inputCnt at offset 116.
  *   2888  io_registry_entry_get_properties_bin_buf
  *         Request: Head(24) + NDR(8) + buf(8) + bufsize(8) = 48
  *         buf at offset 32 (mach_vm_address_t)
@@ -809,7 +812,8 @@ static void fixup_mig_request_addrs(void *msg_buf, uint32_t send_size)
     }
 
     switch (hdr->msgh_id) {
-    case 2880: {
+    case 2880:   /* io_connect_method */
+    case 2881: { /* io_connect_async_method */
         /*
          * io_connect_method — variable layout (pack(4)):
          *   Head(24) + NDR(8) + selector(4)
@@ -818,10 +822,21 @@ static void fixup_mig_request_addrs(void *msg_buf, uint32_t send_size)
          *   + ool_input(8) + ool_input_size(8)
          *   + inband_outputCnt(4) + scalar_outputCnt(4)
          *   + ool_output(8) + ool_output_size(8)
+         *
+         * io_connect_async_method prepends:
+         *   Head(24) + body(4) + port_desc(12) + NDR(8)
+         *   + reference[8](64) + selector(4)
+         * scalar_inputCnt starts at offset 116 instead of 36.
          */
         uint8_t *p = (uint8_t *)hdr;
-        if (send_size < 56) break;
-        uint32_t off = 36;  /* after Head+NDR+selector */
+        uint32_t off;
+        if (hdr->msgh_id == 2881) {
+            if (send_size < 136) break;
+            off = 116;  /* Head+body+port_desc+NDR+ref[8]+selector */
+        } else {
+            if (send_size < 56) break;
+            off = 36;   /* Head+NDR+selector */
+        }
         uint32_t scnt = *(uint32_t *)(p + off);
         off += 4 + scnt * 8;
         if (off + 4 > send_size) break;
