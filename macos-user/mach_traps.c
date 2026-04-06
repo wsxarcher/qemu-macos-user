@@ -47,7 +47,7 @@ extern mach_port_t thread_get_special_reply_port(void);
  * MACH_RCV_TIMED_OUT must NOT be returned — dispatch aborts on it.
  * MACH_RCV_PORT_DIED is handled by dispatch (graceful teardown).
  */
-#define IPC_RECV_TIMEOUT_MS   30000  /* 30s per attempt */
+#define IPC_RECV_TIMEOUT_MS   5000   /* 5s per attempt */
 #define IPC_RECV_MAX_RETRY    6      /* then PORT_DIED */
 
 static mach_port_name_t ipc_timeout_port;
