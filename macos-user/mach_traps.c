@@ -88,6 +88,56 @@ static kern_return_t ipc_timeout_result(mach_port_name_t rcv_port,
     return 0x10004008;  /* MACH_RCV_PORT_DIED — graceful teardown */
 }
 
+static mach_timespec_t timeout_ms_to_mach_timespec(uint64_t timeout_ms)
+{
+    mach_timespec_t ts;
+
+    ts.tv_sec = timeout_ms / 1000;
+    ts.tv_nsec = (timeout_ms % 1000) * 1000000;
+    return ts;
+}
+
+static uint64_t mach_timespec_to_timeout_ms(unsigned int sec, clock_res_t nsec)
+{
+    uint64_t timeout_ms = (uint64_t)sec * 1000;
+
+    timeout_ms += ((uint64_t)nsec + 999999) / 1000000;
+    return timeout_ms;
+}
+
+static kern_return_t semaphore_wait_with_polling(semaphore_t sem,
+                                                 uint64_t timeout_ms,
+                                                 bool indefinite)
+{
+    uint64_t remaining = timeout_ms;
+
+    service_pending_workloop_reqs();
+
+    while (indefinite || remaining > 0) {
+        uint64_t slice = indefinite || remaining > WORKLOOP_POLL_SLICE_MS
+            ? WORKLOOP_POLL_SLICE_MS : remaining;
+        kern_return_t ret;
+
+        service_workloop_machport_events();
+        service_workq_notification_events();
+        ret = semaphore_timedwait(sem, timeout_ms_to_mach_timespec(slice));
+        if (ret != KERN_OPERATION_TIMED_OUT) {
+            return ret;
+        }
+
+        if (!indefinite) {
+            if (remaining <= slice) {
+                return ret;
+            }
+            remaining -= slice;
+        }
+
+        service_pending_workloop_reqs();
+    }
+
+    return KERN_OPERATION_TIMED_OUT;
+}
+
 /*
  * Raw mach_msg2_trap via inline assembly.
  * On modern macOS, the old mach_msg_trap (-31) is killed by message
@@ -1069,6 +1119,118 @@ static void restore_send_ool(struct ool_save *save)
     }
 }
 
+static void debug_log_send_descriptors(void *msg_buf, uint32_t send_size)
+{
+    mach_msg_header_t *hdr = (mach_msg_header_t *)msg_buf;
+    mach_msg_body_t *body;
+    uint8_t *dp;
+    uint8_t *end;
+
+    if (!do_strace || !msg_buf) {
+        return;
+    }
+    if (!(hdr->msgh_bits & MACH_MSGH_BITS_COMPLEX)) {
+        return;
+    }
+    if (hdr->msgh_id != 1999646836 &&
+        hdr->msgh_id != 1073741824 &&
+        hdr->msgh_id != 1073742031 &&
+        hdr->msgh_id != 1073742125 &&
+        hdr->msgh_id != 1073742628) {
+        return;
+    }
+    if (send_size < sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t)) {
+        return;
+    }
+
+    body = (mach_msg_body_t *)(hdr + 1);
+    dp = (uint8_t *)(body + 1);
+    end = (uint8_t *)hdr + send_size;
+
+    fprintf(stderr,
+            "  send descs: msg_id=%u count=%u send_size=%u\n",
+            hdr->msgh_id, body->msgh_descriptor_count, send_size);
+
+    for (uint32_t i = 0; i < body->msgh_descriptor_count; i++) {
+        mach_msg_type_descriptor_t *td;
+
+        if (dp + sizeof(mach_msg_type_descriptor_t) > end) {
+            fprintf(stderr, "    desc[%u]: truncated\n", i);
+            break;
+        }
+        td = (mach_msg_type_descriptor_t *)dp;
+
+        switch (td->type) {
+        case MACH_MSG_PORT_DESCRIPTOR: {
+            mach_msg_port_descriptor_t *pd =
+                (mach_msg_port_descriptor_t *)dp;
+            mach_port_type_t ptype = 0;
+            kern_return_t pret =
+                mach_port_type(mach_task_self(), pd->name, &ptype);
+            fprintf(stderr,
+                    "    SEND PORT desc[%u]: name=0x%x disp=%u "
+                    "ptype_ret=%d ptype=0x%x\n",
+                    i, pd->name, pd->disposition, pret, ptype);
+            dp += sizeof(mach_msg_port_descriptor_t);
+            break;
+        }
+        case MACH_MSG_OOL_DESCRIPTOR:
+        case MACH_MSG_OOL_VOLATILE_DESCRIPTOR: {
+            mach_msg_ool_descriptor_t *ool =
+                (mach_msg_ool_descriptor_t *)dp;
+            fprintf(stderr,
+                    "    SEND OOL desc[%u]: addr=%p size=%u copy=%u\n",
+                    i, ool->address, ool->size, ool->copy);
+            dp += sizeof(mach_msg_ool_descriptor_t);
+            break;
+        }
+        case MACH_MSG_OOL_PORTS_DESCRIPTOR: {
+            mach_msg_ool_ports_descriptor_t *op =
+                (mach_msg_ool_ports_descriptor_t *)dp;
+            fprintf(stderr,
+                    "    SEND OOL_PORTS desc[%u]: addr=%p count=%u disp=%u\n",
+                    i, op->address, op->count, op->disposition);
+            dp += sizeof(mach_msg_ool_ports_descriptor_t);
+            break;
+        }
+        default:
+            fprintf(stderr, "    SEND desc[%u]: type=%u\n", i, td->type);
+            dp += sizeof(mach_msg_ool_descriptor_t);
+            break;
+        }
+    }
+}
+
+static void debug_log_send_strings(void *msg_buf, uint32_t send_size)
+{
+    mach_msg_header_t *hdr = (mach_msg_header_t *)msg_buf;
+    const unsigned char *p = (const unsigned char *)msg_buf;
+
+    if (!do_strace || !msg_buf) {
+        return;
+    }
+    if (hdr->msgh_id != 1073742031 &&
+        hdr->msgh_id != 1073742125 &&
+        hdr->msgh_id != 1073742628) {
+        return;
+    }
+
+    for (uint32_t i = 0; i < send_size; ) {
+        uint32_t start = i;
+
+        while (i < send_size && p[i] >= 0x20 && p[i] <= 0x7e) {
+            i++;
+        }
+        if (i > start + 3) {
+            fprintf(stderr, "  send str @%u: %.*s\n",
+                    start, (int)(i - start), p + start);
+        }
+        if (i == start) {
+            i++;
+        }
+    }
+}
+
 /*
  * fixup_mig_reply_ool -- translate OOL descriptors in MIG replies.
  *
@@ -1081,7 +1243,7 @@ static void restore_send_ool(struct ool_save *save)
  *   3. Releasing the kernel's original mapping
  *   4. Patching the descriptor to hold the guest address
  */
-static void fixup_mig_reply_ool(void *reply_buf)
+static void fixup_mig_reply_ool(void *reply_buf, mach_port_name_t receive_set)
 {
     mach_msg_header_t *hdr = (mach_msg_header_t *)reply_buf;
 
@@ -1165,9 +1327,45 @@ static void fixup_mig_reply_ool(void *reply_buf)
         case MACH_MSG_PORT_DESCRIPTOR: {
             mach_msg_port_descriptor_t *pd =
                 (mach_msg_port_descriptor_t *)dp;
-            if (do_strace) {
-                mach_port_type_t ptype = 0;
+            mach_port_type_t ptype = 0;
+            kern_return_t ptype_ret =
                 mach_port_type(mach_task_self(), pd->name, &ptype);
+            if (ptype_ret == KERN_SUCCESS &&
+                (ptype & MACH_PORT_TYPE_RECEIVE)) {
+                mach_port_limits_t limits = {
+                    .mpl_qlimit = MACH_PORT_QLIMIT_SMALL,
+                };
+                kern_return_t lret =
+                    mach_port_set_attributes(mach_task_self(), pd->name,
+                                             MACH_PORT_LIMITS_INFO,
+                                             (mach_port_info_t)&limits,
+                                             MACH_PORT_LIMITS_INFO_COUNT);
+                if (do_strace) {
+                    fprintf(stderr,
+                        "    port_set_limits: name=0x%x qlimit=%u ret=%d\n",
+                        pd->name, limits.mpl_qlimit, lret);
+                }
+            }
+            if (ptype_ret == KERN_SUCCESS &&
+                (ptype & MACH_PORT_TYPE_RECEIVE) &&
+                receive_set != MACH_PORT_NULL) {
+                mach_port_type_t set_type = 0;
+                kern_return_t set_ret =
+                    mach_port_type(mach_task_self(), receive_set, &set_type);
+                if (set_ret == KERN_SUCCESS &&
+                    (set_type & MACH_PORT_TYPE_PORT_SET)) {
+                    kern_return_t ins_ret =
+                        mach_port_insert_member(mach_task_self(), pd->name,
+                                                receive_set);
+                    if (do_strace) {
+                        fprintf(stderr,
+                            "    auto_insert_member: port=0x%x set=0x%x "
+                            "ret=%d\n",
+                            pd->name, receive_set, ins_ret);
+                    }
+                }
+            }
+            if (do_strace) {
                 fprintf(stderr,
                     "  PORT desc[%u]: name=0x%x disp=%u type=0x%x\n",
                     i, pd->name, pd->disposition, ptype);
@@ -1502,6 +1700,11 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                 ret = mach_port_allocate(mach_task_self(),
                                          (mach_port_right_t)arg2,
                                          &name);
+                if (do_strace) {
+                    fprintf(stderr,
+                            "  port_allocate: right=%llu -> name=0x%x ret=%ld\n",
+                            (unsigned long long)arg2, name, (long)ret);
+                }
                 if (ret == KERN_SUCCESS && arg3) {
                     memcpy(g2h_untagged(arg3), &name, sizeof(name));
                 }
@@ -1515,6 +1718,14 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                                              (mach_port_name_t)arg2,
                                              (mach_port_t)arg3,
                                              (mach_msg_type_name_t)arg4);
+                if (do_strace) {
+                    fprintf(stderr,
+                            "  port_insert_right: name=0x%llx poly=0x%llx "
+                            "disp=%llu ret=%ld\n",
+                            (unsigned long long)arg2,
+                            (unsigned long long)arg3,
+                            (unsigned long long)arg4, (long)ret);
+                }
             } else if (trap_num == MACH_TRAP_PORT_CONSTRUCT) {
                 mach_port_options_t opts;
                 memset(&opts, 0, sizeof(opts));
@@ -1525,6 +1736,13 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                 ret = mach_port_construct(mach_task_self(), &opts,
                                           (mach_port_context_t)arg3,
                                           &name);
+                if (do_strace) {
+                    fprintf(stderr,
+                            "  port_construct: flags=0x%x mpl_qlimit=%u "
+                            "ctx=0x%llx -> name=0x%x ret=%ld\n",
+                            opts.flags, opts.mpl.mpl_qlimit,
+                            (unsigned long long)arg3, name, (long)ret);
+                }
                 if (ret == KERN_SUCCESS && arg4) {
                     memcpy(g2h_untagged(arg4), &name, sizeof(name));
                 }
@@ -1550,6 +1768,17 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                     &previous);
                 if (ret == KERN_SUCCESS) {
                     record_workq_notification_port((mach_port_t)arg5);
+                }
+                if (do_strace) {
+                    fprintf(stderr, "  port_request_notification: "
+                            "name=0x%llx msgid=%llu sync=%llu "
+                            "notify=0x%llx poly=%llu prev=0x%x ret=%ld\n",
+                            (unsigned long long)arg2,
+                            (unsigned long long)arg3,
+                            (unsigned long long)arg4,
+                            (unsigned long long)arg5,
+                            (unsigned long long)arg6,
+                            previous, (long)ret);
                 }
                 if (arg7 > 0x1000) {
                     memcpy(g2h_untagged(arg7), &previous,
@@ -1578,14 +1807,35 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                 ret = mach_port_insert_member(mach_task_self(),
                                               (mach_port_name_t)arg2,
                                               (mach_port_name_t)arg3);
+                if (do_strace) {
+                    fprintf(stderr,
+                            "  port_insert_member: member=0x%llx set=0x%llx "
+                            "ret=%ld\n",
+                            (unsigned long long)arg2,
+                            (unsigned long long)arg3, (long)ret);
+                }
             } else if (trap_num == MACH_TRAP_PORT_EXTRACT_MEMBER) {
                 ret = mach_port_extract_member(mach_task_self(),
                                                (mach_port_name_t)arg2,
                                                (mach_port_name_t)arg3);
+                if (do_strace) {
+                    fprintf(stderr,
+                            "  port_extract_member: member=0x%llx set=0x%llx "
+                            "ret=%ld\n",
+                            (unsigned long long)arg2,
+                            (unsigned long long)arg3, (long)ret);
+                }
             } else if (trap_num == MACH_TRAP_PORT_MOVE_MEMBER) {
                 ret = mach_port_move_member(mach_task_self(),
                                             (mach_port_name_t)arg2,
                                             (mach_port_name_t)arg3);
+                if (do_strace) {
+                    fprintf(stderr,
+                            "  port_move_member: member=0x%llx set=0x%llx "
+                            "ret=%ld\n",
+                            (unsigned long long)arg2,
+                            (unsigned long long)arg3, (long)ret);
+                }
             } else if (trap_num == MACH_TRAP_PORT_TYPE) {
                 mach_port_type_t type = 0;
                 ret = mach_port_type(mach_task_self(),
@@ -1876,6 +2126,10 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                             vec[0].msgv_send_size);
                         fixup_send_ool(msg_buf,
                             vec[0].msgv_send_size, &ool_sv);
+                        debug_log_send_descriptors(msg_buf,
+                            vec[0].msgv_send_size);
+                        debug_log_send_strings(msg_buf,
+                            vec[0].msgv_send_size);
                     }
 
                     uint64_t vec_opts = options;
@@ -1937,10 +2191,124 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                                                   vec_tmout);
                     }
 
+                    if (ret == 0x10000004 && msg_buf && (vec_opts & 0x1)) {
+                        mach_msg_header_t *retry_hdr =
+                            (mach_msg_header_t *)msg_buf;
+                        mach_port_type_t retry_ptype = 0;
+                        kern_return_t ptype_rc =
+                            mach_port_type(mach_task_self(),
+                                           retry_hdr->msgh_remote_port,
+                                           &retry_ptype);
+                        if (ptype_rc == KERN_SUCCESS &&
+                            (retry_ptype & MACH_PORT_TYPE_RECEIVE)) {
+                            mach_port_limits_t retry_limits = {
+                                .mpl_qlimit = MACH_PORT_QLIMIT_SMALL,
+                            };
+                            kern_return_t retry_lret =
+                                mach_port_set_attributes(
+                                    mach_task_self(),
+                                    retry_hdr->msgh_remote_port,
+                                    MACH_PORT_LIMITS_INFO,
+                                    (mach_port_info_t)&retry_limits,
+                                    MACH_PORT_LIMITS_INFO_COUNT);
+                            service_pending_workloop_reqs();
+                            service_workloop_machport_events();
+                            service_workq_notification_events();
+                            ret = host_mach_msg2_trap(host_data, vec_opts,
+                                                      (uint64_t)arg3,
+                                                      (uint64_t)arg4,
+                                                      (uint64_t)arg5,
+                                                      (uint64_t)arg6,
+                                                      (uint64_t)arg7,
+                                                      vec_tmout);
+                            if (do_strace && ret == KERN_SUCCESS) {
+                                fprintf(stderr,
+                                    "  mach_msg2[vec]: local-send retry "
+                                    "succeeded for port 0x%x qlimit_ret=%d\n",
+                                    retry_hdr->msgh_remote_port, retry_lret);
+                            }
+                        } else if (ptype_rc == KERN_SUCCESS &&
+                                   (retry_ptype & MACH_PORT_TYPE_SEND) &&
+                                   !(retry_ptype & MACH_PORT_TYPE_RECEIVE) &&
+                                   vec_tmout == 0) {
+                            /*
+                             * Send-only (external) port with zero timeout.
+                             * The remote service may not have started its
+                             * receive loop yet.  Retry with a small non-zero
+                             * timeout to avoid a spurious MACH_SEND_TIMED_OUT
+                             * that would otherwise lead to an infinite hang
+                             * waiting for a send_possible notification that
+                             * never arrives.
+                             */
+#define EXT_SEND_RETRY_MS 100
+                            service_pending_workloop_reqs();
+                            service_workloop_machport_events();
+                            service_workq_notification_events();
+                            ret = host_mach_msg2_trap(host_data, vec_opts,
+                                                      (uint64_t)arg3,
+                                                      (uint64_t)arg4,
+                                                      (uint64_t)arg5,
+                                                      (uint64_t)arg6,
+                                                      (uint64_t)arg7,
+                                                      EXT_SEND_RETRY_MS);
+                            if (do_strace) {
+                                fprintf(stderr,
+                                    "  mach_msg2[vec]: ext-send retry %s "
+                                    "for port 0x%x tmout=%dms\n",
+                                    ret == KERN_SUCCESS
+                                        ? "succeeded" : "failed",
+                                    retry_hdr->msgh_remote_port,
+                                    EXT_SEND_RETRY_MS);
+                            }
+#undef EXT_SEND_RETRY_MS
+                        }
+                    }
+
                     if (do_strace && ret != KERN_SUCCESS) {
+                        mach_msg_header_t *shdr =
+                            (mach_msg_header_t *)msg_buf;
                         fprintf(stderr,
                             "  mach_msg2[vec] FAILED: ret=0x%x\n",
                             (unsigned)ret);
+                        if (shdr && (options & 0x1)) {
+                            mach_port_type_t ptype = 0;
+                            kern_return_t pret =
+                                mach_port_type(mach_task_self(),
+                                               shdr->msgh_remote_port,
+                                               &ptype);
+                            mach_port_status_t st = {0};
+                            mach_msg_type_number_t st_count =
+                                MACH_PORT_RECEIVE_STATUS_COUNT;
+                            kern_return_t sret = KERN_INVALID_NAME;
+                            mach_port_seqno_t peek_seq = 0;
+                            mach_msg_size_t peek_size = 0;
+                            mach_msg_id_t peek_id = 0;
+                            mach_msg_type_number_t peek_cnt = 0;
+                            kern_return_t peek_ret = KERN_INVALID_NAME;
+                            if (pret == KERN_SUCCESS &&
+                                (ptype & MACH_PORT_TYPE_RECEIVE)) {
+                                sret = mach_port_get_attributes(
+                                    mach_task_self(), shdr->msgh_remote_port,
+                                    MACH_PORT_RECEIVE_STATUS,
+                                    (mach_port_info_t)&st, &st_count);
+                                peek_ret = mach_port_peek(
+                                    mach_task_self(), shdr->msgh_remote_port,
+                                    MACH_RCV_TRAILER_NULL, &peek_seq,
+                                    &peek_size, &peek_id, NULL, &peek_cnt);
+                            }
+                            fprintf(stderr,
+                                "  send remote=0x%x local=0x%x id=%u "
+                                "ptype_ret=%d ptype=0x%x st_ret=%d "
+                                "pset=%u qlimit=%u msgcount=%u srights=%u "
+                                "sorights=%u peek_ret=%d peek_seq=%u "
+                                "peek_size=%u peek_id=%u\n",
+                                shdr->msgh_remote_port,
+                                shdr->msgh_local_port,
+                                shdr->msgh_id, pret, ptype, sret,
+                                st.mps_pset, st.mps_qlimit, st.mps_msgcount,
+                                st.mps_srights, st.mps_sorights, peek_ret,
+                                peek_seq, peek_size, peek_id);
+                        }
                     }
                     /* Translate OOL descriptors in the reply */
                     if (ret == KERN_SUCCESS && (options & 0x2)) {
@@ -1951,7 +2319,9 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                             rcv_buf = (void *)(uintptr_t)vec[0].msgv_data;
                         }
                         if (rcv_buf) {
-                            fixup_mig_reply_ool(rcv_buf);
+                            fixup_mig_reply_ool(
+                                rcv_buf,
+                                (mach_port_name_t)((uint64_t)arg6 >> 32));
                         }
                     }
                     /* Restore OOL descriptor addresses in send buffer */
@@ -2009,6 +2379,10 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                             shdr->msgh_size);
                         fixup_send_ool(host_data,
                             shdr->msgh_size, &ool_sv);
+                        debug_log_send_descriptors(host_data,
+                            shdr->msgh_size);
+                        debug_log_send_strings(host_data,
+                            shdr->msgh_size);
                     }
 
                     uint64_t trap_options = options;
@@ -2070,6 +2444,44 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                                                   trap_timeout);
                     }
 
+                    if (ret == 0x10000004 && host_data &&
+                        (trap_options & 0x1)) {
+                        mach_msg_header_t *retry_hdr =
+                            (mach_msg_header_t *)host_data;
+                        mach_port_type_t retry_ptype = 0;
+                        if (mach_port_type(mach_task_self(),
+                                           retry_hdr->msgh_remote_port,
+                                           &retry_ptype) == KERN_SUCCESS &&
+                            (retry_ptype & MACH_PORT_TYPE_RECEIVE)) {
+                            mach_port_limits_t retry_limits = {
+                                .mpl_qlimit = MACH_PORT_QLIMIT_SMALL,
+                            };
+                            kern_return_t retry_lret =
+                                mach_port_set_attributes(
+                                    mach_task_self(),
+                                    retry_hdr->msgh_remote_port,
+                                    MACH_PORT_LIMITS_INFO,
+                                    (mach_port_info_t)&retry_limits,
+                                    MACH_PORT_LIMITS_INFO_COUNT);
+                            service_pending_workloop_reqs();
+                            service_workloop_machport_events();
+                            service_workq_notification_events();
+                            ret = host_mach_msg2_trap(host_data, trap_options,
+                                                      (uint64_t)arg3,
+                                                      (uint64_t)arg4,
+                                                      (uint64_t)arg5,
+                                                      (uint64_t)arg6,
+                                                      (uint64_t)arg7,
+                                                      trap_timeout);
+                            if (do_strace && ret == KERN_SUCCESS) {
+                                fprintf(stderr,
+                                    "  mach_msg2: local-send retry "
+                                    "succeeded for port 0x%x qlimit_ret=%d\n",
+                                    retry_hdr->msgh_remote_port, retry_lret);
+                            }
+                        }
+                    }
+
                     if (do_strace && ret == KERN_SUCCESS &&
                         (options & 0x2) && host_data) {
                         mach_msg_header_t *rhdr =
@@ -2087,19 +2499,42 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                         if (host_data) {
                             mach_msg_header_t *hdr =
                                 (mach_msg_header_t *)host_data;
+                            mach_port_type_t ptype = 0;
+                            kern_return_t pret =
+                                mach_port_type(mach_task_self(),
+                                               hdr->msgh_remote_port,
+                                               &ptype);
+                            mach_port_status_t st = {0};
+                            mach_msg_type_number_t st_count =
+                                MACH_PORT_RECEIVE_STATUS_COUNT;
+                            kern_return_t sret = KERN_INVALID_NAME;
+                            if (pret == KERN_SUCCESS &&
+                                (ptype & MACH_PORT_TYPE_RECEIVE)) {
+                                sret = mach_port_get_attributes(
+                                    mach_task_self(), hdr->msgh_remote_port,
+                                    MACH_PORT_RECEIVE_STATUS,
+                                    (mach_port_info_t)&st, &st_count);
+                            }
                             fprintf(stderr,
                                 "  reply: bits=0x%x size=%u "
-                                "remote=0x%x local=0x%x id=%u\n",
+                                "remote=0x%x local=0x%x id=%u "
+                                "ptype_ret=%d ptype=0x%x st_ret=%d "
+                                "pset=%u qlimit=%u msgcount=%u srights=%u "
+                                "sorights=%u\n",
                                 hdr->msgh_bits, hdr->msgh_size,
                                 hdr->msgh_remote_port,
                                 hdr->msgh_local_port,
-                                hdr->msgh_id);
+                                hdr->msgh_id, pret, ptype, sret,
+                                st.mps_pset, st.mps_qlimit, st.mps_msgcount,
+                                st.mps_srights, st.mps_sorights);
                         }
                     }
                     /* Translate OOL descriptors in the reply */
                     if (ret == KERN_SUCCESS && host_data &&
                         (options & 0x2)) {
-                        fixup_mig_reply_ool(host_data);
+                        fixup_mig_reply_ool(
+                            host_data,
+                            (mach_port_name_t)((uint64_t)arg6 >> 32));
                     }
                     /* Restore OOL descriptor addresses in send buffer */
                     restore_send_ool(&ool_sv);
@@ -2149,15 +2584,16 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
             ret = semaphore_signal_thread((semaphore_t)arg1,
                                           (thread_t)arg2);
         } else if (trap_num == MACH_TRAP_SEMAPHORE_WAIT) {
-            ret = semaphore_wait((semaphore_t)arg1);
+            ret = semaphore_wait_with_polling((semaphore_t)arg1, 0, true);
         } else if (trap_num == MACH_TRAP_SEMAPHORE_WAIT_SIGNAL) {
             ret = semaphore_wait_signal((semaphore_t)arg1,
                                         (semaphore_t)arg2);
         } else if (trap_num == MACH_TRAP_SEMAPHORE_TIMEDWAIT) {
-            mach_timespec_t ts;
-            ts.tv_sec = (unsigned int)arg2;
-            ts.tv_nsec = (clock_res_t)arg3;
-            ret = semaphore_timedwait((semaphore_t)arg1, ts);
+            ret = semaphore_wait_with_polling((semaphore_t)arg1,
+                                              mach_timespec_to_timeout_ms(
+                                                  (unsigned int)arg2,
+                                                  (clock_res_t)arg3),
+                                              false);
         } else {
             mach_timespec_t ts;
             ts.tv_sec = (unsigned int)arg3;
