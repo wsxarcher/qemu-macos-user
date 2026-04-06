@@ -43,6 +43,20 @@ void dump_core_and_abort(int sig)
         fprintf(stderr, "dump_core_and_abort: sig=%d, guest PC=0x%lx\n",
                 sig, (unsigned long)env->pc);
         cpu_dump_state(cpu, stderr, 0);
+
+        /* Walk guest frame pointer chain for backtrace */
+        fprintf(stderr, "Guest backtrace:\n");
+        fprintf(stderr, "  [0] PC=0x%lx\n", (unsigned long)env->pc);
+        fprintf(stderr, "  [1] LR=0x%lx\n", (unsigned long)env->xregs[30]);
+        uint64_t fp = env->xregs[29];
+        for (int i = 2; i < 32 && fp != 0; i++) {
+            uint64_t *frame = g2h_untagged(fp);
+            uint64_t saved_fp = frame[0];
+            uint64_t saved_lr = frame[1];
+            fprintf(stderr, "  [%d] 0x%lx\n", i, (unsigned long)saved_lr);
+            if (saved_fp <= fp) break;
+            fp = saved_fp;
+        }
     }
     abort();
 }
