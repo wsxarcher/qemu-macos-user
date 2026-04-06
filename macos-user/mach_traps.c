@@ -47,8 +47,8 @@ extern mach_port_t thread_get_special_reply_port(void);
  * MACH_RCV_TIMED_OUT must NOT be returned — dispatch aborts on it.
  * MACH_RCV_PORT_DIED is handled by dispatch (graceful teardown).
  */
-#define IPC_RECV_TIMEOUT_MS   5000   /* 5s per attempt */
-#define IPC_RECV_MAX_RETRY    3      /* then PORT_DIED */
+#define IPC_RECV_TIMEOUT_MS   30000  /* 30s per attempt */
+#define IPC_RECV_MAX_RETRY    6      /* then PORT_DIED */
 
 static mach_port_name_t ipc_timeout_port;
 static int ipc_timeout_count;
@@ -1493,15 +1493,18 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                     nentries = 1;
                 }
                 /*
-                 * Only check entry 1 if entry 0 handles ONLY send
-                 * (no rcv_size) and the operation includes RCV, or
-                 * if entry 1 explicitly has sizes set.  This avoids
-                 * reading garbage when only 1 entry was allocated.
+                 * Translate entry 1 (aux data) if the kernel will
+                 * read it.  The kernel copins MAX(snd_count, rcv_count)
+                 * entries where:
+                 *   snd_count = upper 32 of arg3 (mb_ss >> 32)
+                 *   rcv_count = lower 32 of arg7 (rs_pr)
+                 * We must translate vec[1] if count >= 2.
                  */
-#define MACH64_SEND_AUX   0x20000000000ULL
-#define MACH64_RCV_AUX    0x80000000000ULL
-                if (nentries == 1 &&
-                    (options & (MACH64_SEND_AUX | MACH64_RCV_AUX))) {
+                uint32_t snd_count = (uint32_t)((uint64_t)arg3 >> 32);
+                uint32_t rcv_count = (uint32_t)(uint64_t)arg7;
+                uint32_t max_count = snd_count > rcv_count ?
+                                     snd_count : rcv_count;
+                if (nentries == 1 && max_count >= 2) {
                     save_data[1] = vec[1].msgv_data;
                     save_rcv[1] = vec[1].msgv_rcv_addr;
                     if (vec[1].msgv_data) {
@@ -1514,8 +1517,6 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                     }
                     nentries = 2;
                 }
-#undef MACH64_SEND_AUX
-#undef MACH64_RCV_AUX
 
                 if (do_strace) {
                     /* Log the actual message header from the first vector */
@@ -1532,6 +1533,16 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                             hdr->msgh_id, options,
                             vec[0].msgv_send_size,
                             vec[0].msgv_rcv_size);
+                        fprintf(stderr,
+                            "    vec[0]: data=0x%llx rcv=0x%llx "
+                            "ssz=%u rsz=%u | vec[1]: data=0x%llx "
+                            "rcv=0x%llx ssz=%u rsz=%u | "
+                            "snd_count=%u nentries=%d\n",
+                            vec[0].msgv_data, vec[0].msgv_rcv_addr,
+                            vec[0].msgv_send_size, vec[0].msgv_rcv_size,
+                            vec[1].msgv_data, vec[1].msgv_rcv_addr,
+                            vec[1].msgv_send_size, vec[1].msgv_rcv_size,
+                            (uint32_t)((uint64_t)arg3 >> 32), nentries);
                     }
                 }
 

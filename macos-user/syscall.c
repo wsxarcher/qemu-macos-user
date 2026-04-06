@@ -49,6 +49,76 @@ struct kevent_qos_s {
 #define KEVENT_FLAG_WORKLOOP   0x0100
 
 /*
+ * Raw syscall helpers for kevent_qos and kevent_id.
+ * The libc syscall() wrapper on ARM64 may not correctly pass 8 real
+ * arguments (9 total including syscall number) through the variadic
+ * interface.  Use inline assembly to ensure all 8 args go into X0-X7.
+ */
+#if defined(__aarch64__)
+static long raw_kevent_qos(int kq, void *cl, int nchanges,
+                           void *el, int nevents,
+                           void *d_out, void *d_avail,
+                           unsigned int flags)
+{
+    register long x0 __asm__("x0") = kq;
+    register long x1 __asm__("x1") = (long)cl;
+    register long x2 __asm__("x2") = nchanges;
+    register long x3 __asm__("x3") = (long)el;
+    register long x4 __asm__("x4") = nevents;
+    register long x5 __asm__("x5") = (long)d_out;
+    register long x6 __asm__("x6") = (long)d_avail;
+    register long x7 __asm__("x7") = flags;
+    register long x16 __asm__("x16") = SYS_kevent_qos;
+
+    __asm__ volatile(
+        "svc #0x80\n"
+        "bcc 1f\n"
+        "neg x0, x0\n"
+        "1:\n"
+        : "+r"(x0)
+        : "r"(x1), "r"(x2), "r"(x3), "r"(x4),
+          "r"(x5), "r"(x6), "r"(x7), "r"(x16)
+        : "memory", "cc"
+    );
+    return x0;
+}
+
+static long raw_kevent_id(uint64_t id, void *cl, int nchanges,
+                          void *el, int nevents,
+                          void *d_out, void *d_avail,
+                          unsigned int flags)
+{
+    register long x0 __asm__("x0") = (long)id;
+    register long x1 __asm__("x1") = (long)cl;
+    register long x2 __asm__("x2") = nchanges;
+    register long x3 __asm__("x3") = (long)el;
+    register long x4 __asm__("x4") = nevents;
+    register long x5 __asm__("x5") = (long)d_out;
+    register long x6 __asm__("x6") = (long)d_avail;
+    register long x7 __asm__("x7") = flags;
+    register long x16 __asm__("x16") = SYS_kevent_id;
+
+    __asm__ volatile(
+        "svc #0x80\n"
+        "bcc 1f\n"
+        "neg x0, x0\n"
+        "1:\n"
+        : "+r"(x0)
+        : "r"(x1), "r"(x2), "r"(x3), "r"(x4),
+          "r"(x5), "r"(x6), "r"(x7), "r"(x16)
+        : "memory", "cc"
+    );
+    return x0;
+}
+#else
+/* Fallback for non-ARM64 (not expected to be used) */
+#define raw_kevent_qos(kq,cl,nc,el,ne,do_,da,fl) \
+    syscall(SYS_kevent_qos,(kq),(cl),(nc),(el),(ne),(do_),(da),(fl))
+#define raw_kevent_id(id,cl,nc,el,ne,do_,da,fl) \
+    syscall(SYS_kevent_id,(id),(cl),(nc),(el),(ne),(do_),(da),(fl))
+#endif
+
+/*
  * Workqueue kqueue fd.  libdispatch calls kevent_qos with fd=-1 and
  * KEVENT_FLAG_WORKQ; the real kernel routes those to the per-process
  * workqueue kqueue.  We emulate this with a normal kqueue fd.
@@ -61,6 +131,31 @@ static int get_workq_kqueue(void)
         workq_kqueue_fd = kqueue();
     }
     return workq_kqueue_fd;
+}
+
+/*
+ * EVFILT_MACHPORT uses ext[0] as a pointer to a receive buffer and
+ * ext[1] as the buffer size.  Since guest_base != 0 for dynamic
+ * binaries, we must translate these guest pointers to host addresses
+ * before passing to the kernel, and restore the guest values
+ * afterward so libdispatch sees its own addresses.
+ */
+#define EVFILT_MACHPORT (-8)
+#define EVFILT_WORKLOOP_PRIVATE (-17)
+
+static void kevent_translate_machport_ptrs(struct kevent_qos_s *kev,
+                                           int count, bool to_host)
+{
+    for (int i = 0; i < count; i++) {
+        if (kev[i].filter == EVFILT_MACHPORT && kev[i].ext[0]) {
+            if (to_host) {
+                kev[i].ext[0] = (uint64_t)(uintptr_t)
+                    g2h_untagged((abi_ptr)kev[i].ext[0]);
+            } else {
+                kev[i].ext[0] = h2g((void *)(uintptr_t)kev[i].ext[0]);
+            }
+        }
+    }
 }
 
 /*
@@ -132,6 +227,506 @@ typedef struct parked_wq_thread {
 
 static parked_wq_thread *parked_list = NULL;
 static pthread_mutex_t parked_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/*
+ * Parked kevent workqueue thread — called WQOPS_THREAD_KEVENT_RETURN
+ * and is waiting for new kevent work from the monitor thread.
+ */
+typedef struct parked_kevent_wq {
+    CPUArchState *env;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    bool has_work;
+    abi_ulong self_addr;
+    abi_ulong stack_top;
+    abi_ulong stack_bottom;
+    abi_ulong tsd_base;
+    struct kevent_qos_s *delivered_events;
+    int delivered_nevents;
+    struct parked_kevent_wq *next;
+} parked_kevent_wq;
+
+static parked_kevent_wq *parked_kevent_list = NULL;
+static pthread_mutex_t parked_kevent_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/*
+ * Workqueue kqueue monitor.
+ *
+ * When libdispatch registers EVFILT_MACHPORT events on the workqueue
+ * kqueue (via kevent_qos with fd=-1 and KEVENT_FLAG_WORKQ), we forward
+ * them to a real kqueue fd.  A dedicated monitor thread blocks on this
+ * kqueue and, when events fire, creates or wakes workqueue threads to
+ * process them — replicating the kernel's automatic workqueue dispatch.
+ */
+static pthread_t workq_monitor_tid;
+static bool workq_monitor_started;
+static CPUArchState *workq_monitor_parent_env;
+static TaskState *workq_monitor_parent_ts;
+
+/* Stack allocation constants (must match WQOPS_QUEUE_REQTHREADS) */
+#define PTH_DEFAULT_STACKSZ    (512 * 1024)
+#define PTHREAD_T_OFFSET_ARM64 (12 * 1024)
+
+static int create_guest_thread(CPUArchState *parent_env,
+                               abi_ulong pc, abi_ulong sp,
+                               abi_ulong arg0, abi_ulong arg1,
+                               abi_ulong arg2, abi_ulong arg3,
+                               abi_ulong arg4, abi_ulong arg5,
+                               abi_ulong tsd_base,
+                               TaskState *parent_ts,
+                               bool is_workqueue,
+                               abi_ulong wq_self, abi_ulong wq_stop,
+                               abi_ulong wq_sbot, abi_ulong wq_tsd);
+
+static void deliver_kevents_to_thread(struct kevent_qos_s *events,
+                                      int nevents);
+
+/*
+ * Convert kevent_qos_s to kevent64_s for registration on regular kqueues.
+ * The kevent_qos syscall doesn't work correctly on regular kqueues
+ * (returns EINVAL with flags=0), so we use kevent64 instead.
+ */
+static void kqos_to_k64(const struct kevent_qos_s *src, struct kevent64_s *dst)
+{
+    memset(dst, 0, sizeof(*dst));
+    dst->ident = src->ident;
+    dst->filter = src->filter;
+    /*
+     * Strip EV_UDATA_SPECIFIC (0x100) and EV_VANISHED (0x200) — these
+     * are workloop-specific flags that don't work on regular kqueues.
+     * Keep EV_DISPATCH (0x80) which is required for EVFILT_MACHPORT
+     * with MACH_RCV_MSG.
+     */
+    dst->flags = src->flags & ~(uint16_t)0x0300;
+    dst->fflags = src->fflags;
+    dst->data = src->data;
+    dst->udata = src->udata;
+
+    if (src->filter == EVFILT_MACHPORT) {
+        /*
+         * Clear ext[0]/ext[1] for MACHPORT events.  The guest's ext[0]
+         * is a guest-space receive buffer that the kernel would try to
+         * pre-receive into.  With guest_base != 0 this would corrupt
+         * random host memory.  We handle pre-receive ourselves in the
+         * monitor thread via prereceive_machport_drain().
+         */
+        dst->ext[0] = 0;
+        dst->ext[1] = 0;
+    } else {
+        dst->ext[0] = src->ext[0];
+        dst->ext[1] = src->ext[1];
+    }
+}
+
+static void k64_to_kqos(const struct kevent64_s *src, struct kevent_qos_s *dst)
+{
+    memset(dst, 0, sizeof(*dst));
+    dst->ident = src->ident;
+    dst->filter = src->filter;
+    dst->flags = src->flags;
+    dst->fflags = src->fflags;
+    dst->data = src->data;
+    dst->udata = src->udata;
+    dst->ext[0] = src->ext[0];
+    dst->ext[1] = src->ext[1];
+}
+
+/*
+ * Register kevent_qos_s events on a regular kqueue using kevent64.
+ * Returns 0 on success, -1 on error.
+ */
+static int workq_kqueue_register(const struct kevent_qos_s *changelist,
+                                 int nchanges)
+{
+    int kq = get_workq_kqueue();
+    struct kevent64_s changes64[16];
+    int batch;
+
+    for (int i = 0; i < nchanges; i += batch) {
+        batch = nchanges - i;
+        if (batch > 16) {
+            batch = 16;
+        }
+        for (int j = 0; j < batch; j++) {
+            kqos_to_k64(&changelist[i + j], &changes64[j]);
+        }
+        int rc = kevent64(kq, changes64, batch, NULL, 0, 0, NULL);
+        if (rc < 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/*
+ * Pre-receive a Mach message for an EVFILT_MACHPORT kevent.
+ *
+ * The XNU kernel pre-receives the Mach message into a buffer before
+ * delivering the kevent to workqueue threads.  libdispatch expects this:
+ *   fflags==0 → message already received, sitting at ext[0]
+ *   fflags==MACH_RCV_TOO_LARGE → message not received, data=size
+ *
+ * Our regular kqueue cannot pre-receive, so we do it here in the
+ * monitor thread.  On success, we update the kevent_qos_s so that
+ * the guest thread sees fflags=0 and ext[0]=guest_buffer.
+ */
+static abi_ulong prereceive_one_msg(mach_port_t port,
+                                    mach_msg_size_t hint_size)
+{
+    mach_msg_size_t buf_size = hint_size + MAX_TRAILER_SIZE;
+    if (buf_size < 4096) {
+        buf_size = 4096;
+    }
+    void *buf = g_malloc0(buf_size);
+    mach_msg_header_t *hdr = (mach_msg_header_t *)buf;
+
+    kern_return_t kr = mach_msg(hdr,
+        MACH_RCV_MSG | MACH_RCV_LARGE | MACH_RCV_TIMEOUT,
+        0, buf_size, port, 100 /* 100ms timeout */, MACH_PORT_NULL);
+
+    if (kr == MACH_RCV_TOO_LARGE) {
+        buf_size = hdr->msgh_size + MAX_TRAILER_SIZE;
+        buf = g_realloc(buf, buf_size);
+        hdr = (mach_msg_header_t *)buf;
+        kr = mach_msg(hdr, MACH_RCV_MSG | MACH_RCV_LARGE | MACH_RCV_TIMEOUT,
+                      0, buf_size, port, 100, MACH_PORT_NULL);
+    }
+
+    if (kr != KERN_SUCCESS) {
+        g_free(buf);
+        return (abi_ulong)-1;
+    }
+
+    mach_msg_size_t received_size = hdr->msgh_size + MAX_TRAILER_SIZE;
+    mmap_lock();
+    abi_ulong guest_buf = target_mmap(0, received_size,
+        PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    mmap_unlock();
+
+    if (guest_buf == (abi_ulong)-1) {
+        g_free(buf);
+        return (abi_ulong)-1;
+    }
+
+    memcpy(g2h_untagged(guest_buf), buf, received_size);
+
+    /* Fix up OOL descriptors */
+    if (guest_base && (hdr->msgh_bits & MACH_MSGH_BITS_COMPLEX)) {
+        mach_msg_header_t *gh =
+            (mach_msg_header_t *)g2h_untagged(guest_buf);
+        mach_msg_body_t *body = (mach_msg_body_t *)(gh + 1);
+        uint8_t *dp = (uint8_t *)(body + 1);
+        for (uint32_t i = 0; i < body->msgh_descriptor_count; i++) {
+            mach_msg_type_descriptor_t *td =
+                (mach_msg_type_descriptor_t *)dp;
+            if (td->type == MACH_MSG_OOL_DESCRIPTOR ||
+                td->type == MACH_MSG_OOL_VOLATILE_DESCRIPTOR) {
+                mach_msg_ool_descriptor_t *ool =
+                    (mach_msg_ool_descriptor_t *)dp;
+                void *host_addr = ool->address;
+                mach_msg_size_t sz = ool->size;
+                if (host_addr && sz > 0) {
+                    mmap_lock();
+                    abi_long ga = target_mmap(0, sz,
+                        PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                    mmap_unlock();
+                    if (ga > 0) {
+                        memcpy(g2h_untagged(ga), host_addr, sz);
+                        munmap(host_addr, sz);
+                        ool->address = (void *)(uintptr_t)ga;
+                    }
+                }
+                dp += sizeof(mach_msg_ool_descriptor_t);
+            } else if (td->type == MACH_MSG_OOL_PORTS_DESCRIPTOR) {
+                dp += sizeof(mach_msg_ool_ports_descriptor_t);
+            } else if (td->type == MACH_MSG_PORT_DESCRIPTOR) {
+                dp += sizeof(mach_msg_port_descriptor_t);
+            } else {
+                dp += sizeof(mach_msg_type_descriptor_t);
+            }
+        }
+    }
+
+    if (do_strace) {
+        fprintf(stderr, "  workq_monitor: prereceived port 0x%x "
+                "msg_size=%u id=%u -> guest 0x%llx\n",
+                port, hdr->msgh_size, hdr->msgh_id,
+                (unsigned long long)guest_buf);
+    }
+
+    g_free(buf);
+    return guest_buf;
+}
+
+/*
+ * Pre-receive ALL pending Mach messages for an EVFILT_MACHPORT kevent.
+ *
+ * Drains the port's message queue.  For each received message, creates
+ * a kevent_qos_s with fflags=0 and ext[0]=guest_buffer (matching what
+ * the kernel delivers to workqueue threads).  Returns the count of
+ * successfully pre-received events, stored in out_events[].
+ */
+static int prereceive_machport_drain(struct kevent_qos_s *template_kev,
+                                     struct kevent_qos_s *out_events,
+                                     int max_events)
+{
+    mach_port_t port = (mach_port_t)template_kev->ident;
+    mach_msg_size_t hint = (mach_msg_size_t)template_kev->data;
+    int count = 0;
+
+    while (count < max_events) {
+        abi_ulong guest_buf = prereceive_one_msg(port, hint);
+        if (guest_buf == (abi_ulong)-1) {
+            break;
+        }
+        /* Build kevent for this message */
+        out_events[count] = *template_kev;
+        out_events[count].fflags = 0;
+        mach_msg_header_t *gh =
+            (mach_msg_header_t *)g2h_untagged(guest_buf);
+        out_events[count].data = gh->msgh_size;
+        out_events[count].ext[0] = (uint64_t)guest_buf;
+        count++;
+        hint = 4096;  /* next message might be any size */
+    }
+
+    return count;
+}
+
+static void *workq_kqueue_monitor_func(void *arg)
+{
+    struct kevent64_s events64[8];
+    struct kevent_qos_s events_qos[8];
+    int kq = get_workq_kqueue();
+
+    rcu_register_thread();
+
+    while (1) {
+        int n = kevent64(kq, NULL, 0, events64, 8, 0, NULL);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            usleep(10000);
+            continue;
+        }
+        if (n == 0) {
+            continue;
+        }
+
+        /* Convert to kevent_qos_s for the guest */
+        for (int i = 0; i < n; i++) {
+            k64_to_kqos(&events64[i], &events_qos[i]);
+        }
+
+        if (do_strace) {
+            fprintf(stderr, "  workq_monitor: %d events fired\n", n);
+            for (int i = 0; i < n; i++) {
+                fprintf(stderr, "    event[%d]: filter=%d ident=0x%llx "
+                        "flags=0x%x fflags=0x%x data=%lld\n",
+                        i, events_qos[i].filter,
+                        (unsigned long long)events_qos[i].ident,
+                        events_qos[i].flags, events_qos[i].fflags,
+                        (long long)events_qos[i].data);
+            }
+        }
+
+        /*
+         * Pre-receive Mach messages for MACHPORT events.
+         * This replicates the kernel's workqueue kevent delivery which
+         * receives the message before waking the thread.
+         *
+         * We drain ALL pending messages since the port might have
+         * multiple (e.g. a notification + the real callback).
+         * Each pre-received message becomes a separate kevent delivery.
+         */
+        struct kevent_qos_s drain_buf[16];
+        int total_drained = 0;
+
+        for (int i = 0; i < n; i++) {
+            if (events_qos[i].filter == EVFILT_MACHPORT) {
+                int got = prereceive_machport_drain(&events_qos[i],
+                    &drain_buf[total_drained],
+                    16 - total_drained);
+                if (got > 0) {
+                    total_drained += got;
+                } else if (total_drained < 16) {
+                    /* Pre-receive failed — deliver raw event anyway */
+                    drain_buf[total_drained++] = events_qos[i];
+                }
+
+                /*
+                 * Re-arm the kevent (EV_ENABLE) so it fires again if
+                 * more messages arrive.  EVFILT_MACHPORT with
+                 * EV_DISPATCH is one-shot; we must re-enable it.
+                 */
+                struct kevent64_s rearm;
+                memset(&rearm, 0, sizeof(rearm));
+                rearm.ident = events_qos[i].ident;
+                rearm.filter = EVFILT_MACHPORT;
+                rearm.flags = EV_ENABLE;
+                rearm.fflags = events_qos[i].fflags;
+                rearm.udata = events64[i].udata;
+                rearm.ext[0] = events64[i].ext[0];
+                rearm.ext[1] = events64[i].ext[1];
+                kevent64(kq, &rearm, 1, NULL, 0, 0, NULL);
+            } else {
+                /* Non-MACHPORT event, pass through */
+                if (total_drained < 16) {
+                    drain_buf[total_drained++] = events_qos[i];
+                }
+            }
+        }
+
+        if (total_drained > 0) {
+            deliver_kevents_to_thread(drain_buf, total_drained);
+        }
+    }
+    return NULL;
+}
+
+/*
+ * Create or wake a workqueue thread to process kevent events.
+ */
+static void deliver_kevents_to_thread(struct kevent_qos_s *events,
+                                      int nevents)
+{
+    /* Try to wake a parked kevent thread first */
+    parked_kevent_wq *pk = NULL;
+    pthread_mutex_lock(&parked_kevent_lock);
+    if (parked_kevent_list) {
+        pk = parked_kevent_list;
+        parked_kevent_list = pk->next;
+        pk->next = NULL;
+    }
+    pthread_mutex_unlock(&parked_kevent_lock);
+
+    if (pk) {
+        pk->delivered_events = g_memdup2(events,
+            nevents * sizeof(struct kevent_qos_s));
+        pk->delivered_nevents = nevents;
+
+        if (do_strace) {
+            fprintf(stderr, "  workq_monitor: waking parked kevent "
+                    "thread self=0x%lx with %d events\n",
+                    (unsigned long)pk->self_addr, nevents);
+        }
+
+        pthread_mutex_lock(&pk->mutex);
+        pk->has_work = true;
+        pthread_cond_signal(&pk->cond);
+        pthread_mutex_unlock(&pk->mutex);
+        return;
+    }
+
+    /* No parked kevent thread — create a new workqueue thread */
+    if (!saved_wqthread || !workq_monitor_parent_env) {
+        return;
+    }
+
+    size_t page_sz = qemu_real_host_page_size();
+    size_t guardsize = page_sz;
+    size_t pthsize = saved_pthsize ? saved_pthsize : 0x4000;
+    size_t total = guardsize + PTH_DEFAULT_STACKSZ
+                 + PTHREAD_T_OFFSET_ARM64 + pthsize;
+
+    mmap_lock();
+    abi_ulong stackaddr = target_mmap(0, total,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    mmap_unlock();
+
+    if (stackaddr == (abi_ulong)-1) {
+        return;
+    }
+
+    mmap_lock();
+    target_mprotect(stackaddr, guardsize, PROT_NONE);
+    mmap_unlock();
+
+    abi_ulong stack_bottom = stackaddr + guardsize;
+    abi_ulong self_addr = stackaddr + guardsize + PTH_DEFAULT_STACKSZ
+                        + PTHREAD_T_OFFSET_ARM64;
+    abi_ulong stack_top = self_addr & ~(abi_ulong)0xF;
+
+    abi_ulong tsd_base = self_addr;
+    if (saved_tsd_offset) {
+        tsd_base = self_addr + saved_tsd_offset;
+    }
+
+    /* Copy events onto the new thread's stack (below stack_top) */
+    size_t events_sz = nevents * sizeof(struct kevent_qos_s);
+    abi_ulong sp = stack_top;
+    sp -= events_sz;
+    sp &= ~(abi_ulong)0xF;
+    memcpy(g2h_untagged(sp), events, events_sz);
+    abi_ulong keventlist = sp;
+
+    sp -= 256;  /* headroom */
+    sp &= ~(abi_ulong)0xF;
+
+    uint32_t flags = WQ_FLAG_THREAD_NEWSPI
+                   | WQ_FLAG_THREAD_TSD_BASE_SET
+                   | WQ_FLAG_THREAD_PRIO_QOS
+                   | WQ_FLAG_THREAD_KEVENT
+                   | 4;  /* QoS default */
+
+    if (do_strace) {
+        fprintf(stderr, "  workq_monitor: creating kevent thread "
+                "self=0x%lx sp=0x%lx keventlist=0x%lx "
+                "nevents=%d flags=0x%x\n",
+                (unsigned long)self_addr, (unsigned long)sp,
+                (unsigned long)keventlist, nevents, flags);
+    }
+
+    create_guest_thread(
+        workq_monitor_parent_env,
+        saved_wqthread,
+        sp,
+        self_addr,       /* x0 = pthread_self */
+        0,               /* x1 = kport (set by worker) */
+        stack_bottom,    /* x2 = stacklowaddr */
+        keventlist,      /* x3 = keventlist */
+        flags,           /* x4 = flags */
+        nevents,         /* x5 = nkevents */
+        tsd_base,
+        workq_monitor_parent_ts,
+        true, self_addr, stack_top,
+        stack_bottom, tsd_base);
+}
+
+static void ensure_workq_monitor(CPUArchState *env, TaskState *ts)
+{
+    if (workq_monitor_started) {
+        return;
+    }
+    workq_monitor_started = true;
+    workq_monitor_parent_env = env;
+    workq_monitor_parent_ts = ts;
+
+    /*
+     * Transition to parallel code generation NOW, while we're on a guest
+     * thread (current_cpu is set).  The monitor is a host-only thread and
+     * cannot safely call tb_flush__exclusive_or_serial(), so make sure
+     * CF_PARALLEL is already set before the monitor ever calls
+     * create_guest_thread → begin_parallel_context.
+     */
+    begin_parallel_context(env_cpu(env));
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 256 * 1024);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_create(&workq_monitor_tid, &attr,
+                   workq_kqueue_monitor_func, NULL);
+    pthread_attr_destroy(&attr);
+
+    if (do_strace) {
+        fprintf(stderr, "  workq_monitor: started, kq_fd=%d\n",
+                get_workq_kqueue());
+    }
+}
 
 typedef struct {
     CPUArchState *env;
@@ -1777,11 +2372,16 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
     case TARGET_MACOS_NR_workq_open:
         /*
          * workq_open(void)
-         * Opens the workqueue for this process.  We don't implement
-         * real workqueues but returning success prevents libdispatch
-         * from aborting.
+         * We emulate the workqueue with our own kqueue, so just
+         * return success.  Do NOT forward to the kernel — that
+         * would create real kernel workqueue threads that interfere
+         * with our emulation.
          */
+        get_workq_kqueue();
         ret = 0;
+        if (do_strace) {
+            fprintf(stderr, "  workq_open -> 0 (emulated)\n");
+        }
         break;
 
     case TARGET_MACOS_NR_workq_kernreturn:
@@ -1842,8 +2442,6 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                  */
                 size_t page_sz = qemu_real_host_page_size();
                 size_t guardsize = page_sz;
-#define PTH_DEFAULT_STACKSZ (512 * 1024)
-#define PTHREAD_T_OFFSET_ARM64 (12 * 1024)
                 size_t pthsize = saved_pthsize ? saved_pthsize : 0x4000;
                 size_t total = guardsize + PTH_DEFAULT_STACKSZ
                              + PTHREAD_T_OFFSET_ARM64 + pthsize;
@@ -1979,7 +2577,6 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
             }
 
             case WQOPS_THREAD_RETURN:
-            case WQOPS_THREAD_KEVENT_RETURN:
             case WQOPS_THREAD_WORKLOOP_RETURN:
             {
                 /*
@@ -2036,11 +2633,90 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                 pthread_mutex_destroy(&pw.mutex);
                 pthread_cond_destroy(&pw.cond);
 
+                ret = -TARGET_EJUSTRETURN;
+                break;
+            }
+
+            case WQOPS_THREAD_KEVENT_RETURN:
+            {
                 /*
-                 * Return EJUSTRETURN so the syscall return path does
-                 * not clobber our carefully set-up registers.
-                 * cpu_loop will resume at the new PC (wqthread entry).
+                 * Kevent workqueue thread is done.  Forward any new
+                 * changelist to our workq kqueue, then park the thread
+                 * in the kevent-parked list.  The monitor thread will
+                 * wake it when new kevent events fire.
                  */
+                struct kevent_qos_s *cl = arg2
+                    ? (struct kevent_qos_s *)g2h_untagged(arg2) : NULL;
+                int nchanges = (int)arg3;
+
+                if (cl && nchanges > 0) {
+                    int rc = workq_kqueue_register(cl, nchanges);
+                    if (do_strace) {
+                        fprintf(stderr,
+                            "  WQOPS_THREAD_KEVENT_RETURN: "
+                            "registered %d events -> %d\n",
+                            nchanges, rc);
+                    }
+                }
+
+                parked_kevent_wq pk;
+                memset(&pk, 0, sizeof(pk));
+                pthread_mutex_init(&pk.mutex, NULL);
+                pthread_cond_init(&pk.cond, NULL);
+                pk.env = (CPUArchState *)cpu_env;
+                pk.has_work = false;
+
+                TaskState *ts = get_task_state(
+                    env_cpu((CPUArchState *)cpu_env));
+                pk.self_addr = ts->wq_self_addr;
+                pk.stack_top = ts->wq_stack_top;
+                pk.stack_bottom = ts->wq_stack_bottom;
+                pk.tsd_base = ts->wq_tsd_base;
+
+                pthread_mutex_lock(&parked_kevent_lock);
+                pk.next = parked_kevent_list;
+                parked_kevent_list = &pk;
+                pthread_mutex_unlock(&parked_kevent_lock);
+
+                /* Wait for events from monitor thread */
+                pthread_mutex_lock(&pk.mutex);
+                while (!pk.has_work) {
+                    pthread_cond_wait(&pk.cond, &pk.mutex);
+                }
+                pthread_mutex_unlock(&pk.mutex);
+
+                /* Copy delivered events to guest stack */
+                CPUArchState *env = (CPUArchState *)cpu_env;
+                size_t ev_sz = pk.delivered_nevents
+                             * sizeof(struct kevent_qos_s);
+                abi_ulong sp = pk.stack_top;
+                sp -= ev_sz;
+                sp &= ~(abi_ulong)0xF;
+                memcpy(g2h_untagged(sp), pk.delivered_events, ev_sz);
+                abi_ulong keventlist = sp;
+                sp -= 256;
+                sp &= ~(abi_ulong)0xF;
+
+                uint32_t reuse_flags = WQ_FLAG_THREAD_KEVENT
+                    | WQ_FLAG_THREAD_REUSE
+                    | WQ_FLAG_THREAD_NEWSPI
+                    | WQ_FLAG_THREAD_PRIO_QOS | 4;
+
+                env->pc = saved_wqthread;
+                env->xregs[31] = sp;
+                env->xregs[0] = pk.self_addr;
+                env->xregs[1] = (abi_ulong)mach_thread_self();
+                env->xregs[2] = pk.stack_bottom;
+                env->xregs[3] = keventlist;
+                env->xregs[4] = reuse_flags;
+                env->xregs[5] = pk.delivered_nevents;
+                env->xregs[29] = 0;
+                env->xregs[30] = 0;
+
+                g_free(pk.delivered_events);
+                pthread_mutex_destroy(&pk.mutex);
+                pthread_cond_destroy(&pk.cond);
+
                 ret = -TARGET_EJUSTRETURN;
                 break;
             }
@@ -2067,16 +2743,12 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
             {
                 /*
                  * libdispatch calls this to register its config struct.
-                 * arg2 = pointer to workq_dispatch_config
-                 * arg3 = sizeof(workq_dispatch_config)
-                 *
-                 * We acknowledge it and store nothing — the real kernel
-                 * uses this for serialno / label offsets in workloop
-                 * kqueues.  We don't emulate that yet.
+                 * We emulate the workqueue ourselves, so just return
+                 * success without forwarding to the kernel.
                  */
                 if (do_strace) {
                     fprintf(stderr, "  WQOPS_SETUP_DISPATCH: "
-                            "config=0x%lx size=%d\n",
+                            "config=0x%lx size=%d (emulated)\n",
                             (unsigned long)arg2, (int)arg3);
                 }
                 ret = 0;
@@ -2141,15 +2813,44 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
          *            size_t *data_available, unsigned int flags)
          *
          * When fd == -1 and flags & KEVENT_FLAG_WORKQ, libdispatch is
-         * using the per-process workqueue kqueue.  We can't dispatch to
-         * workqueue threads (single-threaded), so just pretend the
-         * changelist was registered and return 0 events.
+         * using the per-process workqueue kqueue.  Forward event
+         * registrations to our workq kqueue and start the monitor
+         * thread which creates workqueue threads when events fire.
          */
         int kq = (int)arg1;
         unsigned int flags = (unsigned int)arg8;
 
         if (kq == -1 && (flags & KEVENT_FLAG_WORKQ)) {
+            /*
+             * Workqueue kqueue: libdispatch registers events and parks
+             * threads here.  We return success without registering
+             * anything — ports remain in CFRunLoop's port sets for
+             * mach_msg delivery.  Events will be handled when dispatch
+             * channels become active on workqueue threads.
+             */
+            struct kevent_qos_s *cl = arg2
+                ? (struct kevent_qos_s *)g2h_untagged(arg2) : NULL;
+            int nchanges = (int)arg3;
+
+            if (do_strace) {
+                fprintf(stderr, "  kevent_qos WORKQ: nchanges=%d "
+                        "nevents=%d flags=0x%x\n",
+                        nchanges, (int)arg5, flags);
+                if (cl) {
+                    for (int i = 0; i < nchanges; i++) {
+                        fprintf(stderr, "    kev[%d]: filter=%d "
+                                "ident=0x%llx fflags=0x%x\n",
+                                i, cl[i].filter,
+                                (unsigned long long)cl[i].ident,
+                                cl[i].fflags);
+                    }
+                }
+            }
+
             ret = 0;
+            if (do_strace) {
+                fprintf(stderr, "    kevent_qos WORKQ -> 0 (no-op)\n");
+            }
             break;
         }
 
@@ -2158,9 +2859,28 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
         void *d_out = arg6 ? g2h_untagged(arg6) : NULL;
         size_t *d_avail = arg7 ? (size_t *)g2h_untagged(arg7) : NULL;
 
-        ret = get_errno(syscall(SYS_kevent_qos, kq, cl, (int)arg3,
-                                el, (int)arg5, d_out, d_avail, flags));
-        break;
+        if (cl) {
+            kevent_translate_machport_ptrs(
+                (struct kevent_qos_s *)cl, (int)arg3, true);
+        }
+        {
+            long raw = raw_kevent_qos(kq, cl, (int)arg3,
+                                       el, (int)arg5, d_out, d_avail, flags);
+            if (raw < 0) {
+                errno = (int)(-raw);
+                ret = -errno;
+            } else {
+                ret = raw;
+            }
+        }
+        if (cl) {
+            kevent_translate_machport_ptrs(
+                (struct kevent_qos_s *)cl, (int)arg3, false);
+        }
+        if (el && ret > 0) {
+            kevent_translate_machport_ptrs(
+                (struct kevent_qos_s *)el, (int)ret, false);
+        }
     }
 
     case TARGET_MACOS_NR_kevent_id: {
@@ -2170,11 +2890,53 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
          *           int nevents, void *data_out,
          *           size_t *data_available, unsigned int flags)
          *
-         * Used by libdispatch for workloop kqueues.  Workloop events
-         * need real kernel workqueue thread support that we lack;
-         * stub the call to return 0 events.
+         * Used by libdispatch for workloop kqueues.  We emulate by
+         * returning success for registrations without actually creating
+         * a kernel workloop.  MACHPORT registrations are acknowledged
+         * Used by libdispatch for workloop kqueues.
+         *
+         * MACHPORT registrations go to workq_kqueue_fd so the
+         * monitor thread can deliver events to guest workqueue
+         * threads.  WORKLOOP registrations are no-ops (we handle
+         * thread management ourselves).
          */
+        struct kevent_qos_s *cl = arg2
+            ? (struct kevent_qos_s *)g2h_untagged(arg2) : NULL;
+        int nchanges = (int)arg3;
+        unsigned int kflags = (unsigned int)arg8;
+
+        if (do_strace) {
+            fprintf(stderr, "  kevent_id: id=0x%llx nchanges=%d "
+                    "nevents=%d flags=0x%x\n",
+                    (unsigned long long)arg1, nchanges,
+                    (int)arg5, kflags);
+            if (cl) {
+                for (int i = 0; i < nchanges; i++) {
+                    fprintf(stderr, "    kev[%d]: filter=%d "
+                            "ident=0x%llx flags=0x%x "
+                            "fflags=0x%x ext0=0x%llx\n",
+                            i, cl[i].filter,
+                            (unsigned long long)cl[i].ident,
+                            cl[i].flags, cl[i].fflags,
+                            (unsigned long long)cl[i].ext[0]);
+                }
+            }
+        }
+
+        /* kevent_id: no-ops for all registrations */
+        if (do_strace && cl) {
+            for (int i = 0; i < nchanges; i++) {
+                fprintf(stderr, "    %s ident=0x%llx -> no-op\n",
+                        cl[i].filter == EVFILT_MACHPORT ? "MACHPORT" :
+                        "WORKLOOP",
+                        (unsigned long long)cl[i].ident);
+            }
+        }
+
         ret = 0;
+        if (do_strace) {
+            fprintf(stderr, "    kevent_id -> 0\n");
+        }
         break;
     }
 
