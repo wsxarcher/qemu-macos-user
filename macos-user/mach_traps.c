@@ -863,20 +863,22 @@ static void fixup_mig_request_addrs(void *msg_buf, uint32_t send_size)
     case 2889: {
         /*
          * io_registry_entry_get_property_bin_buf
-         * Request layout (pack(4)):
-         *   Head(24) + NDR(8) + planeCnt(4) + plane(var,pad4)
-         *   + nameCnt(4) + name(var,pad4) + options(4)
-         *   + buf(8) + bufsize(8)
+         * MIG c_string[*:N] emits: Offset(4) + Cnt(4) + data(var,pad4)
+         *   Head(24) + NDR(8) + planeOff(4) + planeCnt(4) + plane(var)
+         *   + nameOff(4) + nameCnt(4) + name(var)
+         *   + options(4) + buf(8) + bufsize(8)
          */
         uint8_t *p = (uint8_t *)hdr;
-        if (send_size < 48) break;
-        uint32_t plane_cnt = *(uint32_t *)(p + 32);
+        if (send_size < 56) break;
+        /* plane: offset + count + data */
+        uint32_t plane_cnt = *(uint32_t *)(p + 36);
         uint32_t plane_pad = (plane_cnt + 3) & ~3u;
-        uint32_t name_off = 36 + plane_pad;
-        if (name_off + 4 > send_size) break;
-        uint32_t name_cnt = *(uint32_t *)(p + name_off);
+        uint32_t name_off_field = 40 + plane_pad;
+        if (name_off_field + 8 > send_size) break;
+        /* property_name: offset + count + data */
+        uint32_t name_cnt = *(uint32_t *)(p + name_off_field + 4);
         uint32_t name_pad = (name_cnt + 3) & ~3u;
-        uint32_t opts_off = name_off + 4 + name_pad;
+        uint32_t opts_off = name_off_field + 8 + name_pad;
         uint32_t buf_off = opts_off + 4;
         if (buf_off + 8 > send_size) break;
         uint64_t *bufp = (uint64_t *)(p + buf_off);
