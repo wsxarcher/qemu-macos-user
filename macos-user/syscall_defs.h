@@ -506,8 +506,15 @@
 #define TARGET_TRAP_TRACE   2
 
 /* Error codes */
-#define TARGET_ERESTART     -1
-#define TARGET_EJUSTRETURN  -2
+/*
+ * Internal sentinel values for syscall return.  XNU uses ERESTART==-1
+ * and EJUSTRETURN==-2, but -(-1)==1 which collides with legitimate
+ * return values like "1 byte written".  Use values above ELAST (107)
+ * so that -TARGET_ERESTART and -TARGET_EJUSTRETURN cannot be valid
+ * syscall success values.  This matches bsd-user's convention.
+ */
+#define TARGET_ERESTART     255
+#define TARGET_EJUSTRETURN  254
 
 /* siginfo_t structure */
 typedef struct target_siginfo {

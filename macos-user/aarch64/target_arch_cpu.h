@@ -39,13 +39,11 @@ static inline G_NORETURN void target_cpu_loop(CPUARMState *env)
     int trapnr, ec, fsc, si_code, si_signo;
     uint64_t code, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8;
     abi_long ret;
-    uint64_t loop_count = 0;
 
     for (;;) {
         cpu_exec_start(cs);
         trapnr = cpu_exec(cs);
         cpu_exec_end(cs);
-        loop_count++;
 
         qemu_process_cpu_events(cs);
 
