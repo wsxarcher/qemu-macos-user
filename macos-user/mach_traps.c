@@ -48,7 +48,7 @@ extern mach_port_t thread_get_special_reply_port(void);
  * MACH_RCV_TIMED_OUT must NOT be returned — dispatch aborts on it.
  * MACH_RCV_PORT_DIED is handled by dispatch (graceful teardown).
  */
-#define IPC_RECV_TIMEOUT_MS   5000   /* 5s per attempt */
+#define IPC_RECV_TIMEOUT_MS   1000   /* 1s per attempt */
 #define IPC_RECV_MAX_RETRY    3      /* then PORT_DIED */
 #define WORKLOOP_POLL_SLICE_MS 100
 #define DISPATCH_MACH_CHECKIN_MSGID 0x77303074U
@@ -2238,8 +2238,23 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                              * receive loop yet, or its queue is temporarily
                              * full due to a circular dependency in the XPC
                              * bootstrap chain.  Retry with escalating
-                             * timeouts, servicing events between attempts
-                             * so the host service can make progress.
+                             * timeouts, servicing workloop events between
+                             * attempts so the host service can make progress.
+                             *
+                             * service_workq_notification_events() is
+                             * intentionally NOT called inside this loop.
+                             * Calling it here would drain the SEND_POSSIBLE
+                             * notification from the notification port and
+                             * wake a workq thread that would race to resend
+                             * the same message to this rendezvous port.
+                             * On a qlimit=0 port only one sender wins; the
+                             * loser exhausts its own retries and gets
+                             * INVALID_DEST, causing dispatch to cancel the
+                             * channel even though the send succeeded on the
+                             * other thread.  Workq SEND_POSSIBLE delivery is
+                             * handled by the background workq_kqueue_monitor
+                             * thread; we service workq notifications once
+                             * after the loop instead.
                              */
                             static const int ext_retry_ms[] = {
                                 50, 100, 200, 500, 1000
@@ -2250,7 +2265,6 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                                  ri++) {
                                 service_pending_workloop_reqs();
                                 service_workloop_machport_events();
-                                service_workq_notification_events();
                                 ret = host_mach_msg2_trap(
                                     host_data, vec_opts,
                                     (uint64_t)arg3, (uint64_t)arg4,
@@ -2272,18 +2286,23 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                                     break;
                                 }
                             }
-                            if (ret == MACH_SEND_TIMED_OUT &&
-                                retry_hdr->msgh_id ==
-                                DISPATCH_MACH_CHECKIN_MSGID) {
-                                if (do_strace) {
-                                    fprintf(stderr,
-                                        "  mach_msg2[vec]: remapping failed "
-                                        "dispatch_mach checkin timeout on "
-                                        "port 0x%x to INVALID_DEST\n",
-                                        retry_hdr->msgh_remote_port);
-                                }
-                                ret = MACH_SEND_INVALID_DEST;
-                            }
+                            /*
+                             * Service workq notification events once after
+                             * the retry loop so any SEND_POSSIBLE that
+                             * arrived while we were retrying is delivered
+                             * to the appropriate workq thread.
+                             */
+                            service_workq_notification_events();
+                            /*
+                             * Do NOT remap MACH_SEND_TIMED_OUT to
+                             * MACH_SEND_INVALID_DEST here.  The port is
+                             * still valid (we have a send right and
+                             * mach_port_type succeeded); returning
+                             * INVALID_DEST would cause libdispatch to
+                             * cancel the mach channel entirely.  Return
+                             * TIMED_OUT so dispatch re-arms SEND_POSSIBLE
+                             * and retries via the normal notification path.
+                             */
                         }
                     }
 
@@ -2511,6 +2530,12 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                             /*
                              * Send-only (external) port with zero timeout.
                              * Same escalating retry as the vector path.
+                             * service_workq_notification_events() is moved
+                             * to after the loop for the same reason as the
+                             * vector path: calling it inside would create a
+                             * competing workq thread that races to resend the
+                             * same message, and the loser would eventually
+                             * return INVALID_DEST, cancelling the channel.
                              */
                             static const int ext_retry_ms[] = {
                                 50, 100, 200, 500, 1000
@@ -2521,7 +2546,6 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                                  ri++) {
                                 service_pending_workloop_reqs();
                                 service_workloop_machport_events();
-                                service_workq_notification_events();
                                 ret = host_mach_msg2_trap(
                                     host_data, trap_options,
                                     (uint64_t)arg3, (uint64_t)arg4,
@@ -2543,18 +2567,8 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                                     break;
                                 }
                             }
-                            if (ret == MACH_SEND_TIMED_OUT &&
-                                retry_hdr->msgh_id ==
-                                DISPATCH_MACH_CHECKIN_MSGID) {
-                                if (do_strace) {
-                                    fprintf(stderr,
-                                        "  mach_msg2: remapping failed "
-                                        "dispatch_mach checkin timeout on "
-                                        "port 0x%x to INVALID_DEST\n",
-                                        retry_hdr->msgh_remote_port);
-                                }
-                                ret = MACH_SEND_INVALID_DEST;
-                            }
+                            service_workq_notification_events();
+                            /* Return TIMED_OUT, not INVALID_DEST — see vec path. */
                         }
                     }
 
