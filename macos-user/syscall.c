@@ -201,6 +201,55 @@ static pthread_mutex_t workq_lock = PTHREAD_MUTEX_INITIALIZER;
 #define WQ_FLAG_THREAD_KEVENT          0x00080000
 #define WQ_FLAG_THREAD_EVENT_MANAGER   0x00100000
 #define WQ_FLAG_THREAD_TSD_BASE_SET    0x00200000
+#define WQ_FLAG_THREAD_WORKLOOP        0x00400000
+
+/*
+ * Workloop → port mapping.  When kevent_id registers a MACHPORT on a
+ * workloop, we record the (workloop_id, port) pair so the monitor thread
+ * can deliver MACHPORT events as workloop-thread events.
+ */
+#define MAX_WORKLOOP_PORTS 64
+typedef struct {
+    uint64_t workloop_id;
+    mach_port_t port;
+} workloop_port_entry;
+
+static workloop_port_entry workloop_ports[MAX_WORKLOOP_PORTS];
+static int workloop_port_count = 0;
+static pthread_mutex_t workloop_port_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void add_workloop_port(uint64_t wl_id, mach_port_t port)
+{
+    pthread_mutex_lock(&workloop_port_lock);
+    /* Update existing entry for this port */
+    for (int i = 0; i < workloop_port_count; i++) {
+        if (workloop_ports[i].port == port) {
+            workloop_ports[i].workloop_id = wl_id;
+            pthread_mutex_unlock(&workloop_port_lock);
+            return;
+        }
+    }
+    if (workloop_port_count < MAX_WORKLOOP_PORTS) {
+        workloop_ports[workloop_port_count].workloop_id = wl_id;
+        workloop_ports[workloop_port_count].port = port;
+        workloop_port_count++;
+    }
+    pthread_mutex_unlock(&workloop_port_lock);
+}
+
+static uint64_t find_workloop_for_port(mach_port_t port)
+{
+    uint64_t wl_id = 0;
+    pthread_mutex_lock(&workloop_port_lock);
+    for (int i = 0; i < workloop_port_count; i++) {
+        if (workloop_ports[i].port == port) {
+            wl_id = workloop_ports[i].workloop_id;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&workloop_port_lock);
+    return wl_id;
+}
 
 /*
  * Parked workqueue thread — waiting to be re-dispatched.
@@ -250,6 +299,28 @@ static parked_kevent_wq *parked_kevent_list = NULL;
 static pthread_mutex_t parked_kevent_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /*
+ * Parked workloop thread — called WQOPS_THREAD_WORKLOOP_RETURN and
+ * waiting for new workloop events from the monitor thread.
+ */
+typedef struct parked_workloop_wq {
+    CPUArchState *env;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    bool has_work;
+    abi_ulong self_addr;
+    abi_ulong stack_top;
+    abi_ulong stack_bottom;
+    abi_ulong tsd_base;
+    struct kevent_qos_s *delivered_events;
+    int delivered_nevents;
+    uint64_t workloop_id;
+    struct parked_workloop_wq *next;
+} parked_workloop_wq;
+
+static parked_workloop_wq *parked_workloop_list = NULL;
+static pthread_mutex_t parked_workloop_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/*
  * Workqueue kqueue monitor.
  *
  * When libdispatch registers EVFILT_MACHPORT events on the workqueue
@@ -280,6 +351,9 @@ static int create_guest_thread(CPUArchState *parent_env,
 
 static void deliver_kevents_to_thread(struct kevent_qos_s *events,
                                       int nevents);
+static void deliver_workloop_events_to_thread(uint64_t workloop_id,
+                                               struct kevent_qos_s *events,
+                                               int nevents);
 
 /*
  * Convert kevent_qos_s to kevent64_s for registration on regular kqueues.
@@ -339,23 +413,34 @@ static int workq_kqueue_register(const struct kevent_qos_s *changelist,
                                  int nchanges)
 {
     int kq = get_workq_kqueue();
-    struct kevent64_s changes64[16];
-    int batch;
+    int registered = 0;
 
-    for (int i = 0; i < nchanges; i += batch) {
-        batch = nchanges - i;
-        if (batch > 16) {
-            batch = 16;
-        }
-        for (int j = 0; j < batch; j++) {
-            kqos_to_k64(&changelist[i + j], &changes64[j]);
-        }
-        int rc = kevent64(kq, changes64, batch, NULL, 0, 0, NULL);
-        if (rc < 0) {
-            return -1;
+    for (int i = 0; i < nchanges; i++) {
+        if (changelist[i].filter == EVFILT_MACHPORT) {
+            struct kevent64_s k64;
+            kqos_to_k64(&changelist[i], &k64);
+            int rc = kevent64(kq, &k64, 1, NULL, 0, 0, NULL);
+            if (rc < 0) {
+                if (do_strace) {
+                    fprintf(stderr, "  workq_kqueue_register: "
+                            "MACHPORT ident=0x%llx failed errno=%d\n",
+                            (unsigned long long)changelist[i].ident,
+                            errno);
+                }
+            } else {
+                registered++;
+            }
+        } else {
+            /* Skip non-MACHPORT (e.g. WORKLOOP) — can't go on kqueue */
+            if (do_strace) {
+                fprintf(stderr, "  workq_kqueue_register: "
+                        "skip filter=%d ident=0x%llx\n",
+                        changelist[i].filter,
+                        (unsigned long long)changelist[i].ident);
+            }
         }
     }
-    return 0;
+    return registered > 0 ? 0 : (nchanges > 0 ? -1 : 0);
 }
 
 /*
@@ -580,7 +665,25 @@ static void *workq_kqueue_monitor_func(void *arg)
         }
 
         if (total_drained > 0) {
-            deliver_kevents_to_thread(drain_buf, total_drained);
+            /*
+             * Check if ANY of the fired ports belong to a workloop.
+             * If so, deliver as workloop events (WQ_FLAG_THREAD_WORKLOOP).
+             * Otherwise deliver as regular kevent events.
+             */
+            uint64_t wl_id = 0;
+            for (int i = 0; i < n; i++) {
+                if (events_qos[i].filter == EVFILT_MACHPORT) {
+                    wl_id = find_workloop_for_port(
+                        (mach_port_t)events_qos[i].ident);
+                    if (wl_id) break;
+                }
+            }
+            if (wl_id) {
+                deliver_workloop_events_to_thread(wl_id,
+                    drain_buf, total_drained);
+            } else {
+                deliver_kevents_to_thread(drain_buf, total_drained);
+            }
         }
     }
     return NULL;
@@ -678,6 +781,135 @@ static void deliver_kevents_to_thread(struct kevent_qos_s *events,
                 "nevents=%d flags=0x%x\n",
                 (unsigned long)self_addr, (unsigned long)sp,
                 (unsigned long)keventlist, nevents, flags);
+    }
+
+    create_guest_thread(
+        workq_monitor_parent_env,
+        saved_wqthread,
+        sp,
+        self_addr,       /* x0 = pthread_self */
+        0,               /* x1 = kport (set by worker) */
+        stack_bottom,    /* x2 = stacklowaddr */
+        keventlist,      /* x3 = keventlist */
+        flags,           /* x4 = flags */
+        nevents,         /* x5 = nkevents */
+        tsd_base,
+        workq_monitor_parent_ts,
+        true, self_addr, stack_top,
+        stack_bottom, tsd_base);
+}
+
+/*
+ * Create or wake a workloop thread to process events for a specific
+ * dispatch workloop.  Unlike kevent threads, workloop threads pass the
+ * workloop ID (kqueue_id_t) on the stack immediately before the
+ * keventlist so libpthread's wqthread_start can hand it to
+ * __libdispatch_workloopfunction.
+ */
+static void deliver_workloop_events_to_thread(uint64_t workloop_id,
+                                               struct kevent_qos_s *events,
+                                               int nevents)
+{
+    /* Try to wake a parked workloop thread first */
+    parked_workloop_wq *pw = NULL;
+    pthread_mutex_lock(&parked_workloop_lock);
+    if (parked_workloop_list) {
+        pw = parked_workloop_list;
+        parked_workloop_list = pw->next;
+        pw->next = NULL;
+    }
+    pthread_mutex_unlock(&parked_workloop_lock);
+
+    if (pw) {
+        pw->delivered_events = g_memdup2(events,
+            nevents * sizeof(struct kevent_qos_s));
+        pw->delivered_nevents = nevents;
+        pw->workloop_id = workloop_id;
+
+        if (do_strace) {
+            fprintf(stderr, "  workq_monitor: waking parked workloop "
+                    "thread self=0x%lx wl=0x%llx with %d events\n",
+                    (unsigned long)pw->self_addr,
+                    (unsigned long long)workloop_id, nevents);
+        }
+
+        pthread_mutex_lock(&pw->mutex);
+        pw->has_work = true;
+        pthread_cond_signal(&pw->cond);
+        pthread_mutex_unlock(&pw->mutex);
+        return;
+    }
+
+    /* No parked workloop thread — create a new one */
+    if (!saved_wqthread || !workq_monitor_parent_env) {
+        return;
+    }
+
+    size_t page_sz = qemu_real_host_page_size();
+    size_t guardsize = page_sz;
+    size_t pthsize = saved_pthsize ? saved_pthsize : 0x4000;
+    size_t total = guardsize + PTH_DEFAULT_STACKSZ
+                 + PTHREAD_T_OFFSET_ARM64 + pthsize;
+
+    mmap_lock();
+    abi_ulong stackaddr = target_mmap(0, total,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    mmap_unlock();
+
+    if (stackaddr == (abi_ulong)-1) {
+        return;
+    }
+
+    mmap_lock();
+    target_mprotect(stackaddr, guardsize, PROT_NONE);
+    mmap_unlock();
+
+    abi_ulong stack_bottom = stackaddr + guardsize;
+    abi_ulong self_addr = stackaddr + guardsize + PTH_DEFAULT_STACKSZ
+                        + PTHREAD_T_OFFSET_ARM64;
+    abi_ulong stack_top = self_addr & ~(abi_ulong)0xF;
+
+    abi_ulong tsd_base = self_addr;
+    if (saved_tsd_offset) {
+        tsd_base = self_addr + saved_tsd_offset;
+    }
+
+    /*
+     * Stack layout for workloop threads (from libpthread source):
+     *   [kqueue_id_t]   <- kqidptr = keventlist - 8
+     *   [kevent_qos_s]  <- keventlist (x3 points here)
+     *   [kevent_qos_s]
+     *   ...
+     */
+    size_t events_sz = nevents * sizeof(struct kevent_qos_s);
+    abi_ulong sp = stack_top;
+    /* Reserve space for kqueue_id_t + events */
+    sp -= sizeof(uint64_t) + events_sz;
+    sp &= ~(abi_ulong)0xF;
+
+    /* Write kqueue_id_t first, then events */
+    abi_ulong kqid_addr = sp;
+    abi_ulong keventlist = sp + sizeof(uint64_t);
+    *(uint64_t *)g2h_untagged(kqid_addr) = workloop_id;
+    memcpy(g2h_untagged(keventlist), events, events_sz);
+
+    sp -= 256;  /* headroom */
+    sp &= ~(abi_ulong)0xF;
+
+    uint32_t flags = WQ_FLAG_THREAD_NEWSPI
+                   | WQ_FLAG_THREAD_TSD_BASE_SET
+                   | WQ_FLAG_THREAD_PRIO_QOS
+                   | WQ_FLAG_THREAD_WORKLOOP
+                   | 4;  /* QoS default */
+
+    if (do_strace) {
+        fprintf(stderr, "  workq_monitor: creating workloop thread "
+                "self=0x%lx sp=0x%lx keventlist=0x%lx "
+                "wl=0x%llx nevents=%d flags=0x%x\n",
+                (unsigned long)self_addr, (unsigned long)sp,
+                (unsigned long)keventlist,
+                (unsigned long long)workloop_id, nevents, flags);
     }
 
     create_guest_thread(
@@ -2069,6 +2301,29 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
         ret = do_sigreturn(cpu_env, arg1);
         break;
 
+    case TARGET_MACOS_NR_setitimer:
+    case TARGET_MACOS_NR_getitimer:
+    {
+        /*
+         * setitimer(int which, const struct itimerval *value,
+         *           struct itimerval *ovalue)
+         * getitimer(int which, struct itimerval *value)
+         *
+         * Forward to host.  struct itimerval is the same layout on
+         * arm64 guest and host (two struct timeval = 2×16 bytes).
+         */
+        struct itimerval *v = arg2 ? (struct itimerval *)g2h_untagged(arg2)
+                                   : NULL;
+        struct itimerval *ov = arg3 ? (struct itimerval *)g2h_untagged(arg3)
+                                    : NULL;
+        if (num == TARGET_MACOS_NR_setitimer) {
+            ret = get_errno(setitimer((int)arg1, v, ov));
+        } else {
+            ret = get_errno(getitimer((int)arg1, v));
+        }
+        break;
+    }
+
     case TARGET_MACOS_NR_kill:
         /* kill(pid_t pid, int sig) */
         if ((pid_t)arg1 == getpid() && arg2 != 0) {
@@ -2577,7 +2832,6 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
             }
 
             case WQOPS_THREAD_RETURN:
-            case WQOPS_THREAD_WORKLOOP_RETURN:
             {
                 /*
                  * Thread is done with work.  The real kernel parks the
@@ -2630,6 +2884,99 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                 env->xregs[29] = 0; /* FP */
                 env->xregs[30] = 0; /* LR */
 
+                pthread_mutex_destroy(&pw.mutex);
+                pthread_cond_destroy(&pw.cond);
+
+                ret = -TARGET_EJUSTRETURN;
+                break;
+            }
+
+            case WQOPS_THREAD_WORKLOOP_RETURN:
+            {
+                /*
+                 * Workloop thread is done.  Forward any changelist to
+                 * our workq kqueue, then park in the workloop-parked
+                 * list.  The monitor thread will wake it when new
+                 * workloop events arrive for any workloop.
+                 */
+                struct kevent_qos_s *cl = arg2
+                    ? (struct kevent_qos_s *)g2h_untagged(arg2) : NULL;
+                int nchanges = (int)arg3;
+
+                if (do_strace) {
+                    fprintf(stderr, "  WQOPS_THREAD_WORKLOOP_RETURN: "
+                            "nchanges=%d\n", nchanges);
+                }
+
+                if (cl && nchanges > 0) {
+                    int rc = workq_kqueue_register(cl, nchanges);
+                    if (do_strace) {
+                        fprintf(stderr,
+                            "  WQOPS_THREAD_WORKLOOP_RETURN: "
+                            "registered %d events -> %d\n",
+                            nchanges, rc);
+                    }
+                }
+
+                parked_workloop_wq pw;
+                memset(&pw, 0, sizeof(pw));
+                pthread_mutex_init(&pw.mutex, NULL);
+                pthread_cond_init(&pw.cond, NULL);
+                pw.env = (CPUArchState *)cpu_env;
+                pw.has_work = false;
+
+                TaskState *ts = get_task_state(
+                    env_cpu((CPUArchState *)cpu_env));
+                pw.self_addr = ts->wq_self_addr;
+                pw.stack_top = ts->wq_stack_top;
+                pw.stack_bottom = ts->wq_stack_bottom;
+                pw.tsd_base = ts->wq_tsd_base;
+
+                pthread_mutex_lock(&parked_workloop_lock);
+                pw.next = parked_workloop_list;
+                parked_workloop_list = &pw;
+                pthread_mutex_unlock(&parked_workloop_lock);
+
+                /* Wait for events from monitor thread */
+                pthread_mutex_lock(&pw.mutex);
+                while (!pw.has_work) {
+                    pthread_cond_wait(&pw.cond, &pw.mutex);
+                }
+                pthread_mutex_unlock(&pw.mutex);
+
+                /* Copy delivered events to guest stack with wl ID */
+                CPUArchState *env = (CPUArchState *)cpu_env;
+                size_t ev_sz = pw.delivered_nevents
+                             * sizeof(struct kevent_qos_s);
+                abi_ulong sp = pw.stack_top;
+                sp -= sizeof(uint64_t) + ev_sz;
+                sp &= ~(abi_ulong)0xF;
+
+                abi_ulong kqid_addr = sp;
+                abi_ulong keventlist = sp + sizeof(uint64_t);
+                *(uint64_t *)g2h_untagged(kqid_addr) = pw.workloop_id;
+                memcpy(g2h_untagged(keventlist),
+                       pw.delivered_events, ev_sz);
+                sp -= 256;
+                sp &= ~(abi_ulong)0xF;
+
+                uint32_t reuse_flags = WQ_FLAG_THREAD_WORKLOOP
+                    | WQ_FLAG_THREAD_REUSE
+                    | WQ_FLAG_THREAD_NEWSPI
+                    | WQ_FLAG_THREAD_PRIO_QOS | 4;
+
+                env->pc = saved_wqthread;
+                env->xregs[31] = sp;
+                env->xregs[0] = pw.self_addr;
+                env->xregs[1] = (abi_ulong)mach_thread_self();
+                env->xregs[2] = pw.stack_bottom;
+                env->xregs[3] = keventlist;
+                env->xregs[4] = reuse_flags;
+                env->xregs[5] = pw.delivered_nevents;
+                env->xregs[29] = 0;
+                env->xregs[30] = 0;
+
+                g_free(pw.delivered_events);
                 pthread_mutex_destroy(&pw.mutex);
                 pthread_cond_destroy(&pw.cond);
 
@@ -2822,11 +3169,11 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
 
         if (kq == -1 && (flags & KEVENT_FLAG_WORKQ)) {
             /*
-             * Workqueue kqueue: libdispatch registers events and parks
-             * threads here.  We return success without registering
-             * anything — ports remain in CFRunLoop's port sets for
-             * mach_msg delivery.  Events will be handled when dispatch
-             * channels become active on workqueue threads.
+             * Workqueue kqueue: libdispatch registers events here.
+             * Return success without registering on kqueue.
+             * MACHPORT events from kevent_id are handled separately;
+             * kevent_qos WORKQ ports may overlap with MIG reply ports
+             * and must NOT be put on our kqueue.
              */
             struct kevent_qos_s *cl = arg2
                 ? (struct kevent_qos_s *)g2h_untagged(arg2) : NULL;
@@ -2923,13 +3270,65 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
             }
         }
 
-        /* kevent_id: no-ops for all registrations */
-        if (do_strace && cl) {
+        /*
+         * kevent_id: register MACHPORT events on our workq kqueue so
+         * the monitor thread can detect incoming messages and create
+         * guest workqueue threads.  These ports are dispatch-internal
+         * (not in CFRunLoop port sets), so kqueue monitoring is safe.
+         *
+         * WORKLOOP (EVFILT_WORKLOOP) events remain no-ops — we handle
+         * thread creation ourselves when MACHPORT events fire.
+         */
+        if (cl && nchanges > 0) {
+            bool have_machport = false;
             for (int i = 0; i < nchanges; i++) {
-                fprintf(stderr, "    %s ident=0x%llx -> no-op\n",
-                        cl[i].filter == EVFILT_MACHPORT ? "MACHPORT" :
-                        "WORKLOOP",
-                        (unsigned long long)cl[i].ident);
+                if (cl[i].filter == EVFILT_MACHPORT) {
+                    have_machport = true;
+                    break;
+                }
+            }
+            if (have_machport) {
+                /* Ensure monitor thread is running */
+                TaskState *ts = get_task_state(
+                    env_cpu((CPUArchState *)cpu_env));
+                ensure_workq_monitor((CPUArchState *)cpu_env, ts);
+                /*
+                 * Register MACHPORT events on our workq kqueue.
+                 * Use kevent64 since kevent_qos doesn't work on
+                 * regular kqueues.
+                 */
+                int kq = get_workq_kqueue();
+                for (int i = 0; i < nchanges; i++) {
+                    if (cl[i].filter == EVFILT_MACHPORT) {
+                        struct kevent64_s k64;
+                        kqos_to_k64(&cl[i], &k64);
+                        int rc = kevent64(kq, &k64, 1, NULL, 0, 0, NULL);
+                        /* Track workloop→port mapping (arg1 is wl ID) */
+                        add_workloop_port(arg1,
+                            (mach_port_t)cl[i].ident);
+                        if (do_strace) {
+                            fprintf(stderr, "    MACHPORT ident=0x%llx"
+                                    " -> kqueue reg rc=%d wl=0x%llx%s\n",
+                                    (unsigned long long)cl[i].ident,
+                                    rc, (unsigned long long)arg1,
+                                    rc < 0 ? " (FAILED)" : "");
+                        }
+                    } else {
+                        if (do_strace) {
+                            fprintf(stderr,
+                                    "    WORKLOOP ident=0x%llx -> no-op\n",
+                                    (unsigned long long)cl[i].ident);
+                        }
+                    }
+                }
+            } else {
+                if (do_strace) {
+                    for (int i = 0; i < nchanges; i++) {
+                        fprintf(stderr, "    WORKLOOP ident=0x%llx"
+                                " -> no-op\n",
+                                (unsigned long long)cl[i].ident);
+                    }
+                }
             }
         }
 
