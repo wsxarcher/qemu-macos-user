@@ -1431,6 +1431,48 @@ int main(void) {
                 n = int(line.split(b"=")[1])
                 self.assertGreater(n, 5, "expected many nonzero bytes")
 
+    # -- CFPreferences: XPC timeout handling --------------------------------
+    _CF_PREFERENCES_SRC = r'''
+#include <CoreFoundation/CoreFoundation.h>
+#include <signal.h>
+#include <stdio.h>
+#include <unistd.h>
+
+static void bail(int sig) { _exit(99); }
+
+int main(void) {
+    signal(SIGALRM, bail);
+    alarm(25);
+
+    /* CFPreferencesCopyValue contacts cfprefsd via XPC.  Under emulation
+       the daemon may not reply, so the XPC receive timeout must kick in
+       and return NULL instead of hanging forever. */
+    CFStringRef val = CFPreferencesCopyValue(
+        CFSTR("AppleLanguages"),
+        kCFPreferencesAnyApplication,
+        kCFPreferencesCurrentUser,
+        kCFPreferencesAnyHost);
+    if (val) {
+        printf("cfprefs=found\n");
+        CFRelease(val);
+    } else {
+        printf("cfprefs=null\n");
+    }
+    printf("cfprefs_done\n");
+    return 0;
+}
+'''
+
+    def test_cfpreferences_no_hang(self):
+        """CFPreferencesCopyValue returns without hanging."""
+        exe = _compile_framework_test("cfprefs", self._CF_PREFERENCES_SRC,
+                                      ["CoreFoundation"], language="c")
+        rc, out, _ = _run_emulated(exe, timeout=30)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"cfprefs_done", out)
+        # Value may be NULL (daemon unreachable) or found — either is fine
+        self.assertTrue(b"cfprefs=null" in out or b"cfprefs=found" in out)
+
 
 # ---------------------------------------------------------------------------
 # Helper: compile Objective-C / C test programs from source strings
