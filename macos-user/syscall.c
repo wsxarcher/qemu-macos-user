@@ -182,6 +182,7 @@ static abi_ulong saved_threadstart;  /* from bsdthread_register arg1 */
 static abi_ulong saved_wqthread;     /* from bsdthread_register arg2 */
 static abi_ulong saved_pthsize;      /* from bsdthread_register arg3 */
 static uint32_t saved_tsd_offset;    /* from registration data +24 */
+static uint32_t saved_mach_thread_self_offset; /* registration data +32 */
 static pthread_mutex_t workq_lock = PTHREAD_MUTEX_INITIALIZER;
 
 #define WQ_STACK_SIZE    (512 * 1024)  /* 512 KB per workqueue thread */
@@ -259,6 +260,7 @@ typedef struct {
     mach_port_t port;
     struct kevent_qos_s template_kev;
     bool has_template;
+    bool synthetic;
 } workq_machport_entry;
 
 #define MAX_WORKQ_MACHPORTS 64
@@ -338,6 +340,7 @@ static void deliver_workloop_events_to_thread(uint64_t workloop_id,
 static bool has_parked_workloop_thread(uint64_t workloop_id);
 static bool is_workq_notification_port(mach_port_t port);
 static void register_workq_notification_template(mach_port_t port);
+static void service_workq_notification_events_filtered(bool synthetic_only);
 static int prereceive_machport_drain(struct kevent_qos_s *template_kev,
                                      struct kevent_qos_s *out_events,
                                      int max_events);
@@ -534,18 +537,51 @@ static void release_prereceived_workloop_event(struct kevent_qos_s *event)
     }
 }
 
+static bool is_mach_notification_msg(const mach_msg_header_t *hdr)
+{
+    return hdr->msgh_id >= MACH_NOTIFY_FIRST &&
+        hdr->msgh_id <= MACH_NOTIFY_LAST;
+}
+
+static bool workloop_event_is_mach_notification(
+    const struct kevent_qos_s *event)
+{
+    mach_msg_header_t *gh;
+
+    if (event->filter != EVFILT_MACHPORT ||
+        event->fflags != 0 ||
+        !event->ext[0]) {
+        return false;
+    }
+
+    gh = (mach_msg_header_t *)g2h_untagged((abi_ulong)event->ext[0]);
+    return is_mach_notification_msg(gh);
+}
+
 static int filter_workloop_notification_events(struct kevent_qos_s *events,
                                                int nevents)
 {
-    /*
-     * Mach notifications (PORT_DESTROYED id=69, DEAD_NAME id=72, etc.)
-     * must be delivered to the guest so dispatch/XPC can tear down dead
-     * connections.  Previously this function dropped all such messages,
-     * which prevented dispatch from learning that a channel was dead
-     * and caused workloop threads to spin forever: the THREAD_REQ kept
-     * being re-delivered but the receive always failed on the dead port.
-     */
-    return nevents;
+    int out = 0;
+
+    for (int i = 0; i < nevents; i++) {
+        if (workloop_event_is_mach_notification(&events[i])) {
+            if (do_strace) {
+                mach_msg_header_t *gh =
+                    (mach_msg_header_t *)g2h_untagged((abi_ulong)events[i].ext[0]);
+                fprintf(stderr, "  workloop wl MACHPORT 0x%llx: dropping Mach "
+                        "notification id=%u\n",
+                        (unsigned long long)events[i].ident, gh->msgh_id);
+            }
+            release_prereceived_workloop_event(&events[i]);
+            continue;
+        }
+        if (out != i) {
+            events[out] = events[i];
+        }
+        out++;
+    }
+
+    return out;
 }
 
 static void store_pending_workloop_req(uint64_t wl_id,
@@ -685,6 +721,7 @@ static void add_workloop_port(uint64_t wl_id,
                               const struct kevent_qos_s *kev)
 {
     mach_port_t port = (mach_port_t)kev->ident;
+    bool drop_synthetic = false;
 
     pthread_mutex_lock(&workloop_port_lock);
     /* Update existing entry for this port */
@@ -694,7 +731,8 @@ static void add_workloop_port(uint64_t wl_id,
             workloop_ports[i].template_kev = *kev;
             workloop_ports[i].has_template = true;
             pthread_mutex_unlock(&workloop_port_lock);
-            return;
+            drop_synthetic = true;
+            goto done;
         }
     }
     if (workloop_port_count < MAX_WORKLOOP_PORTS) {
@@ -703,8 +741,24 @@ static void add_workloop_port(uint64_t wl_id,
         workloop_ports[workloop_port_count].template_kev = *kev;
         workloop_ports[workloop_port_count].has_template = true;
         workloop_port_count++;
+        drop_synthetic = true;
     }
     pthread_mutex_unlock(&workloop_port_lock);
+
+done:
+    if (!drop_synthetic) {
+        return;
+    }
+
+    pthread_mutex_lock(&workq_machport_lock);
+    for (int i = 0; i < workq_machport_count; i++) {
+        if (workq_machports[i].port == port &&
+            workq_machports[i].synthetic) {
+            workq_machports[i] = workq_machports[--workq_machport_count];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&workq_machport_lock);
 }
 
 static int stash_workloop_port_events(mach_port_t port,
@@ -826,6 +880,10 @@ static int prepare_workloop_events(uint64_t wl_id,
     }
 
     if (find_workloop_machport_template(wl_id, &machport_kev)) {
+        bool notification_port =
+            is_workq_notification_port((mach_port_t)machport_kev.ident);
+        bool wants_msg = template_needs_prereceived_msg(&machport_kev);
+
         if (is_port_active_rcv((mach_port_t)machport_kev.ident)) {
             /* Another thread is doing mach_msg2 receive on this port;
              * prereceiving here would steal its reply message. */
@@ -833,7 +891,7 @@ static int prepare_workloop_events(uint64_t wl_id,
         }
         got = prereceive_machport_drain(&machport_kev, out_events,
                                         max_events);
-        if (got > 0) {
+        if (got > 0 && !(notification_port && wants_msg)) {
             got = filter_workloop_notification_events(out_events, got);
         }
         if (got > 0 && prepend_thread_req) {
@@ -859,6 +917,75 @@ fallback:
     return 1;
 }
 
+static bool workq_notification_port_has_real_template(mach_port_t port)
+{
+    bool found = false;
+
+    pthread_mutex_lock(&workq_machport_lock);
+    for (int i = 0; i < workq_machport_count; i++) {
+        if (workq_machports[i].port == port &&
+            workq_machports[i].has_template &&
+            !workq_machports[i].synthetic) {
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&workq_machport_lock);
+
+    if (found) {
+        return true;
+    }
+
+    pthread_mutex_lock(&workloop_port_lock);
+    for (int i = 0; i < workloop_port_count; i++) {
+        if (workloop_ports[i].port == port &&
+            workloop_ports[i].has_template) {
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&workloop_port_lock);
+
+    return found;
+}
+
+static void synthesize_workq_notification_template(mach_port_t port)
+{
+    pthread_mutex_lock(&workq_machport_lock);
+    for (int i = 0; i < workq_machport_count; i++) {
+        if (workq_machports[i].port == port) {
+            if (!workq_machports[i].has_template) {
+                memset(&workq_machports[i].template_kev, 0,
+                       sizeof(workq_machports[i].template_kev));
+                workq_machports[i].template_kev.ident = port;
+                workq_machports[i].template_kev.filter = EVFILT_MACHPORT;
+                workq_machports[i].template_kev.flags = EV_ADD | EV_ENABLE |
+                    EV_DISPATCH | EV_UDATA_SPECIFIC | EV_VANISHED;
+                workq_machports[i].has_template = true;
+                workq_machports[i].synthetic = true;
+            }
+            pthread_mutex_unlock(&workq_machport_lock);
+            return;
+        }
+    }
+
+    if (workq_machport_count < MAX_WORKQ_MACHPORTS) {
+        workq_machports[workq_machport_count].port = port;
+        memset(&workq_machports[workq_machport_count].template_kev, 0,
+               sizeof(workq_machports[workq_machport_count].template_kev));
+        workq_machports[workq_machport_count].template_kev.ident = port;
+        workq_machports[workq_machport_count].template_kev.filter =
+            EVFILT_MACHPORT;
+        workq_machports[workq_machport_count].template_kev.flags =
+            EV_ADD | EV_ENABLE | EV_DISPATCH |
+            EV_UDATA_SPECIFIC | EV_VANISHED;
+        workq_machports[workq_machport_count].has_template = true;
+        workq_machports[workq_machport_count].synthetic = true;
+        workq_machport_count++;
+    }
+    pthread_mutex_unlock(&workq_machport_lock);
+}
+
 void record_workq_notification_port(mach_port_t port)
 {
     if (port == MACH_PORT_NULL) {
@@ -881,7 +1008,17 @@ void record_workq_notification_port(mach_port_t port)
                 "  record_workq_notification_port: port=0x%x (manual poll)\n",
                 port);
     }
-    register_workq_notification_template(port);
+
+    if (workq_notification_port_has_real_template(port)) {
+        register_workq_notification_template(port);
+        return;
+    }
+
+    synthesize_workq_notification_template(port);
+    if (do_strace) {
+        fprintf(stderr, "  synthesized notify MACHPORT template ident=0x%x "
+                "for manual polling\n", (unsigned)port);
+    }
 }
 
 static bool is_workq_notification_port(mach_port_t port)
@@ -910,6 +1047,7 @@ static void save_workq_machport_template(const struct kevent_qos_s *kev)
         if (workq_machports[i].port == port) {
             workq_machports[i].template_kev = *kev;
             workq_machports[i].has_template = true;
+            workq_machports[i].synthetic = false;
             pthread_mutex_unlock(&workq_machport_lock);
             return;
         }
@@ -918,6 +1056,7 @@ static void save_workq_machport_template(const struct kevent_qos_s *kev)
         workq_machports[workq_machport_count].port = port;
         workq_machports[workq_machport_count].template_kev = *kev;
         workq_machports[workq_machport_count].has_template = true;
+        workq_machports[workq_machport_count].synthetic = false;
         workq_machport_count++;
     }
     pthread_mutex_unlock(&workq_machport_lock);
@@ -1004,6 +1143,18 @@ void service_workloop_machport_events(void)
         if (notification_port && !parked) {
             bool wants_msg =
                 template_needs_prereceived_msg(&snapshot[i].template_kev);
+
+            if (wants_msg) {
+                if (do_strace) {
+                    fprintf(stderr, "  workloop wl=0x%llx: deferring message "
+                            "notification port 0x%x until a parked thread is "
+                            "available\n",
+                            (unsigned long long)snapshot[i].workloop_id,
+                            (unsigned)snapshot[i].port);
+                }
+                continue;
+            }
+
             got = prereceive_machport_drain_timeout(&snapshot[i].template_kev,
                                                     drained,
                                                     ARRAY_SIZE(drained), 0);
@@ -1041,7 +1192,9 @@ void service_workloop_machport_events(void)
 
         got = prereceive_machport_drain_timeout(
             &snapshot[i].template_kev, drained, ARRAY_SIZE(drained), 0);
-        if (got > 0) {
+        if (got > 0 &&
+            !(notification_port &&
+              template_needs_prereceived_msg(&snapshot[i].template_kev))) {
             got = filter_workloop_notification_events(drained, got);
         }
         if (got > 0) {
@@ -1062,7 +1215,7 @@ void service_workloop_machport_events(void)
     }
 }
 
-void service_workq_notification_events(void)
+static void service_workq_notification_events_filtered(bool synthetic_only)
 {
     workq_machport_entry snapshot[MAX_WORKQ_MACHPORTS];
     int snapshot_count = 0;
@@ -1070,6 +1223,7 @@ void service_workq_notification_events(void)
     pthread_mutex_lock(&workq_machport_lock);
     for (int i = 0; i < workq_machport_count; i++) {
         if (!workq_machports[i].has_template ||
+            (synthetic_only && !workq_machports[i].synthetic) ||
             !is_workq_notification_port(workq_machports[i].port)) {
             continue;
         }
@@ -1107,6 +1261,11 @@ void service_workq_notification_events(void)
             deliver_kevents_to_thread(drained, got);
         }
     }
+}
+
+void service_workq_notification_events(void)
+{
+    service_workq_notification_events_filtered(false);
 }
 
 /*
@@ -1608,6 +1767,8 @@ static void *workq_kqueue_monitor_func(void *arg)
              * queue and processes timers.
              */
             static int idle_ticks;
+
+            service_workq_notification_events_filtered(true);
             idle_ticks++;
             if (idle_ticks >= 2 && saved_wqthread
                 && workq_monitor_parent_env) {
@@ -1670,6 +1831,19 @@ static void *workq_kqueue_monitor_func(void *arg)
 
                 if (notification_port && !parked) {
                     bool wants_msg = template_needs_prereceived_msg(&events_qos[i]);
+
+                    if (wants_msg) {
+                        if (do_strace) {
+                            fprintf(stderr,
+                                    "  workq_monitor: deferring message "
+                                    "notification port 0x%x for wl=0x%llx until "
+                                    "the thread parks\n",
+                                    (unsigned)events_qos[i].ident,
+                                    (unsigned long long)wl_id);
+                        }
+                        goto rearm_machport_event;
+                    }
+
                     int got = prereceive_machport_drain(&events_qos[i],
                                                         drained,
                                                         ARRAY_SIZE(drained));
@@ -1721,7 +1895,11 @@ static void *workq_kqueue_monitor_func(void *arg)
                     drained[0] = events_qos[i];
                     got = 1;
                 } else if (wl_id) {
-                    got = filter_workloop_notification_events(drained, got);
+                    if (!(is_workq_notification_port(
+                              (mach_port_t)events_qos[i].ident) &&
+                          template_needs_prereceived_msg(&events_qos[i]))) {
+                        got = filter_workloop_notification_events(drained, got);
+                    }
                     if (got > 0 && !parked) {
                         got = prepend_workloop_req_event(
                             wl_id, drained, got, ARRAY_SIZE(drained));
@@ -2172,6 +2350,66 @@ static abi_ulong alloc_thread_stack(size_t size)
     return addr + size;
 }
 
+static void strace_dump_guest_backtrace(CPUArchState *env, const char *tag)
+{
+    uint64_t fp = env->xregs[29];
+    uint64_t mach_self_slot = 0;
+
+    if (saved_mach_thread_self_offset &&
+        guest_range_valid_untagged(env->cp15.tpidrro_el[0] +
+                                   saved_mach_thread_self_offset,
+                                   sizeof(uint64_t))) {
+        mach_self_slot =
+            *(uint64_t *)g2h_untagged(env->cp15.tpidrro_el[0] +
+                                      saved_mach_thread_self_offset);
+    }
+
+    fprintf(stderr,
+            "  %s pc=0x%lx lr=0x%lx tpidr=0x%lx tpidrro=0x%lx mach_self=0x%lx\n",
+            tag,
+            (unsigned long)env->pc,
+            (unsigned long)env->xregs[30],
+            (unsigned long)env->cp15.tpidr_el[0],
+            (unsigned long)env->cp15.tpidrro_el[0],
+            (unsigned long)mach_self_slot);
+    for (int i = 0; i < 16 && fp != 0; i++) {
+        uint64_t *frame;
+        uint64_t saved_fp;
+        uint64_t saved_lr;
+
+        if (!guest_range_valid_untagged(fp, 2 * sizeof(uint64_t))) {
+            fprintf(stderr, "    bt[%d] invalid fp=0x%lx\n", i,
+                    (unsigned long)fp);
+            break;
+        }
+        frame = g2h_untagged(fp);
+        saved_fp = frame[0];
+        saved_lr = frame[1];
+        fprintf(stderr, "    bt[%d]=0x%lx\n", i, (unsigned long)saved_lr);
+        if (saved_fp <= fp) {
+            break;
+        }
+        fp = saved_fp;
+    }
+}
+
+static void write_workqueue_mach_thread_self(abi_ulong tsd_base,
+                                             mach_port_t self_port)
+{
+    abi_ulong slot_addr;
+
+    if (!tsd_base || !saved_mach_thread_self_offset) {
+        return;
+    }
+
+    slot_addr = tsd_base + saved_mach_thread_self_offset;
+    if (!guest_range_valid_untagged(slot_addr, sizeof(uint64_t))) {
+        return;
+    }
+
+    *(uint64_t *)g2h_untagged(slot_addr) = (uint64_t)self_port;
+}
+
 /*
  * Host thread function for new guest threads.
  * Clones CPU state and enters cpu_loop.
@@ -2182,6 +2420,7 @@ static void *guest_thread_func(void *arg)
     CPUArchState *env;
     CPUState *cpu;
     TaskState *ts;
+    mach_port_t self_port;
 
     rcu_register_thread();
     tcg_register_thread();
@@ -2213,7 +2452,11 @@ static void *guest_thread_func(void *arg)
      * rather than from the parent, otherwise os_unfair_lock sees the
      * main thread's port and falsely detects recursion.
      */
-    env->xregs[1] = (abi_ulong)mach_thread_self();
+    self_port = mach_thread_self();
+    env->xregs[1] = (abi_ulong)self_port;
+    if (info->is_workqueue) {
+        write_workqueue_mach_thread_self(info->wq_tsd_base, self_port);
+    }
 
     /* Signal parent that we're ready */
     pthread_mutex_lock(&info->mutex);
@@ -2290,6 +2533,7 @@ static int create_guest_thread(CPUArchState *parent_env,
      * For workqueue threads, tsd_base = self + tsd_offset.
      * The kernel sets this via thread_set_tsd_base().
      */
+    new_env->cp15.tpidr_el[0] = is_workqueue ? wq_self : 0;
     new_env->cp15.tpidrro_el[0] = tsd_base;
 
     /* Prepare thread info for synchronization */
@@ -3815,6 +4059,14 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                                 "tsd_offset=%u\n", saved_tsd_offset);
                     }
                 }
+                if (datasz >= 36) {
+                    memcpy(&saved_mach_thread_self_offset, data + 32, 4);
+                    if (do_strace) {
+                        fprintf(stderr, "  bsdthread_register: "
+                                "mach_thread_self_offset=%u\n",
+                                saved_mach_thread_self_offset);
+                    }
+                }
 
                 /* main_qos = 0 (THREAD_QOS_UNSPECIFIED) */
                 if (datasz >= 24) {
@@ -4049,6 +4301,10 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                  * guest thread causes libdispatch to spin in THREAD_RETURN
                  * while other threads are blocked waiting for replies.
                  */
+                if (do_strace) {
+                    strace_dump_guest_backtrace((CPUArchState *)cpu_env,
+                                                "WQOPS_THREAD_RETURN");
+                }
                 pthread_exit(NULL);
             }
 
@@ -4158,16 +4414,20 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                     | WQ_FLAG_THREAD_NEWSPI
                     | WQ_FLAG_THREAD_PRIO_QOS | 4;
 
+                mach_port_t self_port = mach_thread_self();
+
                 env->pc = saved_wqthread;
                 env->xregs[31] = sp;
                 env->xregs[0] = pw.self_addr;
-                env->xregs[1] = (abi_ulong)mach_thread_self();
+                env->xregs[1] = (abi_ulong)self_port;
                 env->xregs[2] = pw.stack_bottom;
                 env->xregs[3] = keventlist;
                 env->xregs[4] = reuse_flags;
                 env->xregs[5] = pw.delivered_nevents;
                 env->xregs[29] = 0;
                 env->xregs[30] = 0;
+                env->cp15.tpidr_el[0] = pw.self_addr;
+                write_workqueue_mach_thread_self(pw.tsd_base, self_port);
 
                 g_free(pw.delivered_events);
                 pthread_mutex_destroy(&pw.mutex);
@@ -4272,16 +4532,20 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                 }
 #undef _PTHREAD_PRIORITY_EVENT_MANAGER_FLAG
 
+                mach_port_t self_port = mach_thread_self();
+
                 env->pc = saved_wqthread;
                 env->xregs[31] = sp;
                 env->xregs[0] = pk.self_addr;
-                env->xregs[1] = (abi_ulong)mach_thread_self();
+                env->xregs[1] = (abi_ulong)self_port;
                 env->xregs[2] = pk.stack_bottom;
                 env->xregs[3] = keventlist;
                 env->xregs[4] = reuse_flags;
                 env->xregs[5] = pk.delivered_nevents;
                 env->xregs[29] = 0;
                 env->xregs[30] = 0;
+                env->cp15.tpidr_el[0] = pk.self_addr;
+                write_workqueue_mach_thread_self(pk.tsd_base, self_port);
 
                 g_free(pk.delivered_events);
                 pthread_mutex_destroy(&pk.mutex);
@@ -4432,13 +4696,16 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
             }
 
             /*
-             * Forward EVFILT_USER and EVFILT_TIMER to our kqueue.
+             * Forward EVFILT_USER, EVFILT_TIMER, and EVFILT_MACHPORT
+             * to our workqueue kqueue so the monitor thread can
+             * dispatch them to workqueue threads.
              *
-             * MACHPORT events from kevent_qos WORKQ overlap with
-             * reply/event ports that the guest is waiting on directly.
-             * If our monitor thread registers and prereceives them, it
-             * steals messages that the main thread needs (for example
-             * during AppKit/WindowServer setup).
+             * MACHPORT events must go through the kqueue for
+             * dispatch_mach channels (e.g. XPC connections) that
+             * rely exclusively on workqueue delivery.  The
+             * active-receive-port guard (is_port_active_rcv)
+             * prevents the monitor from stealing messages when
+             * the guest has a direct mach_msg receive in flight.
              */
 #define EVFILT_USER_PRIVATE (-10)
 #define EVFILT_TIMER_PRIVATE (-7)
@@ -4484,10 +4751,20 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                                         "ident=0x%llx for manual polling\n",
                                         (unsigned long long)cl[i].ident);
                             }
-                        } else if (do_strace) {
-                            fprintf(stderr, "    skip MACHPORT ident=0x%llx"
-                                    " from WORKQ\n",
-                                    (unsigned long long)cl[i].ident);
+                        } else {
+                            struct kevent64_s k64;
+                            kqos_to_k64(&cl[i], &k64);
+                            int rc = kevent64(wkq, &k64, 1, NULL, 0, 0,
+                                              NULL);
+                            if (do_strace) {
+                                fprintf(stderr,
+                                        "    registered MACHPORT"
+                                        " ident=0x%llx on workq kqueue"
+                                        " rc=%d%s\n",
+                                        (unsigned long long)cl[i].ident,
+                                        rc,
+                                        rc < 0 ? " (FAILED)" : "");
+                            }
                         }
                     }
                 }
