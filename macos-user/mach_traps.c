@@ -275,6 +275,17 @@ static void record_dead_dispatch_port_from_msg(void *msg_buf, bool strace)
     record_dead_dispatch_port(hdr->msgh_remote_port, strace);
 }
 
+static void clear_dead_dispatch_port_from_msg(void *msg_buf)
+{
+    mach_msg_header_t *hdr = (mach_msg_header_t *)msg_buf;
+
+    if (!msg_buf) {
+        return;
+    }
+
+    clear_dead_dispatch_port(hdr->msgh_remote_port);
+}
+
 static bool receive_port_has_zero_qlimit(mach_port_name_t port)
 {
     mach_port_status_t status = {0};
@@ -2134,7 +2145,8 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                     (mach_msg_type_name_t)arg6,
                     &previous);
                 if (ret == KERN_SUCCESS) {
-                    record_workq_notification_port((mach_port_t)arg5);
+                    record_workq_notification_port((mach_port_t)arg5,
+                                                   (mach_port_t)arg2);
                 }
                 if (do_strace) {
                     fprintf(stderr, "  port_request_notification: "
@@ -2719,6 +2731,9 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                         }
                     }
 
+                    if (ret == KERN_SUCCESS && msg_buf && (options & 0x1)) {
+                        clear_dead_dispatch_port_from_msg(msg_buf);
+                    }
                     if (do_strace && ret != KERN_SUCCESS) {
                         mach_msg_header_t *shdr =
                             (mach_msg_header_t *)msg_buf;
@@ -3021,6 +3036,9 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                         }
                     }
 
+                    if (ret == KERN_SUCCESS && host_data && (options & 0x1)) {
+                        clear_dead_dispatch_port_from_msg(host_data);
+                    }
                     if (do_strace && ret == KERN_SUCCESS &&
                         (options & 0x2) && host_data) {
                         mach_msg_header_t *rhdr =
