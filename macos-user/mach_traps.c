@@ -53,8 +53,183 @@ extern mach_port_t thread_get_special_reply_port(void);
 #define WORKLOOP_POLL_SLICE_MS 100
 #define DISPATCH_MACH_CHECKIN_MSGID 0x77303074U
 
-static mach_port_name_t ipc_timeout_port;
-static int ipc_timeout_count;
+/*
+ * Timeout escalation is per waiting thread: AppKit/libdispatch may have
+ * multiple concurrent reply waits on different ports, and a single global
+ * counter lets one thread reset another thread's retry budget.
+ */
+static __thread mach_port_name_t ipc_timeout_port;
+static __thread int ipc_timeout_count;
+
+#define MAX_DEAD_DISPATCH_PORTS 64
+static mach_port_name_t dead_dispatch_ports[MAX_DEAD_DISPATCH_PORTS];
+static int dead_dispatch_port_count;
+static pthread_mutex_t dead_dispatch_port_lock = PTHREAD_MUTEX_INITIALIZER;
+
+typedef enum DeferredActiveRcvPortOpKind {
+    DEFER_ACTIVE_RCV_PORT_DEALLOCATE,
+    DEFER_ACTIVE_RCV_PORT_DESTRUCT,
+} DeferredActiveRcvPortOpKind;
+
+typedef struct DeferredActiveRcvPortOp {
+    DeferredActiveRcvPortOpKind kind;
+    mach_port_name_t port;
+    mach_port_delta_t srdelta;
+    mach_port_context_t guard;
+} DeferredActiveRcvPortOp;
+
+#define MAX_DEFERRED_ACTIVE_RCV_PORT_OPS 64
+static DeferredActiveRcvPortOp
+    deferred_active_rcv_port_ops[MAX_DEFERRED_ACTIVE_RCV_PORT_OPS];
+static int deferred_active_rcv_port_op_count;
+static pthread_mutex_t deferred_active_rcv_port_lock =
+    PTHREAD_MUTEX_INITIALIZER;
+
+static bool defer_active_rcv_port_op(DeferredActiveRcvPortOpKind kind,
+                                     mach_port_name_t port,
+                                     mach_port_delta_t srdelta,
+                                     mach_port_context_t guard,
+                                     bool strace)
+{
+    bool queued = false;
+
+    pthread_mutex_lock(&deferred_active_rcv_port_lock);
+    if (deferred_active_rcv_port_op_count < MAX_DEFERRED_ACTIVE_RCV_PORT_OPS) {
+        deferred_active_rcv_port_ops[deferred_active_rcv_port_op_count++] =
+            (DeferredActiveRcvPortOp) {
+                .kind = kind,
+                .port = port,
+                .srdelta = srdelta,
+                .guard = guard,
+            };
+        queued = true;
+    }
+    pthread_mutex_unlock(&deferred_active_rcv_port_lock);
+
+    if (strace) {
+        if (kind == DEFER_ACTIVE_RCV_PORT_DEALLOCATE) {
+            fprintf(stderr,
+                    "  port_deallocate: %s active receive port 0x%x\n",
+                    queued ? "deferring" : "queue full; forwarding",
+                    port);
+        } else {
+            fprintf(stderr,
+                    "  port_destruct: %s active receive port 0x%x "
+                    "srdelta=%d guard=0x%llx\n",
+                    queued ? "deferring" : "queue full; forwarding",
+                    port, srdelta, (unsigned long long)guard);
+        }
+    }
+
+    return queued;
+}
+
+static void flush_deferred_active_rcv_port_ops(mach_port_name_t port,
+                                               bool strace)
+{
+    DeferredActiveRcvPortOp pending[MAX_DEFERRED_ACTIVE_RCV_PORT_OPS];
+    int pending_count = 0;
+
+    pthread_mutex_lock(&deferred_active_rcv_port_lock);
+    for (int i = 0; i < deferred_active_rcv_port_op_count; ) {
+        if (deferred_active_rcv_port_ops[i].port != port) {
+            i++;
+            continue;
+        }
+        pending[pending_count++] = deferred_active_rcv_port_ops[i];
+        memmove(&deferred_active_rcv_port_ops[i],
+                &deferred_active_rcv_port_ops[i + 1],
+                (deferred_active_rcv_port_op_count - i - 1) *
+                sizeof(deferred_active_rcv_port_ops[0]));
+        deferred_active_rcv_port_op_count--;
+    }
+    pthread_mutex_unlock(&deferred_active_rcv_port_lock);
+
+    for (int i = 0; i < pending_count; i++) {
+        kern_return_t ret;
+
+        if (pending[i].kind == DEFER_ACTIVE_RCV_PORT_DEALLOCATE) {
+            ret = mach_port_deallocate(mach_task_self(), pending[i].port);
+            if (strace) {
+                fprintf(stderr,
+                        "  port_deallocate: flushed active receive port 0x%x "
+                        "ret=%ld\n",
+                        pending[i].port, (long)ret);
+            }
+        } else {
+            ret = mach_port_destruct(mach_task_self(), pending[i].port,
+                                     pending[i].srdelta, pending[i].guard);
+            if (strace) {
+                fprintf(stderr,
+                        "  port_destruct: flushed active receive port 0x%x "
+                        "srdelta=%d guard=0x%llx ret=%ld\n",
+                        pending[i].port, pending[i].srdelta,
+                        (unsigned long long)pending[i].guard, (long)ret);
+            }
+        }
+    }
+}
+
+static void clear_dead_dispatch_port(mach_port_name_t port)
+{
+    pthread_mutex_lock(&dead_dispatch_port_lock);
+    for (int i = 0; i < dead_dispatch_port_count; i++) {
+        if (dead_dispatch_ports[i] == port) {
+            dead_dispatch_ports[i] =
+                dead_dispatch_ports[--dead_dispatch_port_count];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&dead_dispatch_port_lock);
+}
+
+static bool is_dead_dispatch_port(mach_port_name_t port)
+{
+    bool found = false;
+
+    pthread_mutex_lock(&dead_dispatch_port_lock);
+    for (int i = 0; i < dead_dispatch_port_count; i++) {
+        if (dead_dispatch_ports[i] == port) {
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&dead_dispatch_port_lock);
+    return found;
+}
+
+static void record_dead_dispatch_port(mach_port_name_t port, bool strace)
+{
+    mach_port_type_t ptype = 0;
+
+    if (port == MACH_PORT_NULL) {
+        return;
+    }
+    if (mach_port_type(mach_task_self(), port, &ptype) != KERN_SUCCESS) {
+        return;
+    }
+    if (!(ptype & MACH_PORT_TYPE_SEND) || (ptype & MACH_PORT_TYPE_RECEIVE)) {
+        return;
+    }
+
+    pthread_mutex_lock(&dead_dispatch_port_lock);
+    for (int i = 0; i < dead_dispatch_port_count; i++) {
+        if (dead_dispatch_ports[i] == port) {
+            pthread_mutex_unlock(&dead_dispatch_port_lock);
+            return;
+        }
+    }
+    if (dead_dispatch_port_count < MAX_DEAD_DISPATCH_PORTS) {
+        dead_dispatch_ports[dead_dispatch_port_count++] = port;
+    }
+    pthread_mutex_unlock(&dead_dispatch_port_lock);
+
+    if (strace) {
+        fprintf(stderr,
+                "  marked remote port 0x%x as dead dispatch channel\n",
+                port);
+    }
+}
 
 static kern_return_t ipc_timeout_result(mach_port_name_t rcv_port,
                                         bool strace)
@@ -87,6 +262,32 @@ static kern_return_t ipc_timeout_result(mach_port_name_t rcv_port,
             rcv_port);
     }
     return 0x10004009;  /* MACH_RCV_PORT_DIED — graceful teardown */
+}
+
+static void record_dead_dispatch_port_from_msg(void *msg_buf, bool strace)
+{
+    mach_msg_header_t *hdr = (mach_msg_header_t *)msg_buf;
+
+    if (!msg_buf) {
+        return;
+    }
+
+    record_dead_dispatch_port(hdr->msgh_remote_port, strace);
+}
+
+static bool receive_port_has_zero_qlimit(mach_port_name_t port)
+{
+    mach_port_status_t status = {0};
+    mach_msg_type_number_t count = MACH_PORT_RECEIVE_STATUS_COUNT;
+
+    if (mach_port_get_attributes(mach_task_self(), port,
+                                 MACH_PORT_RECEIVE_STATUS,
+                                 (mach_port_info_t)&status,
+                                 &count) != KERN_SUCCESS) {
+        return false;
+    }
+
+    return status.mps_qlimit == MACH_PORT_QLIMIT_ZERO;
 }
 
 static mach_timespec_t timeout_ms_to_mach_timespec(uint64_t timeout_ms)
@@ -621,6 +822,151 @@ mach_vm_map_done:
         reply->hdr.msgh_remote_port = MACH_PORT_NULL;
         reply->hdr.msgh_local_port = hdr->msgh_local_port;
         reply->hdr.msgh_id = msg_id + 100;  /* 4911 */
+        reply->NDR = NDR_record;
+        reply->retval = kr;
+
+        *ret_out = KERN_SUCCESS;
+        return true;
+    }
+    case 4813: {
+        /*
+         * mach_vm_remap — MIG subsystem mach_vm, routine 13.
+         * Remaps an existing range into the current task. Same-task remaps
+         * carry guest addresses, so translate them before calling the host
+         * kernel.
+         *
+         * Request (COMPLEX): header(24) + body(4) + port_desc(12) +
+         *   NDR(8) + target_address(8) + size(8) + mask(8) + flags(4) +
+         *   src_address(8) + copy(4) + inheritance(4) = 92
+         * Reply: header(24) + NDR(8) + retcode(4) + target_address(8) +
+         *   cur_protection(4) + max_protection(4) = 52
+         */
+        struct __attribute__((packed)) {
+            mach_msg_header_t hdr;
+            mach_msg_body_t body;
+            mach_msg_port_descriptor_t src_task;
+            NDR_record_t NDR;
+            uint64_t target_address;
+            uint64_t size;
+            uint64_t mask;
+            int flags;
+            uint64_t src_address;
+            int copy;
+            int inheritance;
+        } *req = buf;
+
+        mach_vm_address_t target_addr = req->target_address;
+        mach_vm_size_t size = req->size;
+        int flags = req->flags;
+        mach_port_t src_task = req->src_task.name;
+        mach_vm_address_t src_addr = req->src_address;
+        boolean_t copy = req->copy;
+        vm_inherit_t inheritance = req->inheritance;
+        mach_vm_address_t host_target = target_addr;
+        mach_vm_address_t host_src = src_addr;
+        vm_prot_t cur_prot = 0;
+        vm_prot_t max_prot = 0;
+        kern_return_t kr;
+        abi_long result = -1;
+        abi_long reserved_start = 0;
+        int remap_flags = flags;
+
+        if (src_task == MACH_PORT_NULL) {
+            src_task = mach_task_self();
+        }
+
+        if (src_task == mach_task_self() && guest_base && src_addr != 0) {
+            host_src = (mach_vm_address_t)(uintptr_t)
+                g2h_untagged((abi_ulong)src_addr);
+        }
+
+        if (flags & VM_FLAGS_ANYWHERE) {
+            abi_long reserve = target_mmap(0, size, PROT_NONE,
+                                           MAP_PRIVATE | MAP_ANONYMOUS,
+                                           -1, 0);
+            if (reserve < 0) {
+                kr = KERN_NO_SPACE;
+                goto mach_vm_remap_done;
+            }
+            reserved_start = reserve;
+            host_target = (mach_vm_address_t)(uintptr_t)
+                g2h_untagged((abi_ulong)reserve);
+            remap_flags = (flags & ~VM_FLAGS_ANYWHERE) | VM_FLAGS_OVERWRITE;
+        } else if (guest_base && target_addr != 0) {
+            host_target = (mach_vm_address_t)(uintptr_t)
+                g2h_untagged((abi_ulong)target_addr);
+        }
+
+        kr = mach_vm_remap(mach_task_self(), &host_target, size,
+                           req->mask, remap_flags, src_task, host_src, copy,
+                           &cur_prot, &max_prot, inheritance);
+        if (kr == KERN_SUCCESS && h2g_valid(host_target)) {
+            result = h2g(host_target);
+        } else {
+            if (reserved_start) {
+                target_munmap(reserved_start, size);
+            }
+            if (kr == KERN_SUCCESS) {
+                kr = KERN_NO_SPACE;
+            }
+        }
+
+mach_vm_remap_done:
+        if (do_strace) {
+            fprintf(stderr,
+                    "  MIG mach_vm_remap: target=0x%llx size=0x%llx "
+                    "flags=0x%x src_task=0x%x src=0x%llx copy=%d "
+                    "-> kr=%d result=0x%llx cur=%d max=%d\n",
+                    (unsigned long long)target_addr,
+                    (unsigned long long)size,
+                    flags, src_task,
+                    (unsigned long long)src_addr,
+                    copy, kr,
+                    (unsigned long long)result,
+                    cur_prot, max_prot);
+        }
+
+        struct __attribute__((packed)) {
+            mach_msg_header_t hdr;
+            NDR_record_t NDR;
+            kern_return_t retval;
+            uint64_t target_address;
+            int cur_protection;
+            int max_protection;
+        } *reply = buf;
+
+        if (kr == KERN_SUCCESS) {
+            int page_flags = PAGE_VALID;
+
+            if (cur_prot & VM_PROT_READ) {
+                page_flags |= PAGE_READ;
+            }
+            if (cur_prot & VM_PROT_WRITE) {
+                page_flags |= PAGE_WRITE;
+            }
+            if (cur_prot & VM_PROT_EXECUTE) {
+                page_flags |= PAGE_EXEC;
+            }
+
+            mmap_lock();
+            page_set_flags(result, result + size - 1, page_flags, ~0);
+            mmap_unlock();
+
+            reply->target_address = (uint64_t)result;
+            reply->cur_protection = cur_prot;
+            reply->max_protection = max_prot;
+        } else {
+            reply->target_address = 0;
+            reply->cur_protection = 0;
+            reply->max_protection = 0;
+        }
+
+        reply->hdr.msgh_bits =
+            MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+        reply->hdr.msgh_size = sizeof(*reply);
+        reply->hdr.msgh_remote_port = MACH_PORT_NULL;
+        reply->hdr.msgh_local_port = hdr->msgh_local_port;
+        reply->hdr.msgh_id = msg_id + 100;  /* 4913 */
         reply->NDR = NDR_record;
         reply->retval = kr;
 
@@ -1690,8 +2036,16 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
              * most common ones to the host and stub the rest.
              */
             if (trap_num == MACH_TRAP_PORT_DEALLOCATE) {
-                ret = mach_port_deallocate(mach_task_self(),
-                                           (mach_port_name_t)arg2);
+                mach_port_name_t name = (mach_port_name_t)arg2;
+
+                if (is_port_active_rcv(name) &&
+                    defer_active_rcv_port_op(
+                        DEFER_ACTIVE_RCV_PORT_DEALLOCATE, name, 0, 0,
+                        do_strace)) {
+                    ret = KERN_SUCCESS;
+                } else {
+                    ret = mach_port_deallocate(mach_task_self(), name);
+                }
             } else if (trap_num == MACH_TRAP_PORT_ALLOCATE) {
                 /*
                  * _kernelrpc_mach_port_allocate_trap
@@ -1737,6 +2091,9 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                 ret = mach_port_construct(mach_task_self(), &opts,
                                           (mach_port_context_t)arg3,
                                           &name);
+                if (ret == KERN_SUCCESS) {
+                    clear_dead_dispatch_port(name);
+                }
                 if (do_strace) {
                     fprintf(stderr,
                             "  port_construct: flags=0x%x mpl_qlimit=%u "
@@ -1748,10 +2105,19 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                     memcpy(g2h_untagged(arg4), &name, sizeof(name));
                 }
             } else if (trap_num == MACH_TRAP_PORT_DESTRUCT) {
-                ret = mach_port_destruct(mach_task_self(),
-                                         (mach_port_name_t)arg2,
-                                         (mach_port_delta_t)arg3,
-                                         (mach_port_context_t)arg4);
+                mach_port_name_t name = (mach_port_name_t)arg2;
+                mach_port_delta_t srdelta = (mach_port_delta_t)arg3;
+                mach_port_context_t guard = (mach_port_context_t)arg4;
+
+                if (is_port_active_rcv(name) &&
+                    defer_active_rcv_port_op(
+                        DEFER_ACTIVE_RCV_PORT_DESTRUCT, name, srdelta,
+                        guard, do_strace)) {
+                    ret = KERN_SUCCESS;
+                } else {
+                    ret = mach_port_destruct(mach_task_self(), name,
+                                             srdelta, guard);
+                }
             } else if (trap_num == MACH_TRAP_PORT_REQUEST_NOTIFICATION) {
                 /*
                  * _kernelrpc_mach_port_request_notification_trap
@@ -2181,6 +2547,10 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                                 uint32_t rcv_name =
                                     (uint32_t)((uint64_t)arg6 >> 32);
                                 ret = ipc_timeout_result(rcv_name, do_strace);
+                                if (ret == 0x10004009) {
+                                    record_dead_dispatch_port_from_msg(host_data,
+                                                                       do_strace);
+                                }
                                 break;
                             }
                             remaining -= slice;
@@ -2196,6 +2566,8 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                                                   vec_tmout);
                     }
                     unmark_active_rcv_port(vec_rcv_port);
+                    flush_deferred_active_rcv_port_ops(vec_rcv_port,
+                                                       do_strace);
 
                     if (ret == 0x10000004 && msg_buf && (vec_opts & 0x1)) {
                         mach_msg_header_t *retry_hdr =
@@ -2206,7 +2578,9 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                                            retry_hdr->msgh_remote_port,
                                            &retry_ptype);
                         if (ptype_rc == KERN_SUCCESS &&
-                            (retry_ptype & MACH_PORT_TYPE_RECEIVE)) {
+                            (retry_ptype & MACH_PORT_TYPE_RECEIVE) &&
+                            receive_port_has_zero_qlimit(
+                                retry_hdr->msgh_remote_port)) {
                             mach_port_limits_t retry_limits = {
                                 .mpl_qlimit = MACH_PORT_QLIMIT_SMALL,
                             };
@@ -2237,6 +2611,16 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                                    (retry_ptype & MACH_PORT_TYPE_SEND) &&
                                    !(retry_ptype & MACH_PORT_TYPE_RECEIVE) &&
                                    vec_tmout == 0) {
+                            if (is_dead_dispatch_port(
+                                    retry_hdr->msgh_remote_port)) {
+                                if (do_strace) {
+                                    fprintf(stderr,
+                                        "  mach_msg2[vec]: dead dispatch "
+                                        "channel port 0x%x -> INVALID_DEST\n",
+                                        retry_hdr->msgh_remote_port);
+                                }
+                                ret = MACH_SEND_INVALID_DEST;
+                            } else {
                             /*
                              * Send-only (external) port with zero timeout.
                              * The remote service may not have started its
@@ -2261,13 +2645,35 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                              * thread; we service workq notifications once
                              * after the loop instead.
                              */
+                            /*
+                             * Check-in messages get a much longer retry
+                             * budget.  The remote daemon (e.g. cfprefsd)
+                             * may need several seconds to finish launching
+                             * or to drain earlier requests from its service
+                             * port.  The earlier 1.85 s budget was often
+                             * too short, causing the emulator to return
+                             * MACH_SEND_INVALID_DEST and poison the
+                             * entire XPC connection.  The longer budget
+                             * matches what a real blocking send (no
+                             * MACH_SEND_TIMEOUT) would tolerate.
+                             */
                             static const int ext_retry_ms[] = {
                                 50, 100, 200, 500, 1000
                             };
-                            for (int ri = 0;
-                                 ri < (int)(sizeof(ext_retry_ms) /
-                                            sizeof(ext_retry_ms[0]));
-                                 ri++) {
+                            static const int ext_checkin_retry_ms[] = {
+                                50, 100, 200, 500, 1000,
+                                2000, 3000, 5000
+                            };
+                            bool is_checkin = retry_hdr->msgh_id ==
+                                DISPATCH_MACH_CHECKIN_MSGID;
+                            const int *retry_table = is_checkin
+                                ? ext_checkin_retry_ms : ext_retry_ms;
+                            int retry_count = is_checkin
+                                ? (int)(sizeof(ext_checkin_retry_ms) /
+                                        sizeof(ext_checkin_retry_ms[0]))
+                                : (int)(sizeof(ext_retry_ms) /
+                                        sizeof(ext_retry_ms[0]));
+                            for (int ri = 0; ri < retry_count; ri++) {
                                 service_pending_workloop_reqs();
                                 service_workloop_machport_events();
                                 ret = host_mach_msg2_trap(
@@ -2275,7 +2681,7 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                                     (uint64_t)arg3, (uint64_t)arg4,
                                     (uint64_t)arg5, (uint64_t)arg6,
                                     (uint64_t)arg7,
-                                    (uint64_t)ext_retry_ms[ri]);
+                                    (uint64_t)retry_table[ri]);
                                 if (do_strace) {
                                     fprintf(stderr,
                                         "  mach_msg2[vec]: ext-send "
@@ -2285,7 +2691,7 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                                         ret == KERN_SUCCESS
                                             ? "succeeded" : "TIMED_OUT",
                                         retry_hdr->msgh_remote_port,
-                                        ext_retry_ms[ri]);
+                                        retry_table[ri]);
                                 }
                                 if (ret != 0x10000004) {
                                     break;
@@ -2298,18 +2704,17 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                              * to the appropriate workq thread.
                              */
                             service_workq_notification_events();
-                            if (ret == 0x10000004 &&
-                                retry_hdr->msgh_id ==
-                                DISPATCH_MACH_CHECKIN_MSGID) {
+                            if (ret == 0x10000004 && is_checkin) {
                                 /*
                                  * Retries have been exhausted without any
-                                 * SEND_POSSIBLE completion.  Report the
+                                 * SEND_POSSIBLE completion. Report the
                                  * dispatch_mach checkin as INVALID_DEST so
                                  * libdispatch tears the dead channel down
                                  * instead of waiting forever on the reply
                                  * receive port.
                                  */
                                 ret = MACH_SEND_INVALID_DEST;
+                            }
                             }
                         }
                     }
@@ -2483,6 +2888,10 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                                 uint32_t rcv_name =
                                     (uint32_t)((uint64_t)arg6 >> 32);
                                 ret = ipc_timeout_result(rcv_name, do_strace);
+                                if (ret == 0x10004009) {
+                                    record_dead_dispatch_port_from_msg(host_data,
+                                                                       do_strace);
+                                }
                                 break;
                             }
                             remaining -= slice;
@@ -2498,6 +2907,8 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                                                   trap_timeout);
                     }
                     unmark_active_rcv_port(direct_rcv_port);
+                    flush_deferred_active_rcv_port_ops(direct_rcv_port,
+                                                       do_strace);
 
                     if (ret == 0x10000004 && host_data &&
                         (trap_options & 0x1)) {
@@ -2509,7 +2920,9 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                                            retry_hdr->msgh_remote_port,
                                            &retry_ptype);
                         if (ptype_rc == KERN_SUCCESS &&
-                            (retry_ptype & MACH_PORT_TYPE_RECEIVE)) {
+                            (retry_ptype & MACH_PORT_TYPE_RECEIVE) &&
+                            receive_port_has_zero_qlimit(
+                                retry_hdr->msgh_remote_port)) {
                             mach_port_limits_t retry_limits = {
                                 .mpl_qlimit = MACH_PORT_QLIMIT_SMALL,
                             };
@@ -2540,6 +2953,16 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                                    (retry_ptype & MACH_PORT_TYPE_SEND) &&
                                    !(retry_ptype & MACH_PORT_TYPE_RECEIVE) &&
                                    trap_timeout == 0) {
+                            if (is_dead_dispatch_port(
+                                    retry_hdr->msgh_remote_port)) {
+                                if (do_strace) {
+                                    fprintf(stderr,
+                                        "  mach_msg2: dead dispatch channel "
+                                        "port 0x%x -> INVALID_DEST\n",
+                                        retry_hdr->msgh_remote_port);
+                                }
+                                ret = MACH_SEND_INVALID_DEST;
+                            } else {
                             /*
                              * Send-only (external) port with zero timeout.
                              * Same escalating retry as the vector path.
@@ -2553,10 +2976,20 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                             static const int ext_retry_ms[] = {
                                 50, 100, 200, 500, 1000
                             };
-                            for (int ri = 0;
-                                 ri < (int)(sizeof(ext_retry_ms) /
-                                            sizeof(ext_retry_ms[0]));
-                                 ri++) {
+                            static const int ext_checkin_retry_ms[] = {
+                                50, 100, 200, 500, 1000,
+                                2000, 3000, 5000
+                            };
+                            bool is_checkin = retry_hdr->msgh_id ==
+                                DISPATCH_MACH_CHECKIN_MSGID;
+                            const int *retry_table = is_checkin
+                                ? ext_checkin_retry_ms : ext_retry_ms;
+                            int retry_count = is_checkin
+                                ? (int)(sizeof(ext_checkin_retry_ms) /
+                                        sizeof(ext_checkin_retry_ms[0]))
+                                : (int)(sizeof(ext_retry_ms) /
+                                        sizeof(ext_retry_ms[0]));
+                            for (int ri = 0; ri < retry_count; ri++) {
                                 service_pending_workloop_reqs();
                                 service_workloop_machport_events();
                                 ret = host_mach_msg2_trap(
@@ -2564,7 +2997,7 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                                     (uint64_t)arg3, (uint64_t)arg4,
                                     (uint64_t)arg5, (uint64_t)arg6,
                                     (uint64_t)arg7,
-                                    (uint64_t)ext_retry_ms[ri]);
+                                    (uint64_t)retry_table[ri]);
                                 if (do_strace) {
                                     fprintf(stderr,
                                         "  mach_msg2: ext-send "
@@ -2574,17 +3007,16 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                                         ret == KERN_SUCCESS
                                             ? "succeeded" : "TIMED_OUT",
                                         retry_hdr->msgh_remote_port,
-                                        ext_retry_ms[ri]);
+                                        retry_table[ri]);
                                 }
                                 if (ret != 0x10000004) {
                                     break;
                                 }
                             }
                             service_workq_notification_events();
-                            if (ret == 0x10000004 &&
-                                retry_hdr->msgh_id ==
-                                DISPATCH_MACH_CHECKIN_MSGID) {
+                            if (ret == 0x10000004 && is_checkin) {
                                 ret = MACH_SEND_INVALID_DEST;
+                            }
                             }
                         }
                     }
