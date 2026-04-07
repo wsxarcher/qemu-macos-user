@@ -314,7 +314,7 @@ void unmark_active_rcv_port(mach_port_t port)
     pthread_mutex_unlock(&active_rcv_lock);
 }
 
-static bool is_port_active_rcv(mach_port_t port)
+bool is_port_active_rcv(mach_port_t port)
 {
     if (port == MACH_PORT_NULL) {
         return false;
@@ -891,7 +891,7 @@ static int prepare_workloop_events(uint64_t wl_id,
         }
         got = prereceive_machport_drain(&machport_kev, out_events,
                                         max_events);
-        if (got > 0 && !(notification_port && wants_msg)) {
+        if (got > 0) {
             got = filter_workloop_notification_events(out_events, got);
         }
         if (got > 0 && prepend_thread_req) {
@@ -1192,9 +1192,7 @@ void service_workloop_machport_events(void)
 
         got = prereceive_machport_drain_timeout(
             &snapshot[i].template_kev, drained, ARRAY_SIZE(drained), 0);
-        if (got > 0 &&
-            !(notification_port &&
-              template_needs_prereceived_msg(&snapshot[i].template_kev))) {
+        if (got > 0) {
             got = filter_workloop_notification_events(drained, got);
         }
         if (got > 0) {
@@ -1895,11 +1893,7 @@ static void *workq_kqueue_monitor_func(void *arg)
                     drained[0] = events_qos[i];
                     got = 1;
                 } else if (wl_id) {
-                    if (!(is_workq_notification_port(
-                              (mach_port_t)events_qos[i].ident) &&
-                          template_needs_prereceived_msg(&events_qos[i]))) {
-                        got = filter_workloop_notification_events(drained, got);
-                    }
+                    got = filter_workloop_notification_events(drained, got);
                     if (got > 0 && !parked) {
                         got = prepend_workloop_req_event(
                             wl_id, drained, got, ARRAY_SIZE(drained));
