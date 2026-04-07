@@ -243,6 +243,7 @@ typedef struct {
     mach_port_t port;
     struct kevent_qos_s template_kev;
     bool has_template;
+    bool sync_wake_inflight;
     struct kevent_qos_s stashed_events[MAX_STASHED_WORKLOOP_EVENTS];
     int stashed_count;
 } workloop_port_entry;
@@ -352,6 +353,7 @@ static int prereceive_machport_drain_timeout(
 static int stash_workloop_port_events(mach_port_t port,
                                       const struct kevent_qos_s *events,
                                       int nevents);
+static void set_workloop_sync_wake_inflight(uint64_t wl_id, bool inflight);
 static int take_stashed_workloop_events(uint64_t wl_id,
                                         struct kevent_qos_s *out_events,
                                         int max_events);
@@ -458,6 +460,20 @@ static bool lookup_workloop_req_template(uint64_t wl_id,
     return found;
 }
 
+static int prepend_specific_workloop_req_event(const struct kevent_qos_s *wl_ev,
+                                               struct kevent_qos_s *events,
+                                               int nevents,
+                                               int max_events)
+{
+    if (nevents <= 0 || nevents >= max_events) {
+        return nevents;
+    }
+
+    memmove(&events[1], &events[0], nevents * sizeof(events[0]));
+    events[0] = *wl_ev;
+    return nevents + 1;
+}
+
 static int prepend_workloop_req_event(uint64_t wl_id,
                                       struct kevent_qos_s *events,
                                       int nevents,
@@ -470,15 +486,45 @@ static int prepend_workloop_req_event(uint64_t wl_id,
         return nevents;
     }
 
-    memmove(&events[1], &events[0], nevents * sizeof(events[0]));
-    events[0] = wl_ev;
+    nevents = prepend_specific_workloop_req_event(&wl_ev, events, nevents,
+                                                  max_events);
 
     if (do_strace) {
         fprintf(stderr, "  workloop wl=0x%llx: prepended THREAD_REQUEST "
                 "to %d MACHPORT event(s)\n",
-                (unsigned long long)wl_id, nevents);
+                (unsigned long long)wl_id, nevents - 1);
     }
-    return nevents + 1;
+    return nevents;
+}
+
+static bool take_zero_wake_workloop_req(uint64_t wl_id,
+                                        struct kevent_qos_s *out_ev)
+{
+    bool found = false;
+
+    pthread_mutex_lock(&pending_wl_lock);
+    for (int i = pending_wl_count - 1; i >= 0; i--) {
+        if (pending_wl_reqs[i].workloop_id == wl_id &&
+            pending_wl_reqs[i].zero_wake) {
+            *out_ev = pending_wl_reqs[i].event;
+            pending_wl_reqs[i].zero_wake = false;
+            /*
+             * Also clear active — the thread request is fulfilled now.
+             * Without this, service_pending_workloop_reqs() would later
+             * process this entry as a non-zero-wake request and deliver
+             * a bare THREAD_REQUEST fallback.
+             */
+            pending_wl_reqs[i].active = false;
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&pending_wl_lock);
+
+    if (found) {
+        refresh_workloop_req_value(out_ev);
+    }
+    return found;
 }
 
 static bool template_needs_prereceived_msg(const struct kevent_qos_s *template_kev)
@@ -597,9 +643,12 @@ static void store_pending_workloop_req(uint64_t wl_id,
         if (!zero_wake) {
             entry->template_event = *ev;
             entry->has_template = true;
+            entry->active = true;
+            entry->zero_wake = false;
+        } else {
+            entry->zero_wake = true;
+            entry->active = false;
         }
-        entry->active = true;
-        entry->zero_wake = zero_wake;
         if (do_strace) {
             fprintf(stderr, "  queued workloop request wl=0x%llx "
                     "filter=%d fflags=0x%x zero=%d\n",
@@ -666,47 +715,43 @@ void service_pending_workloop_reqs(void)
         pending_workloop_req req;
         struct kevent_qos_s ev;
         uint64_t wl_id;
-        bool zero_wake;
 
         if (!pending_wl_reqs[i].active) {
             continue;
         }
+
+        /*
+         * In XNU, a workloop's NOTE_WL_THREAD_REQUEST persists on the
+         * kernel workloop until a knote fires and the thread is actually
+         * dispatched with real work.  Zero-wake requests represent this
+         * persistent thread request — skip them here and let
+         * take_zero_wake_workloop_req() pair them with MACHPORT events
+         * when those events are delivered via the monitor, polling, or
+         * kevent_id paths.  Processing them here would consume the
+         * request with a 100ms prereceive that almost always finds
+         * nothing, losing the persistent thread request.
+         */
+        if (pending_wl_reqs[i].zero_wake) {
+            continue;
+        }
+
         req = pending_wl_reqs[i];
         pending_wl_reqs[i].active = false;
         pthread_mutex_unlock(&pending_wl_lock);
 
         ev = req.event;
         wl_id = req.workloop_id;
-        zero_wake = req.zero_wake;
-        if (zero_wake && req.has_template) {
-            ev = req.template_event;
-        }
         refresh_workloop_req_value(&ev);
 
         if (do_strace) {
             fprintf(stderr, "  semwait: servicing pending workloop "
                     "wl=0x%llx\n", (unsigned long long)wl_id);
         }
-        if (zero_wake) {
-            if (do_strace) {
-                fprintf(stderr, "  semwait: servicing returned THREAD_REQUEST "
-                        "wl=0x%llx %s\n",
-                        (unsigned long long)wl_id,
-                        req.has_template ? "with cached template" :
-                        "without cached template");
-            }
-        }
         struct kevent_qos_s events[16];
-        const struct kevent_qos_s *fallback_ev = zero_wake ? NULL : &ev;
-        int nevents = prepare_workloop_events(wl_id, !zero_wake,
-                                              fallback_ev, events,
+        int nevents = prepare_workloop_events(wl_id, true,
+                                              &ev, events,
                                               ARRAY_SIZE(events));
         if (nevents == 0) {
-            if (do_strace && zero_wake) {
-                fprintf(stderr, "  semwait: parked workloop wl=0x%llx has no "
-                        "prereceived MACHPORT work\n",
-                        (unsigned long long)wl_id);
-            }
             pthread_mutex_lock(&pending_wl_lock);
             continue;
         }
@@ -791,6 +836,17 @@ static int stash_workloop_port_events(mach_port_t port,
     return stashed;
 }
 
+static void set_workloop_sync_wake_inflight(uint64_t wl_id, bool inflight)
+{
+    pthread_mutex_lock(&workloop_port_lock);
+    for (int i = 0; i < workloop_port_count; i++) {
+        if (workloop_ports[i].workloop_id == wl_id) {
+            workloop_ports[i].sync_wake_inflight = inflight;
+        }
+    }
+    pthread_mutex_unlock(&workloop_port_lock);
+}
+
 static int take_stashed_workloop_events(uint64_t wl_id,
                                         struct kevent_qos_s *out_events,
                                         int max_events)
@@ -820,6 +876,10 @@ static int take_stashed_workloop_events(uint64_t wl_id,
         workloop_ports[i].stashed_count -= take;
     }
     pthread_mutex_unlock(&workloop_port_lock);
+
+    if (total > 0) {
+        set_workloop_sync_wake_inflight(wl_id, false);
+    }
 
     return total;
 }
@@ -867,6 +927,18 @@ static int prepare_workloop_events(uint64_t wl_id,
 
     got = take_stashed_workloop_events(wl_id, out_events, max_events);
     if (got > 0) {
+        struct kevent_qos_s zero_wake_ev;
+
+        if (take_zero_wake_workloop_req(wl_id, &zero_wake_ev)) {
+            got = prepend_specific_workloop_req_event(&zero_wake_ev,
+                                                      out_events, got,
+                                                      max_events);
+            if (do_strace) {
+                fprintf(stderr, "  workloop wl=0x%llx: replayed returned "
+                        "THREAD_REQUEST with %d stashed MACHPORT event(s)\n",
+                        (unsigned long long)wl_id, got - 1);
+            }
+        }
         if (got > 0 && prepend_thread_req) {
             got = prepend_workloop_req_event(wl_id, out_events, got,
                                              max_events);
@@ -892,7 +964,24 @@ static int prepare_workloop_events(uint64_t wl_id,
         got = prereceive_machport_drain(&machport_kev, out_events,
                                         max_events);
         if (got > 0) {
+            struct kevent_qos_s zero_wake_ev;
+
             got = filter_workloop_notification_events(out_events, got);
+            if (got > 0) {
+                set_workloop_sync_wake_inflight(wl_id, false);
+            }
+            if (got > 0 &&
+                take_zero_wake_workloop_req(wl_id, &zero_wake_ev)) {
+                got = prepend_specific_workloop_req_event(&zero_wake_ev,
+                                                          out_events, got,
+                                                          max_events);
+                if (do_strace) {
+                    fprintf(stderr, "  workloop wl=0x%llx: replayed returned "
+                            "THREAD_REQUEST with %d prereceived MACHPORT "
+                            "event(s)\n",
+                            (unsigned long long)wl_id, got - 1);
+                }
+            }
         }
         if (got > 0 && prepend_thread_req) {
             got = prepend_workloop_req_event(wl_id, out_events, got,
@@ -1143,14 +1232,35 @@ void service_workloop_machport_events(void)
         if (notification_port && !parked) {
             bool wants_msg =
                 template_needs_prereceived_msg(&snapshot[i].template_kev);
+            bool sync_gap = snapshot[i].sync_wake_inflight;
 
             if (wants_msg) {
-                if (do_strace) {
-                    fprintf(stderr, "  workloop wl=0x%llx: deferring message "
-                            "notification port 0x%x until a parked thread is "
-                            "available\n",
-                            (unsigned long long)snapshot[i].workloop_id,
-                            (unsigned)snapshot[i].port);
+                if (!sync_gap) {
+                    if (do_strace) {
+                        fprintf(stderr, "  workloop wl=0x%llx: deferring message "
+                                "notification port 0x%x until a parked thread is "
+                                "available\n",
+                                (unsigned long long)snapshot[i].workloop_id,
+                                (unsigned)snapshot[i].port);
+                    }
+                    continue;
+                }
+
+                got = prereceive_machport_drain_timeout(&snapshot[i].template_kev,
+                                                        drained,
+                                                        ARRAY_SIZE(drained), 0);
+                if (got > 0) {
+                    got = filter_workloop_notification_events(drained, got);
+                }
+                if (got > 0) {
+                    int stashed = stash_workloop_port_events(snapshot[i].port,
+                                                             drained, got);
+                    if (do_strace) {
+                        fprintf(stderr, "  workloop wl=0x%llx: stashed %d sync-gap "
+                                "notification event(s) on 0x%x\n",
+                                (unsigned long long)snapshot[i].workloop_id,
+                                stashed, (unsigned)snapshot[i].port);
+                    }
                 }
                 continue;
             }
@@ -1193,7 +1303,21 @@ void service_workloop_machport_events(void)
         got = prereceive_machport_drain_timeout(
             &snapshot[i].template_kev, drained, ARRAY_SIZE(drained), 0);
         if (got > 0) {
+            struct kevent_qos_s zero_wake_ev;
+
             got = filter_workloop_notification_events(drained, got);
+            if (got > 0 && parked &&
+                take_zero_wake_workloop_req(snapshot[i].workloop_id,
+                                            &zero_wake_ev)) {
+                got = prepend_specific_workloop_req_event(&zero_wake_ev,
+                                                          drained, got,
+                                                          ARRAY_SIZE(drained));
+                if (do_strace) {
+                    fprintf(stderr, "  workloop wl=0x%llx: replayed returned "
+                            "THREAD_REQUEST while waking parked thread\n",
+                            (unsigned long long)snapshot[i].workloop_id);
+                }
+            }
         }
         if (got > 0) {
             if (!parked) {
@@ -1897,6 +2021,19 @@ static void *workq_kqueue_monitor_func(void *arg)
                     if (got > 0 && !parked) {
                         got = prepend_workloop_req_event(
                             wl_id, drained, got, ARRAY_SIZE(drained));
+                    } else if (got > 0 && parked) {
+                        /*
+                         * Replay the zero-wake THREAD_REQUEST alongside the
+                         * MACHPORT events so the parked workloop thread sees
+                         * the same event shape XNU delivers.
+                         */
+                        struct kevent_qos_s zero_wake_ev;
+                        if (take_zero_wake_workloop_req(wl_id,
+                                                        &zero_wake_ev)) {
+                            got = prepend_specific_workloop_req_event(
+                                &zero_wake_ev, drained, got,
+                                ARRAY_SIZE(drained));
+                        }
                     }
                 }
 
@@ -2134,10 +2271,38 @@ static void deliver_workloop_events_to_thread(uint64_t workloop_id,
     pthread_mutex_unlock(&parked_workloop_lock);
 
     if (pw) {
-        pw->delivered_events = (events && nevents > 0)
-            ? g_memdup2(events, nevents * sizeof(struct kevent_qos_s))
-            : NULL;
-        pw->delivered_nevents = nevents;
+        /*
+         * If a zero-wake THREAD_REQUEST is pending for this workloop
+         * (from a prior WQOPS_THREAD_WORKLOOP_RETURN), prepend it to
+         * the delivered events.  This ensures the parked thread sees
+         * the same THREAD_REQUEST + MACHPORT event shape that XNU
+         * delivers when a workloop's knote fires while a thread
+         * request is active.  Callers that already consumed the
+         * zero-wake (via prepare_workloop_events) will find nothing
+         * here — take_zero_wake_workloop_req is idempotent after
+         * consumption.
+         */
+        struct kevent_qos_s zero_wake_ev;
+        bool prepend_zero = (nevents > 0 &&
+            take_zero_wake_workloop_req(workloop_id, &zero_wake_ev));
+        int total = nevents + (prepend_zero ? 1 : 0);
+
+        if (total > 0) {
+            pw->delivered_events = g_malloc(
+                total * sizeof(struct kevent_qos_s));
+            int off = 0;
+            if (prepend_zero) {
+                pw->delivered_events[0] = zero_wake_ev;
+                off = 1;
+            }
+            if (events && nevents > 0) {
+                memcpy(&pw->delivered_events[off], events,
+                       nevents * sizeof(struct kevent_qos_s));
+            }
+        } else {
+            pw->delivered_events = NULL;
+        }
+        pw->delivered_nevents = total;
         pw->workloop_id = workloop_id;
 
         if (do_strace) {
@@ -4379,6 +4544,24 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                 pw.next = parked_workloop_list;
                 parked_workloop_list = &pw;
                 pthread_mutex_unlock(&parked_workloop_lock);
+                set_workloop_sync_wake_inflight(current_wl_id, false);
+
+                if (current_wl_id) {
+                    struct kevent_qos_s events[16];
+                    int nevents = prepare_workloop_events(current_wl_id, false,
+                                                          NULL, events,
+                                                          ARRAY_SIZE(events));
+                    if (nevents > 0) {
+                        if (do_strace) {
+                            fprintf(stderr, "  WQOPS_THREAD_WORKLOOP_RETURN: "
+                                    "self-waking wl=0x%llx with %d event(s)\n",
+                                    (unsigned long long)current_wl_id,
+                                    nevents);
+                        }
+                        deliver_workloop_events_to_thread(current_wl_id,
+                                                          events, nevents);
+                    }
+                }
 
                 /* Wait for events from monitor thread */
                 pthread_mutex_lock(&pw.mutex);
@@ -4907,18 +5090,39 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                                     "wl=0x%llx -> waking parked thread\n",
                                     (unsigned long long)arg1);
                         }
-                        nevents = prepare_workloop_events(arg1, false, &wl_ev,
+                        nevents = prepare_workloop_events(arg1, false, NULL,
                                                           events,
                                                           ARRAY_SIZE(events));
-                        clear_pending_workloop_req(arg1);
-                        deliver_workloop_events_to_thread(arg1, events,
-                                                          nevents);
+                        if (nevents > 0) {
+                            /*
+                             * Real work found — clear the persistent thread
+                             * request and dispatch.  take_zero_wake inside
+                             * prepare_workloop_events already consumed the
+                             * zero-wake entry if one existed.
+                             */
+                            clear_pending_workloop_req(arg1);
+                            deliver_workloop_events_to_thread(arg1, events,
+                                                              nevents);
+                        } else if (do_strace) {
+                            /*
+                             * No MACHPORT data available yet.  In XNU the
+                             * kernel keeps the thread request pending on
+                             * the workloop until a knote fires.  Don't
+                             * clear — the monitor or a future poll will
+                             * pair the zero-wake with MACHPORT events.
+                             */
+                            fprintf(stderr, "    WORKLOOP THREAD_REQ "
+                                    "wl=0x%llx -> keeping parked thread "
+                                    "parked (no real work yet)\n",
+                                    (unsigned long long)arg1);
+                        }
                     } else if (sync_wait) {
                         if (do_strace) {
                             fprintf(stderr, "    WORKLOOP THREAD_REQ "
                                     "wl=0x%llx -> immediate sync wake\n",
                                     (unsigned long long)arg1);
                         }
+                        set_workloop_sync_wake_inflight(arg1, true);
                         nevents = prepare_workloop_events(arg1, true, &wl_ev,
                                                           events,
                                                           ARRAY_SIZE(events));
