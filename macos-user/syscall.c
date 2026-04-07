@@ -145,6 +145,8 @@ static int get_workq_kqueue(void)
 #define EVFILT_MACHPORT (-8)
 #define EVFILT_WORKLOOP_PRIVATE (-17)
 #define NOTE_WL_THREAD_REQUEST 0x00000001
+#define NOTE_WL_SYNC_WAIT      0x00000010
+#define NOTE_WL_SYNC_IPC       0x00000100
 
 static void kevent_translate_machport_ptrs(struct kevent_qos_s *kev,
                                            int count, bool to_host)
@@ -578,6 +580,21 @@ static bool template_needs_prereceived_msg(const struct kevent_qos_s *template_k
 static void debug_log_machport_template(const struct kevent_qos_s *template_kev)
 {
     (void)template_needs_prereceived_msg(template_kev);
+}
+
+static uint16_t machport_runtime_event_flags(uint16_t flags)
+{
+    /*
+     * Replay the kernel/runtime delivery shape, not the latest guest rearm
+     * changelist. Workloop rearms often replace EV_ADD with bookkeeping bits
+     * like EV_UDATA_SPECIFIC/EV_VANISHED, but subsequent delivered MACHPORT
+     * events still need the active dispatch shape that libdispatch saw on the
+     * first delivery.
+     */
+    flags &= ~(uint16_t)(EV_DELETE | EV_DISABLE |
+                         EV_UDATA_SPECIFIC | EV_VANISHED);
+    flags |= EV_ADD | EV_ENABLE | EV_DISPATCH;
+    return flags;
 }
 
 static bool machport_has_pending_message(mach_port_t port)
@@ -1913,8 +1930,8 @@ static int prereceive_machport_drain_port_timeout(
          * Returned MACHPORT events don't preserve the workloop-only
          * registration bits; libdispatch expects the runtime event shape.
          */
-        out_events[count].flags &= ~(uint16_t)(EV_UDATA_SPECIFIC |
-                                               EV_VANISHED);
+        out_events[count].flags = machport_runtime_event_flags(
+            out_events[count].flags);
         out_events[count].fflags = 0;
         mach_msg_header_t *gh =
             (mach_msg_header_t *)g2h_untagged(guest_buf);
@@ -2466,6 +2483,7 @@ static void deliver_workloop_events_to_thread(uint64_t workloop_id,
     uint32_t flags = WQ_FLAG_THREAD_NEWSPI
                    | WQ_FLAG_THREAD_TSD_BASE_SET
                    | WQ_FLAG_THREAD_PRIO_QOS
+                   | WQ_FLAG_THREAD_KEVENT
                    | WQ_FLAG_THREAD_WORKLOOP
                    | 4;  /* QoS default */
 
@@ -4661,6 +4679,7 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                 uint32_t reuse_flags = WQ_FLAG_THREAD_WORKLOOP
                     | WQ_FLAG_THREAD_REUSE
                     | WQ_FLAG_THREAD_NEWSPI
+                    | WQ_FLAG_THREAD_KEVENT
                     | WQ_FLAG_THREAD_PRIO_QOS | 4;
 
                 mach_port_t self_port = mach_thread_self();
@@ -5151,7 +5170,7 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                     struct kevent_qos_s wl_ev = cl[i];
                     struct kevent_qos_s events[16];
                     int nevents;
-                    bool sync_wait = ((int)arg5 == 1) && (arg4 == arg2);
+                    bool sync_wait = (wl_ev.fflags & NOTE_WL_SYNC_WAIT) != 0;
 
                     /* Read current dq_state if WL_ADDR is set */
                     refresh_workloop_req_value(&wl_ev);
