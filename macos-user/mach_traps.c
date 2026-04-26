@@ -57,9 +57,17 @@ extern mach_port_t thread_get_special_reply_port(void);
  * Timeout escalation is per waiting thread: AppKit/libdispatch may have
  * multiple concurrent reply waits on different ports, and a single global
  * counter lets one thread reset another thread's retry budget.
+ *
+ * ipc_timeout_port / ipc_timeout_count: per-port retry escalation (original).
+ * ipc_timeout_single_streak: counts consecutive "1 timeout then port change"
+ *   events.  When each retry creates a fresh special-reply-port the per-port
+ *   counter never accumulates past 1/3, so we add this cross-port circuit-
+ *   breaker.  Normal XPC receives with >1 timeout on the same port reset it.
  */
 static __thread mach_port_name_t ipc_timeout_port;
 static __thread int ipc_timeout_count;
+static __thread int ipc_timeout_single_streak;
+#define IPC_RECV_MAX_SINGLE_STREAK 5  /* port-per-retry spin breaker */
 
 #define MAX_DEAD_DISPATCH_PORTS 64
 static mach_port_name_t dead_dispatch_ports[MAX_DEAD_DISPATCH_PORTS];
@@ -236,12 +244,29 @@ static kern_return_t ipc_timeout_result(mach_port_name_t rcv_port,
 {
     if (rcv_port == ipc_timeout_port) {
         ipc_timeout_count++;
+        /* Same port: the streak of "1 timeout per port" is broken. */
+        ipc_timeout_single_streak = 0;
     } else {
+        /*
+         * Port changed.  If the previous port saw only a single timeout
+         * before being replaced, count that toward the streak.  This
+         * detects the pattern where libdispatch creates a fresh special-
+         * reply-port for every retry, preventing ipc_timeout_count from
+         * ever exceeding 1 and stalling teardown indefinitely.
+         */
+        if (ipc_timeout_port != 0 && ipc_timeout_count == 1) {
+            ipc_timeout_single_streak++;
+        } else {
+            ipc_timeout_single_streak = 0;
+        }
         ipc_timeout_port = rcv_port;
         ipc_timeout_count = 1;
     }
 
-    if (ipc_timeout_count <= IPC_RECV_MAX_RETRY) {
+    bool streak_exhausted =
+        ipc_timeout_single_streak >= IPC_RECV_MAX_SINGLE_STREAK;
+
+    if (ipc_timeout_count <= IPC_RECV_MAX_RETRY && !streak_exhausted) {
         if (strace) {
             fprintf(stderr,
                 "  ipc timeout %d/%d on port 0x%x — interrupted\n",
@@ -256,10 +281,12 @@ static kern_return_t ipc_timeout_result(mach_port_name_t rcv_port,
 
     ipc_timeout_port = 0;
     ipc_timeout_count = 0;
+    ipc_timeout_single_streak = 0;
     if (strace) {
         fprintf(stderr,
-            "  ipc timeout exhausted on port 0x%x — port died\n",
-            rcv_port);
+            "  ipc timeout exhausted on port 0x%x — port died%s\n",
+            rcv_port,
+            streak_exhausted ? " (single-streak limit)" : "");
     }
     return 0x10004009;  /* MACH_RCV_PORT_DIED — graceful teardown */
 }
@@ -2593,31 +2620,43 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                             (retry_ptype & MACH_PORT_TYPE_RECEIVE) &&
                             receive_port_has_zero_qlimit(
                                 retry_hdr->msgh_remote_port)) {
-                            mach_port_limits_t retry_limits = {
-                                .mpl_qlimit = MACH_PORT_QLIMIT_SMALL,
-                            };
-                            kern_return_t retry_lret =
-                                mach_port_set_attributes(
-                                    mach_task_self(),
-                                    retry_hdr->msgh_remote_port,
-                                    MACH_PORT_LIMITS_INFO,
-                                    (mach_port_info_t)&retry_limits,
-                                    MACH_PORT_LIMITS_INFO_COUNT);
-                            service_pending_workloop_reqs();
-                            service_workloop_machport_events();
-                            service_workq_notification_events();
-                            ret = host_mach_msg2_trap(host_data, vec_opts,
-                                                      (uint64_t)arg3,
-                                                      (uint64_t)arg4,
-                                                      (uint64_t)arg5,
-                                                      (uint64_t)arg6,
-                                                      (uint64_t)arg7,
-                                                      vec_tmout);
-                            if (do_strace && ret == KERN_SUCCESS) {
-                                fprintf(stderr,
-                                    "  mach_msg2[vec]: local-send retry "
-                                    "succeeded for port 0x%x qlimit_ret=%d\n",
-                                    retry_hdr->msgh_remote_port, retry_lret);
+                            if (vec_opts & MACH_SEND_NOTIFY) {
+                                if (do_strace) {
+                                    fprintf(stderr,
+                                        "  mach_msg2[vec]: preserving "
+                                        "MACH_SEND_TIMED_OUT for notify "
+                                        "port 0x%x\n",
+                                        retry_hdr->msgh_remote_port);
+                                }
+                            } else {
+                                mach_port_limits_t retry_limits = {
+                                    .mpl_qlimit = MACH_PORT_QLIMIT_SMALL,
+                                };
+                                kern_return_t retry_lret =
+                                    mach_port_set_attributes(
+                                        mach_task_self(),
+                                        retry_hdr->msgh_remote_port,
+                                        MACH_PORT_LIMITS_INFO,
+                                        (mach_port_info_t)&retry_limits,
+                                        MACH_PORT_LIMITS_INFO_COUNT);
+                                service_pending_workloop_reqs();
+                                service_workloop_machport_events();
+                                service_workq_notification_events();
+                                ret = host_mach_msg2_trap(host_data, vec_opts,
+                                                          (uint64_t)arg3,
+                                                          (uint64_t)arg4,
+                                                          (uint64_t)arg5,
+                                                          (uint64_t)arg6,
+                                                          (uint64_t)arg7,
+                                                          vec_tmout);
+                                if (do_strace && ret == KERN_SUCCESS) {
+                                    fprintf(stderr,
+                                        "  mach_msg2[vec]: local-send retry "
+                                        "succeeded for port 0x%x "
+                                        "qlimit_ret=%d\n",
+                                        retry_hdr->msgh_remote_port,
+                                        retry_lret);
+                                }
                             }
                         } else if (ptype_rc == KERN_SUCCESS &&
                                    (retry_ptype & MACH_PORT_TYPE_SEND) &&
@@ -2938,31 +2977,44 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                             (retry_ptype & MACH_PORT_TYPE_RECEIVE) &&
                             receive_port_has_zero_qlimit(
                                 retry_hdr->msgh_remote_port)) {
-                            mach_port_limits_t retry_limits = {
-                                .mpl_qlimit = MACH_PORT_QLIMIT_SMALL,
-                            };
-                            kern_return_t retry_lret =
-                                mach_port_set_attributes(
-                                    mach_task_self(),
-                                    retry_hdr->msgh_remote_port,
-                                    MACH_PORT_LIMITS_INFO,
-                                    (mach_port_info_t)&retry_limits,
-                                    MACH_PORT_LIMITS_INFO_COUNT);
-                            service_pending_workloop_reqs();
-                            service_workloop_machport_events();
-                            service_workq_notification_events();
-                            ret = host_mach_msg2_trap(host_data, trap_options,
-                                                      (uint64_t)arg3,
-                                                      (uint64_t)arg4,
-                                                      (uint64_t)arg5,
-                                                      (uint64_t)arg6,
-                                                      (uint64_t)arg7,
-                                                      trap_timeout);
-                            if (do_strace && ret == KERN_SUCCESS) {
-                                fprintf(stderr,
-                                    "  mach_msg2: local-send retry "
-                                    "succeeded for port 0x%x qlimit_ret=%d\n",
-                                    retry_hdr->msgh_remote_port, retry_lret);
+                            if (trap_options & MACH_SEND_NOTIFY) {
+                                if (do_strace) {
+                                    fprintf(stderr,
+                                        "  mach_msg2: preserving "
+                                        "MACH_SEND_TIMED_OUT for notify "
+                                        "port 0x%x\n",
+                                        retry_hdr->msgh_remote_port);
+                                }
+                            } else {
+                                mach_port_limits_t retry_limits = {
+                                    .mpl_qlimit = MACH_PORT_QLIMIT_SMALL,
+                                };
+                                kern_return_t retry_lret =
+                                    mach_port_set_attributes(
+                                        mach_task_self(),
+                                        retry_hdr->msgh_remote_port,
+                                        MACH_PORT_LIMITS_INFO,
+                                        (mach_port_info_t)&retry_limits,
+                                        MACH_PORT_LIMITS_INFO_COUNT);
+                                service_pending_workloop_reqs();
+                                service_workloop_machport_events();
+                                service_workq_notification_events();
+                                ret = host_mach_msg2_trap(host_data,
+                                                          trap_options,
+                                                          (uint64_t)arg3,
+                                                          (uint64_t)arg4,
+                                                          (uint64_t)arg5,
+                                                          (uint64_t)arg6,
+                                                          (uint64_t)arg7,
+                                                          trap_timeout);
+                                if (do_strace && ret == KERN_SUCCESS) {
+                                    fprintf(stderr,
+                                        "  mach_msg2: local-send retry "
+                                        "succeeded for port 0x%x "
+                                        "qlimit_ret=%d\n",
+                                        retry_hdr->msgh_remote_port,
+                                        retry_lret);
+                                }
                             }
                         } else if (ptype_rc == KERN_SUCCESS &&
                                    (retry_ptype & MACH_PORT_TYPE_SEND) &&
