@@ -209,6 +209,9 @@ static pthread_mutex_t workq_lock = PTHREAD_MUTEX_INITIALIZER;
 #define WQ_FLAG_THREAD_TSD_BASE_SET    0x00200000
 #define WQ_FLAG_THREAD_WORKLOOP        0x00400000
 
+/* Flags passed back to libpthread's _pthread_start. */
+#define PTHREAD_START_TSD_BASE_SET     0x10000000
+
 /*
  * libdispatch encodes the source type as the first field of direct unotes.
  * For EVFILT_MACHPORT, only source types with a non-NULL dst_merge_msg want
@@ -2750,6 +2753,7 @@ typedef struct {
     abi_ulong stack;
     abi_ulong pthread_self;
     uint32_t flags;
+    abi_ulong tsd_base;
     /* For workqueue threads */
     bool is_workqueue;
     int wq_flags;
@@ -2824,8 +2828,8 @@ static void strace_dump_guest_backtrace(CPUArchState *env, const char *tag)
     }
 }
 
-static void write_workqueue_mach_thread_self(abi_ulong tsd_base,
-                                             mach_port_t self_port)
+static void write_mach_thread_self_tsd_slot(abi_ulong tsd_base,
+                                            mach_port_t self_port)
 {
     abi_ulong slot_addr;
 
@@ -2885,9 +2889,9 @@ static void *guest_thread_func(void *arg)
      */
     self_port = mach_thread_self();
     env->xregs[1] = (abi_ulong)self_port;
-    if (info->is_workqueue) {
-        write_workqueue_mach_thread_self(info->wq_tsd_base, self_port);
-    }
+    write_mach_thread_self_tsd_slot(
+        info->is_workqueue ? info->wq_tsd_base : info->tsd_base,
+        self_port);
 
     /* Signal parent that we're ready */
     pthread_mutex_lock(&info->mutex);
@@ -2974,6 +2978,7 @@ static int create_guest_thread(CPUArchState *parent_env,
     pthread_cond_init(&info.cond, NULL);
     info.env = new_env;
     info.parent_ts = parent_ts;
+    info.tsd_base = tsd_base;
     info.is_workqueue = is_workqueue;
     info.wq_self_addr = wq_self;
     info.wq_stack_top = wq_stop;
@@ -4361,14 +4366,28 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                 break;
             }
 
-            /* Allocate a guest stack */
-            abi_ulong stack_top = alloc_thread_stack(WQ_STACK_SIZE);
-            if (!stack_top) {
-                ret = -TARGET_ENOMEM;
-                break;
+            abi_ulong sp = arg3;
+            abi_ulong stack_bottom = 0;
+            abi_ulong pthread_self = arg4;
+
+            if (!sp) {
+                /* Older libpthread paths can ask the kernel to supply one. */
+                abi_ulong stack_top = alloc_thread_stack(WQ_STACK_SIZE);
+                if (!stack_top) {
+                    ret = -TARGET_ENOMEM;
+                    break;
+                }
+                stack_bottom = stack_top - WQ_STACK_SIZE;
+                sp = stack_top;
             }
-            abi_ulong stack_bottom = stack_top - WQ_STACK_SIZE;
-            abi_ulong sp = stack_top & ~0xFULL;
+            sp &= ~0xFULL;
+            if (!pthread_self) {
+                pthread_self = stack_bottom;
+            }
+            abi_ulong tsd_base = pthread_self;
+            if (saved_tsd_offset) {
+                tsd_base += saved_tsd_offset;
+            }
 
             TaskState *parent_ts = get_task_state(
                 env_cpu((CPUArchState *)cpu_env));
@@ -4380,19 +4399,19 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
              *   x2 = start function (arg1)
              *   x3 = start arg (arg2)
              *   x4 = stacksize
-             *   x5 = flags (arg5)
+             *   x5 = flags, including the kernel-set TSD_BASE_SET bit
              */
             int rc = create_guest_thread(
                 (CPUArchState *)cpu_env,
                 saved_threadstart,  /* PC = threadstart callback */
                 sp,
-                arg4 ? arg4 : stack_bottom, /* x0 = pthread_self */
+                pthread_self,               /* x0 = pthread_self */
                 0,                          /* x1 = kport (set by worker) */
                 arg1,                       /* x2 = start func */
                 arg2,                       /* x3 = start arg */
                 WQ_STACK_SIZE,              /* x4 = stacksize */
-                arg5,                       /* x5 = flags */
-                arg4 ? arg4 : stack_bottom, /* tsd_base = self */
+                arg5 | PTHREAD_START_TSD_BASE_SET, /* x5 = flags */
+                tsd_base,
                 parent_ts,
                 false, 0, 0, 0, 0);        /* not a wq thread */
 
@@ -4877,7 +4896,7 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                 env->xregs[29] = 0;
                 env->xregs[30] = 0;
                 env->cp15.tpidr_el[0] = pw.self_addr;
-                write_workqueue_mach_thread_self(pw.tsd_base, self_port);
+                write_mach_thread_self_tsd_slot(pw.tsd_base, self_port);
 
                 g_free(pw.delivered_events);
                 pthread_mutex_destroy(&pw.mutex);
@@ -4995,7 +5014,7 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                 env->xregs[29] = 0;
                 env->xregs[30] = 0;
                 env->cp15.tpidr_el[0] = pk.self_addr;
-                write_workqueue_mach_thread_self(pk.tsd_base, self_port);
+                write_mach_thread_self_tsd_slot(pk.tsd_base, self_port);
 
                 g_free(pk.delivered_events);
                 pthread_mutex_destroy(&pk.mutex);
