@@ -24,6 +24,7 @@
 #include <mach/mach_vm.h>
 #include <mach/mach_time.h>
 #include <mach/clock.h>
+#include <mach/notify.h>
 
 /* Functions not exposed in public headers but available at link time */
 extern mach_port_t mach_reply_port(void);
@@ -482,12 +483,17 @@ static kern_return_t host_mk_timer_cancel(mach_port_name_t name,
  *
  * Returns true if the message was handled, with *ret_out set.
  */
-static bool handle_mig_message(void *buf, uint64_t options,
-                               uint64_t bits_and_size,
-                               kern_return_t *ret_out)
+static bool mig_reply_fits(mach_msg_size_t reply_buf_size, size_t reply_size)
+{
+    return reply_size <= UINT32_MAX && reply_buf_size >= reply_size;
+}
+
+static bool handle_mig_message(void *buf, void *reply_buf,
+                               mach_msg_size_t reply_buf_size,
+                               uint64_t options, kern_return_t *ret_out)
 {
     mach_msg_header_t *hdr = (mach_msg_header_t *)buf;
-    if (!hdr) {
+    if (!hdr || !reply_buf) {
         return false;
     }
 
@@ -516,22 +522,31 @@ static bool handle_mig_message(void *buf, uint64_t options,
 
         /* Enough space for the largest host_info_t */
         int info_buf[HOST_BASIC_INFO_COUNT + 16];
+        if (count > ARRAY_SIZE(info_buf)) {
+            count = ARRAY_SIZE(info_buf);
+        }
         kern_return_t kr = host_info(mach_host_self(), flavor,
                                      (host_info_t)info_buf, &count);
 
-        /* Pack MIG reply into the same buffer */
+        /* Pack MIG reply into the caller's receive buffer. */
         struct __attribute__((packed)) {
             mach_msg_header_t hdr;
             NDR_record_t NDR;
             kern_return_t retval;
             mach_msg_type_number_t count;
             int data[64];
-        } *reply = buf;
+        } *reply = reply_buf;
+        mach_msg_size_t reply_size = sizeof(mach_msg_header_t) +
+                                     sizeof(NDR_record_t) + 8 +
+                                     count * sizeof(int);
+
+        if (count > ARRAY_SIZE(reply->data) ||
+            !mig_reply_fits(reply_buf_size, reply_size)) {
+            return false;
+        }
 
         reply->hdr.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
-        reply->hdr.msgh_size = sizeof(mach_msg_header_t) +
-                               sizeof(NDR_record_t) + 8 +
-                               count * sizeof(int);
+        reply->hdr.msgh_size = reply_size;
         reply->hdr.msgh_remote_port = MACH_PORT_NULL;
         reply->hdr.msgh_local_port = hdr->msgh_local_port;
         reply->hdr.msgh_id = msg_id + 100;
@@ -568,7 +583,10 @@ static bool handle_mig_message(void *buf, uint64_t options,
             mach_msg_header_t hdr;
             mach_msg_body_t body;
             mach_msg_port_descriptor_t clock_port;
-        } *reply = buf;
+        } *reply = reply_buf;
+        if (!mig_reply_fits(reply_buf_size, sizeof(*reply))) {
+            return false;
+        }
 
         reply->hdr.msgh_bits = MACH_MSGH_BITS_COMPLEX |
                                MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
@@ -599,7 +617,10 @@ static bool handle_mig_message(void *buf, uint64_t options,
             NDR_record_t NDR;
             kern_return_t retval;
             mach_timespec_t cur_time;
-        } *reply = buf;
+        } *reply = reply_buf;
+        if (!mig_reply_fits(reply_buf_size, sizeof(*reply))) {
+            return false;
+        }
 
         reply->hdr.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
         reply->hdr.msgh_size = sizeof(*reply);
@@ -636,7 +657,10 @@ static bool handle_mig_message(void *buf, uint64_t options,
             mach_msg_header_t hdr;
             mach_msg_body_t body;
             mach_msg_port_descriptor_t semaphore;
-        } *reply = buf;
+        } *reply = reply_buf;
+        if (!mig_reply_fits(reply_buf_size, sizeof(*reply))) {
+            return false;
+        }
 
         reply->hdr.msgh_bits = MACH_MSGH_BITS_COMPLEX |
                                MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
@@ -829,7 +853,10 @@ mach_vm_map_done:
             NDR_record_t NDR;
             kern_return_t retval;
             uint64_t address;
-        } *reply = buf;
+        } *reply = reply_buf;
+        if (!mig_reply_fits(reply_buf_size, sizeof(*reply))) {
+            return false;
+        }
 
         kern_return_t kr;
         if (result < 0) {
@@ -971,7 +998,10 @@ mach_vm_remap_done:
             uint64_t target_address;
             int cur_protection;
             int max_protection;
-        } *reply = buf;
+        } *reply = reply_buf;
+        if (!mig_reply_fits(reply_buf_size, sizeof(*reply))) {
+            return false;
+        }
 
         if (kr == KERN_SUCCESS) {
             int page_flags = PAGE_VALID;
@@ -1070,7 +1100,10 @@ mach_vm_remap_done:
                 mach_msg_port_descriptor_t object;
                 NDR_record_t NDR;
                 memory_object_size_t size;
-            } *reply = buf;
+            } *reply = reply_buf;
+            if (!mig_reply_fits(reply_buf_size, sizeof(*reply))) {
+                return false;
+            }
 
             reply->hdr.msgh_bits =
                 MACH_MSGH_BITS_COMPLEX |
@@ -1090,7 +1123,10 @@ mach_vm_remap_done:
                 mach_msg_header_t hdr;
                 NDR_record_t NDR;
                 kern_return_t retval;
-            } *reply = buf;
+            } *reply = reply_buf;
+            if (!mig_reply_fits(reply_buf_size, sizeof(*reply))) {
+                return false;
+            }
 
             reply->hdr.msgh_bits =
                 MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
@@ -1118,7 +1154,10 @@ mach_vm_remap_done:
             mach_msg_header_t hdr;
             NDR_record_t NDR;
             kern_return_t retval;
-        } *reply = buf;
+        } *reply = reply_buf;
+        if (!mig_reply_fits(reply_buf_size, sizeof(*reply))) {
+            return false;
+        }
 
         reply->hdr.msgh_bits =
             MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
@@ -1144,7 +1183,10 @@ mach_vm_remap_done:
             mach_msg_header_t hdr;
             NDR_record_t NDR;
             kern_return_t retval;
-        } *reply = buf;
+        } *reply = reply_buf;
+        if (!mig_reply_fits(reply_buf_size, sizeof(*reply))) {
+            return false;
+        }
 
         reply->hdr.msgh_bits =
             MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
@@ -1179,7 +1221,10 @@ mach_vm_remap_done:
             mach_msg_header_t hdr;
             mach_msg_body_t body;
             mach_msg_port_descriptor_t special_port;
-        } *reply = buf;
+        } *reply = reply_buf;
+        if (!mig_reply_fits(reply_buf_size, sizeof(*reply))) {
+            return false;
+        }
 
         reply->hdr.msgh_bits = MACH_MSGH_BITS_COMPLEX |
                                MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
@@ -1212,6 +1257,9 @@ mach_vm_remap_done:
         mach_msg_type_number_t count = req->count;
 
         integer_t info_buf[94];
+        if (count > ARRAY_SIZE(info_buf)) {
+            count = ARRAY_SIZE(info_buf);
+        }
         kern_return_t kr = task_info(mach_task_self(), flavor,
                                      (task_info_t)info_buf, &count);
 
@@ -1221,13 +1269,19 @@ mach_vm_remap_done:
             kern_return_t retval;
             mach_msg_type_number_t count;
             integer_t data[94];
-        } *reply = buf;
+        } *reply = reply_buf;
+        mach_msg_size_t reply_size = sizeof(mach_msg_header_t) +
+                                     sizeof(NDR_record_t) + 8 +
+                                     count * sizeof(integer_t);
+
+        if (count > ARRAY_SIZE(reply->data) ||
+            !mig_reply_fits(reply_buf_size, reply_size)) {
+            return false;
+        }
 
         reply->hdr.msgh_bits =
             MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
-        reply->hdr.msgh_size = sizeof(mach_msg_header_t) +
-                               sizeof(NDR_record_t) + 8 +
-                               count * sizeof(integer_t);
+        reply->hdr.msgh_size = reply_size;
         reply->hdr.msgh_remote_port = MACH_PORT_NULL;
         reply->hdr.msgh_local_port = hdr->msgh_local_port;
         reply->hdr.msgh_id = msg_id + 100;  /* 3505 */
@@ -1264,7 +1318,10 @@ mach_vm_remap_done:
             mach_msg_header_t hdr;
             NDR_record_t NDR;
             kern_return_t retval;
-        } *reply = buf;
+        } *reply = reply_buf;
+        if (!mig_reply_fits(reply_buf_size, sizeof(*reply))) {
+            return false;
+        }
 
         reply->hdr.msgh_bits =
             MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
@@ -1428,11 +1485,153 @@ static void fixup_mig_request_addrs(void *msg_buf, uint32_t send_size)
  * virtual addresses, so we add guest_base to each OOL pointer.
  * We also save original guest addresses to restore after the trap.
  */
-#define MAX_OOL_SAVE 16
+#define OOL_SAVE_INLINE 16
+typedef struct OOLSaveEntry {
+    void **addr_ptr;
+    void *orig;
+} OOLSaveEntry;
+
 struct ool_save {
     int count;
-    struct { void **addr_ptr; void *orig; } entries[MAX_OOL_SAVE];
+    int capacity;
+    OOLSaveEntry *entries;
+    OOLSaveEntry inline_entries[OOL_SAVE_INLINE];
 };
+
+static void ool_save_init(struct ool_save *save)
+{
+    save->count = 0;
+    save->capacity = OOL_SAVE_INLINE;
+    save->entries = save->inline_entries;
+}
+
+static void ool_save_destroy(struct ool_save *save)
+{
+    if (save->entries != save->inline_entries) {
+        g_free(save->entries);
+    }
+    save->entries = NULL;
+    save->capacity = 0;
+    save->count = 0;
+}
+
+static void ool_save_remember(struct ool_save *save, void **addr_ptr)
+{
+    if (save->count == save->capacity) {
+        int new_capacity = save->capacity * 2;
+        OOLSaveEntry *new_entries;
+
+        if (save->entries == save->inline_entries) {
+            new_entries = g_new(OOLSaveEntry, new_capacity);
+            memcpy(new_entries, save->entries,
+                   save->count * sizeof(*new_entries));
+        } else {
+            new_entries = g_renew(OOLSaveEntry, save->entries, new_capacity);
+        }
+        save->entries = new_entries;
+        save->capacity = new_capacity;
+    }
+
+    save->entries[save->count++] = (OOLSaveEntry) {
+        .addr_ptr = addr_ptr,
+        .orig = *addr_ptr,
+    };
+}
+
+static size_t mach_msg_descriptor_size(mach_msg_descriptor_type_t type)
+{
+    switch (type) {
+    case MACH_MSG_PORT_DESCRIPTOR:
+        return sizeof(mach_msg_port_descriptor_t);
+    case MACH_MSG_OOL_DESCRIPTOR:
+    case MACH_MSG_OOL_VOLATILE_DESCRIPTOR:
+        return sizeof(mach_msg_ool_descriptor_t);
+    case MACH_MSG_OOL_PORTS_DESCRIPTOR:
+        return sizeof(mach_msg_ool_ports_descriptor_t);
+#ifdef MACH_MSG_GUARDED_PORT_DESCRIPTOR
+    case MACH_MSG_GUARDED_PORT_DESCRIPTOR:
+        return sizeof(mach_msg_guarded_port_descriptor_t);
+#endif
+    default:
+        return sizeof(mach_msg_type_descriptor_t);
+    }
+}
+
+static bool mach_msg_disposition_moves_right(mach_msg_type_name_t disposition)
+{
+    return disposition == MACH_MSG_TYPE_MOVE_RECEIVE ||
+           disposition == MACH_MSG_TYPE_MOVE_SEND ||
+           disposition == MACH_MSG_TYPE_MOVE_SEND_ONCE;
+}
+
+static bool mach_msg_send_moves_rights(void *msg_buf, mach_msg_size_t send_size)
+{
+    mach_msg_header_t *hdr = (mach_msg_header_t *)msg_buf;
+    mach_msg_body_t *body;
+    uint8_t *dp;
+    uint8_t *end;
+
+    if (!msg_buf || send_size < sizeof(mach_msg_header_t) ||
+        !(hdr->msgh_bits & MACH_MSGH_BITS_COMPLEX)) {
+        return false;
+    }
+    if (hdr->msgh_size < sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t) ||
+        hdr->msgh_size > send_size) {
+        return false;
+    }
+
+    body = (mach_msg_body_t *)(hdr + 1);
+    dp = (uint8_t *)(body + 1);
+    end = (uint8_t *)hdr + hdr->msgh_size;
+
+    for (uint32_t i = 0; i < body->msgh_descriptor_count; i++) {
+        mach_msg_type_descriptor_t *td;
+        size_t desc_size;
+
+        if (dp + sizeof(mach_msg_type_descriptor_t) > end) {
+            return false;
+        }
+        td = (mach_msg_type_descriptor_t *)dp;
+        desc_size = mach_msg_descriptor_size(td->type);
+        if (dp + desc_size > end) {
+            return false;
+        }
+
+        switch (td->type) {
+        case MACH_MSG_PORT_DESCRIPTOR: {
+            mach_msg_port_descriptor_t *pd =
+                (mach_msg_port_descriptor_t *)dp;
+            if (mach_msg_disposition_moves_right(pd->disposition)) {
+                return true;
+            }
+            break;
+        }
+        case MACH_MSG_OOL_PORTS_DESCRIPTOR: {
+            mach_msg_ool_ports_descriptor_t *op =
+                (mach_msg_ool_ports_descriptor_t *)dp;
+            if (mach_msg_disposition_moves_right(op->disposition)) {
+                return true;
+            }
+            break;
+        }
+#ifdef MACH_MSG_GUARDED_PORT_DESCRIPTOR
+        case MACH_MSG_GUARDED_PORT_DESCRIPTOR: {
+            mach_msg_guarded_port_descriptor_t *gpd =
+                (mach_msg_guarded_port_descriptor_t *)dp;
+            if (mach_msg_disposition_moves_right(gpd->disposition)) {
+                return true;
+            }
+            break;
+        }
+#endif
+        default:
+            break;
+        }
+        dp += desc_size;
+    }
+
+    return false;
+}
 
 static void fixup_send_ool(void *msg_buf, uint32_t send_size,
                             struct ool_save *save)
@@ -1457,16 +1656,15 @@ static void fixup_send_ool(void *msg_buf, uint32_t send_size,
     for (uint32_t i = 0; i < body->msgh_descriptor_count; i++) {
         if (dp + sizeof(mach_msg_type_descriptor_t) > end) break;
         mach_msg_type_descriptor_t *td = (mach_msg_type_descriptor_t *)dp;
+        size_t desc_size = mach_msg_descriptor_size(td->type);
+        if (dp + desc_size > end) break;
 
         switch (td->type) {
         case MACH_MSG_OOL_DESCRIPTOR:
         case MACH_MSG_OOL_VOLATILE_DESCRIPTOR: {
             mach_msg_ool_descriptor_t *ool = (mach_msg_ool_descriptor_t *)dp;
-            if (ool->address && save->count < MAX_OOL_SAVE) {
-                save->entries[save->count].addr_ptr =
-                    (void **)&ool->address;
-                save->entries[save->count].orig = ool->address;
-                save->count++;
+            if (ool->address) {
+                ool_save_remember(save, (void **)&ool->address);
                 ool->address = (void *)((uintptr_t)ool->address +
                                         (uintptr_t)guest_base);
             }
@@ -1476,11 +1674,8 @@ static void fixup_send_ool(void *msg_buf, uint32_t send_size,
         case MACH_MSG_OOL_PORTS_DESCRIPTOR: {
             mach_msg_ool_ports_descriptor_t *op =
                 (mach_msg_ool_ports_descriptor_t *)dp;
-            if (op->address && save->count < MAX_OOL_SAVE) {
-                save->entries[save->count].addr_ptr =
-                    (void **)&op->address;
-                save->entries[save->count].orig = op->address;
-                save->count++;
+            if (op->address) {
+                ool_save_remember(save, (void **)&op->address);
                 op->address = (void *)((uintptr_t)op->address +
                                        (uintptr_t)guest_base);
             }
@@ -1491,7 +1686,7 @@ static void fixup_send_ool(void *msg_buf, uint32_t send_size,
             dp += sizeof(mach_msg_port_descriptor_t);
             break;
         default:
-            dp += sizeof(mach_msg_ool_descriptor_t);
+            dp += desc_size;
             break;
         }
     }
@@ -1544,6 +1739,11 @@ static void debug_log_send_descriptors(void *msg_buf, uint32_t send_size)
             break;
         }
         td = (mach_msg_type_descriptor_t *)dp;
+        size_t desc_size = mach_msg_descriptor_size(td->type);
+        if (dp + desc_size > end) {
+            fprintf(stderr, "    desc[%u]: truncated type=%u\n", i, td->type);
+            break;
+        }
 
         switch (td->type) {
         case MACH_MSG_PORT_DESCRIPTOR: {
@@ -1578,9 +1778,26 @@ static void debug_log_send_descriptors(void *msg_buf, uint32_t send_size)
             dp += sizeof(mach_msg_ool_ports_descriptor_t);
             break;
         }
+#ifdef MACH_MSG_GUARDED_PORT_DESCRIPTOR
+        case MACH_MSG_GUARDED_PORT_DESCRIPTOR: {
+            mach_msg_guarded_port_descriptor_t *gpd =
+                (mach_msg_guarded_port_descriptor_t *)dp;
+            mach_port_type_t ptype = 0;
+            kern_return_t pret =
+                mach_port_type(mach_task_self(), gpd->name, &ptype);
+            fprintf(stderr,
+                    "    SEND GUARDED_PORT desc[%u]: name=0x%x disp=%u "
+                    "guard=0x%llx flags=0x%x ptype_ret=%d ptype=0x%x\n",
+                    i, gpd->name, gpd->disposition,
+                    (unsigned long long)gpd->context, gpd->flags,
+                    pret, ptype);
+            dp += sizeof(mach_msg_guarded_port_descriptor_t);
+            break;
+        }
+#endif
         default:
             fprintf(stderr, "    SEND desc[%u]: type=%u\n", i, td->type);
-            dp += sizeof(mach_msg_ool_descriptor_t);
+            dp += desc_size;
             break;
         }
     }
@@ -1594,7 +1811,8 @@ static void debug_log_send_strings(void *msg_buf, uint32_t send_size)
     if (!do_strace || !msg_buf) {
         return;
     }
-    if (hdr->msgh_id != 1073742031 &&
+    if (hdr->msgh_id != 1073741824 &&
+        hdr->msgh_id != 1073742031 &&
         hdr->msgh_id != 1073742125 &&
         hdr->msgh_id != 1073742628) {
         return;
@@ -1628,19 +1846,101 @@ static void debug_log_send_strings(void *msg_buf, uint32_t send_size)
  *   3. Releasing the kernel's original mapping
  *   4. Patching the descriptor to hold the guest address
  */
-static void fixup_mig_reply_ool(void *reply_buf, mach_port_name_t receive_set)
+static void fixup_mig_reply_port(mach_port_name_t name,
+                                 mach_msg_type_name_t disposition,
+                                 mach_port_name_t receive_set,
+                                 uint32_t index,
+                                 const char *kind,
+                                 bool notification_msg)
+{
+    mach_port_type_t ptype = 0;
+    kern_return_t ptype_ret =
+        mach_port_type(mach_task_self(), name, &ptype);
+
+    if (!notification_msg &&
+        ptype_ret == KERN_SUCCESS && (ptype & MACH_PORT_TYPE_RECEIVE)) {
+        mach_port_limits_t limits = {
+            .mpl_qlimit = MACH_PORT_QLIMIT_SMALL,
+        };
+        kern_return_t lret =
+            mach_port_set_attributes(mach_task_self(), name,
+                                     MACH_PORT_LIMITS_INFO,
+                                     (mach_port_info_t)&limits,
+                                     MACH_PORT_LIMITS_INFO_COUNT);
+        if (do_strace) {
+            fprintf(stderr,
+                "    port_set_limits: name=0x%x qlimit=%u ret=%d\n",
+                name, limits.mpl_qlimit, lret);
+        }
+    }
+    if (!notification_msg &&
+        ptype_ret == KERN_SUCCESS &&
+        (ptype & MACH_PORT_TYPE_RECEIVE) &&
+        receive_set != MACH_PORT_NULL) {
+        mach_port_type_t set_type = 0;
+        kern_return_t set_ret =
+            mach_port_type(mach_task_self(), receive_set, &set_type);
+        if (set_ret == KERN_SUCCESS &&
+            (set_type & MACH_PORT_TYPE_PORT_SET)) {
+            kern_return_t ins_ret =
+                mach_port_insert_member(mach_task_self(), name, receive_set);
+            if (do_strace) {
+                fprintf(stderr,
+                    "    auto_insert_member: port=0x%x set=0x%x ret=%d\n",
+                    name, receive_set, ins_ret);
+            }
+        }
+    }
+    if (do_strace) {
+        fprintf(stderr,
+            "  %s desc[%u]: name=0x%x disp=%u type=0x%x%s\n",
+            kind, index, name, disposition, ptype,
+            notification_msg ? " notification" : "");
+    }
+}
+
+static bool host_ool_range_to_guest(void *host_addr, mach_msg_size_t size,
+                                    abi_ulong *guest_addr);
+static void mark_guest_ool_mapping(abi_ulong guest_addr, mach_msg_size_t size);
+static kern_return_t release_host_ool_mapping(void *host_addr,
+                                              mach_msg_size_t size);
+
+kern_return_t fixup_mig_reply_ool(void *reply_buf,
+                                  mach_msg_size_t reply_buf_size,
+                                  mach_port_name_t receive_set)
 {
     mach_msg_header_t *hdr = (mach_msg_header_t *)reply_buf;
+    mach_msg_size_t msg_size;
+    mach_msg_body_t *body;
+    uint8_t *dp;
+    uint8_t *end;
 
     if (!guest_base) {
-        return;  /* no translation needed */
+        return KERN_SUCCESS;  /* no translation needed */
     }
-    if (!(hdr->msgh_bits & MACH_MSGH_BITS_COMPLEX)) {
-        return;  /* no descriptors */
+    if (reply_buf_size < sizeof(mach_msg_header_t)) {
+        return KERN_INVALID_ARGUMENT;
     }
 
-    mach_msg_body_t *body = (mach_msg_body_t *)(hdr + 1);
-    uint8_t *dp = (uint8_t *)(body + 1);
+    msg_size = hdr->msgh_size;
+    if (msg_size < sizeof(mach_msg_header_t) || msg_size > reply_buf_size) {
+        if (do_strace) {
+            fprintf(stderr,
+                "  OOL fixup: invalid reply size msg=%u rcv=%u id=%u\n",
+                msg_size, reply_buf_size, hdr->msgh_id);
+        }
+        return KERN_INVALID_ARGUMENT;
+    }
+    if (!(hdr->msgh_bits & MACH_MSGH_BITS_COMPLEX)) {
+        return KERN_SUCCESS;  /* no descriptors */
+    }
+    if (msg_size < sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t)) {
+        return KERN_INVALID_ARGUMENT;
+    }
+
+    body = (mach_msg_body_t *)(hdr + 1);
+    dp = (uint8_t *)(body + 1);
+    end = (uint8_t *)hdr + msg_size;
 
     if (do_strace && body->msgh_descriptor_count > 0) {
         fprintf(stderr, "  OOL fixup: msg_id=%u desc_count=%u msg_size=%u\n",
@@ -1648,7 +1948,17 @@ static void fixup_mig_reply_ool(void *reply_buf, mach_port_name_t receive_set)
     }
 
     for (uint32_t i = 0; i < body->msgh_descriptor_count; i++) {
-        mach_msg_type_descriptor_t *td = (mach_msg_type_descriptor_t *)dp;
+        mach_msg_type_descriptor_t *td;
+        size_t desc_size;
+
+        if (dp + sizeof(mach_msg_type_descriptor_t) > end) {
+            return KERN_INVALID_ARGUMENT;
+        }
+        td = (mach_msg_type_descriptor_t *)dp;
+        desc_size = mach_msg_descriptor_size(td->type);
+        if (dp + desc_size > end) {
+            return KERN_INVALID_ARGUMENT;
+        }
 
         switch (td->type) {
         case MACH_MSG_OOL_DESCRIPTOR:
@@ -1658,20 +1968,42 @@ static void fixup_mig_reply_ool(void *reply_buf, mach_port_name_t receive_set)
             mach_msg_size_t size = ool->size;
 
             if (host_addr && size > 0) {
-                /* Allocate in guest address space */
-                abi_long guest_addr = target_mmap(0, size,
-                    PROT_READ | PROT_WRITE,
-                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-                if (guest_addr > 0) {
+                abi_long guest_addr;
+                abi_ulong existing_guest_addr;
+
+                if (host_ool_range_to_guest(host_addr, size,
+                                            &existing_guest_addr)) {
+                    mark_guest_ool_mapping(existing_guest_addr, size);
+                    ool->address = (void *)(uintptr_t)existing_guest_addr;
+                    if (do_strace) {
+                        fprintf(stderr,
+                            "    OOL[%u]: donated host %p -> guest 0x%llx "
+                            "size=%u\n",
+                            i, host_addr,
+                            (unsigned long long)existing_guest_addr, size);
+                    }
+                } else {
+                    kern_return_t dealloc_ret;
+
+                    guest_addr = target_mmap(0, size, PROT_READ | PROT_WRITE,
+                                             MAP_PRIVATE | MAP_ANONYMOUS,
+                                             -1, 0);
+                    if (guest_addr < 0) {
+                        return KERN_RESOURCE_SHORTAGE;
+                    }
                     memcpy(g2h_untagged(guest_addr), host_addr, size);
-                    munmap(host_addr, size);
+                    dealloc_ret = release_host_ool_mapping(host_addr, size);
+                    if (dealloc_ret != KERN_SUCCESS && do_strace) {
+                        fprintf(stderr,
+                            "    OOL[%u]: mach_vm_deallocate(%p,%u) -> %d\n",
+                            i, host_addr, size, dealloc_ret);
+                    }
                     ool->address = (void *)(uintptr_t)guest_addr;
                     if (do_strace) {
                         fprintf(stderr,
-                            "    OOL[%u]: host %p -> guest 0x%llx "
-                            "size=%u\n",
-                            i, host_addr,
-                            (unsigned long long)guest_addr, size);
+                            "    OOL[%u]: host %p -> guest 0x%llx size=%u\n",
+                            i, host_addr, (unsigned long long)guest_addr,
+                            size);
                     }
                 }
             }
@@ -1685,20 +2017,49 @@ static void fixup_mig_reply_ool(void *reply_buf, mach_port_name_t receive_set)
             mach_msg_size_t count = op->count;
 
             if (host_addr && count > 0) {
-                mach_msg_size_t size = count * sizeof(mach_port_t);
-                abi_long guest_addr = target_mmap(0, size,
-                    PROT_READ | PROT_WRITE,
-                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-                if (guest_addr > 0) {
+                mach_msg_size_t size;
+                abi_long guest_addr;
+                abi_ulong existing_guest_addr;
+
+                if (count > UINT32_MAX / sizeof(mach_port_t)) {
+                    return KERN_RESOURCE_SHORTAGE;
+                }
+                size = count * sizeof(mach_port_t);
+                if (host_ool_range_to_guest(host_addr, size,
+                                            &existing_guest_addr)) {
+                    mark_guest_ool_mapping(existing_guest_addr, size);
+                    op->address = (void *)(uintptr_t)existing_guest_addr;
+                    if (do_strace) {
+                        fprintf(stderr,
+                            "    OOL_PORTS[%u]: donated host %p -> guest "
+                            "0x%llx count=%u\n",
+                            i, host_addr,
+                            (unsigned long long)existing_guest_addr, count);
+                    }
+                } else {
+                    kern_return_t dealloc_ret;
+
+                    guest_addr = target_mmap(0, size, PROT_READ | PROT_WRITE,
+                                             MAP_PRIVATE | MAP_ANONYMOUS,
+                                             -1, 0);
+                    if (guest_addr < 0) {
+                        return KERN_RESOURCE_SHORTAGE;
+                    }
                     memcpy(g2h_untagged(guest_addr), host_addr, size);
-                    munmap(host_addr, size);
+                    dealloc_ret = release_host_ool_mapping(host_addr, size);
+                    if (dealloc_ret != KERN_SUCCESS && do_strace) {
+                        fprintf(stderr,
+                            "    OOL_PORTS[%u]: "
+                            "mach_vm_deallocate(%p,%u) -> %d\n",
+                            i, host_addr, size, dealloc_ret);
+                    }
                     op->address = (void *)(uintptr_t)guest_addr;
                     if (do_strace) {
                         fprintf(stderr,
                             "    OOL_PORTS[%u]: host %p -> guest "
                             "0x%llx count=%u\n",
-                            i, host_addr,
-                            (unsigned long long)guest_addr, count);
+                            i, host_addr, (unsigned long long)guest_addr,
+                            count);
                     }
                 }
             } else if (do_strace) {
@@ -1712,62 +2073,71 @@ static void fixup_mig_reply_ool(void *reply_buf, mach_port_name_t receive_set)
         case MACH_MSG_PORT_DESCRIPTOR: {
             mach_msg_port_descriptor_t *pd =
                 (mach_msg_port_descriptor_t *)dp;
-            mach_port_type_t ptype = 0;
-            kern_return_t ptype_ret =
-                mach_port_type(mach_task_self(), pd->name, &ptype);
-            if (ptype_ret == KERN_SUCCESS &&
-                (ptype & MACH_PORT_TYPE_RECEIVE)) {
-                mach_port_limits_t limits = {
-                    .mpl_qlimit = MACH_PORT_QLIMIT_SMALL,
-                };
-                kern_return_t lret =
-                    mach_port_set_attributes(mach_task_self(), pd->name,
-                                             MACH_PORT_LIMITS_INFO,
-                                             (mach_port_info_t)&limits,
-                                             MACH_PORT_LIMITS_INFO_COUNT);
-                if (do_strace) {
-                    fprintf(stderr,
-                        "    port_set_limits: name=0x%x qlimit=%u ret=%d\n",
-                        pd->name, limits.mpl_qlimit, lret);
-                }
-            }
-            if (ptype_ret == KERN_SUCCESS &&
-                (ptype & MACH_PORT_TYPE_RECEIVE) &&
-                receive_set != MACH_PORT_NULL) {
-                mach_port_type_t set_type = 0;
-                kern_return_t set_ret =
-                    mach_port_type(mach_task_self(), receive_set, &set_type);
-                if (set_ret == KERN_SUCCESS &&
-                    (set_type & MACH_PORT_TYPE_PORT_SET)) {
-                    kern_return_t ins_ret =
-                        mach_port_insert_member(mach_task_self(), pd->name,
-                                                receive_set);
-                    if (do_strace) {
-                        fprintf(stderr,
-                            "    auto_insert_member: port=0x%x set=0x%x "
-                            "ret=%d\n",
-                            pd->name, receive_set, ins_ret);
-                    }
-                }
-            }
-            if (do_strace) {
-                fprintf(stderr,
-                    "  PORT desc[%u]: name=0x%x disp=%u type=0x%x\n",
-                    i, pd->name, pd->disposition, ptype);
-            }
+            fixup_mig_reply_port(
+                pd->name, pd->disposition, receive_set, i, "PORT",
+                hdr->msgh_id >= MACH_NOTIFY_FIRST &&
+                hdr->msgh_id <= MACH_NOTIFY_LAST);
             dp += sizeof(mach_msg_port_descriptor_t);
             break;
         }
+#ifdef MACH_MSG_GUARDED_PORT_DESCRIPTOR
+        case MACH_MSG_GUARDED_PORT_DESCRIPTOR: {
+            mach_msg_guarded_port_descriptor_t *gpd =
+                (mach_msg_guarded_port_descriptor_t *)dp;
+            fixup_mig_reply_port(
+                gpd->name, gpd->disposition, receive_set, i, "GUARDED_PORT",
+                hdr->msgh_id >= MACH_NOTIFY_FIRST &&
+                hdr->msgh_id <= MACH_NOTIFY_LAST);
+            dp += sizeof(mach_msg_guarded_port_descriptor_t);
+            break;
+        }
+#endif
         default:
             if (do_strace) {
                 fprintf(stderr,
                     "  UNKNOWN desc[%u]: type=%u\n", i, td->type);
             }
-            /* Unknown descriptor — skip using guarded size */
-            dp += sizeof(mach_msg_ool_descriptor_t);
+            dp += desc_size;
             break;
         }
     }
+
+    return KERN_SUCCESS;
+}
+
+static bool host_ool_range_to_guest(void *host_addr, mach_msg_size_t size,
+                                    abi_ulong *guest_addr)
+{
+    uintptr_t host_start = (uintptr_t)host_addr;
+    uintptr_t host_last;
+
+    if (!host_addr || size == 0) {
+        return false;
+    }
+    host_last = host_start + size - 1;
+    if (host_last < host_start ||
+        !h2g_valid(host_start) || !h2g_valid(host_last)) {
+        return false;
+    }
+
+    *guest_addr = h2g(host_start);
+    return true;
+}
+
+static void mark_guest_ool_mapping(abi_ulong guest_addr, mach_msg_size_t size)
+{
+    mmap_lock();
+    page_set_flags(guest_addr, guest_addr + size - 1,
+                   PAGE_VALID | PAGE_READ | PAGE_WRITE, ~0);
+    mmap_unlock();
+}
+
+static kern_return_t release_host_ool_mapping(void *host_addr,
+                                              mach_msg_size_t size)
+{
+    return mach_vm_deallocate(mach_task_self(),
+                              (mach_vm_address_t)(uintptr_t)host_addr,
+                              (mach_vm_size_t)size);
 }
 #define MACH_TRAP_ABSTIME                       (-3)
 #define MACH_TRAP_CONTTIME                      (-4)
@@ -1924,18 +2294,10 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
         /*
          * _kernelrpc_mach_vm_deallocate_trap(target, address, size)
          */
-        {
-            void *addr = g2h_untagged(arg2);
-            size_t size = (size_t)arg3;
-            if (munmap(addr, size) == 0) {
-                mmap_lock();
-                page_set_flags((abi_ulong)arg2,
-                               (abi_ulong)arg2 + size - 1, 0, ~0);
-                mmap_unlock();
-                ret = KERN_SUCCESS;
-            } else {
-                ret = KERN_INVALID_ADDRESS;
-            }
+        if (target_munmap((abi_ulong)arg2, (abi_ulong)arg3) == 0) {
+            ret = KERN_SUCCESS;
+        } else {
+            ret = KERN_INVALID_ADDRESS;
         }
         break;
 
@@ -1945,7 +2307,6 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
          */
         {
             abi_ulong guest_addr = (abi_ulong)arg2;
-            void *addr = g2h_untagged(guest_addr);
             size_t size = (size_t)arg3;
             int prot = (int)arg5;
             int host_prot = 0;
@@ -2019,7 +2380,7 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
             int mflags = MAP_PRIVATE | MAP_ANONYMOUS;
             abi_ulong guest_start;
             if (flags & VM_FLAGS_ANYWHERE) {
-                guest_start = 0;
+                guest_start = (abi_ulong)addr;
             } else {
                 guest_start = (abi_ulong)addr;
                 mflags |= MAP_FIXED;
@@ -2027,6 +2388,9 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
 
             abi_long result = target_mmap(guest_start, size,
                                           host_prot, mflags, -1, 0);
+            if (result < 0 && (flags & VM_FLAGS_ANYWHERE) && guest_start) {
+                result = target_mmap(0, size, host_prot, mflags, -1, 0);
+            }
             if (result < 0) {
                 ret = KERN_NO_SPACE;
             } else {
@@ -2075,11 +2439,23 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
              */
             if (trap_num == MACH_TRAP_PORT_DEALLOCATE) {
                 mach_port_name_t name = (mach_port_name_t)arg2;
+                mach_port_type_t ptype = 0;
 
                 if (is_port_active_rcv(name) &&
                     defer_active_rcv_port_op(
                         DEFER_ACTIVE_RCV_PORT_DEALLOCATE, name, 0, 0,
                         do_strace)) {
+                    ret = KERN_SUCCESS;
+                } else if (is_workq_notification_port(name) &&
+                           mach_port_type(mach_task_self(), name, &ptype) ==
+                               KERN_SUCCESS &&
+                           (ptype & MACH_PORT_TYPE_RECEIVE)) {
+                    if (do_strace) {
+                        fprintf(stderr,
+                                "  port_deallocate: preserving notification "
+                                "receive port 0x%x ptype=0x%x\n",
+                                name, ptype);
+                    }
                     ret = KERN_SUCCESS;
                 } else {
                     ret = mach_port_deallocate(mach_task_self(), name);
@@ -2146,11 +2522,23 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                 mach_port_name_t name = (mach_port_name_t)arg2;
                 mach_port_delta_t srdelta = (mach_port_delta_t)arg3;
                 mach_port_context_t guard = (mach_port_context_t)arg4;
+                mach_port_type_t ptype = 0;
 
                 if (is_port_active_rcv(name) &&
                     defer_active_rcv_port_op(
                         DEFER_ACTIVE_RCV_PORT_DESTRUCT, name, srdelta,
                         guard, do_strace)) {
+                    ret = KERN_SUCCESS;
+                } else if (is_workq_notification_port(name) &&
+                           mach_port_type(mach_task_self(), name, &ptype) ==
+                               KERN_SUCCESS &&
+                           (ptype & MACH_PORT_TYPE_RECEIVE)) {
+                    if (do_strace) {
+                        fprintf(stderr,
+                                "  port_destruct: preserving notification "
+                                "receive port 0x%x ptype=0x%x\n",
+                                name, ptype);
+                    }
                     ret = KERN_SUCCESS;
                 } else {
                     ret = mach_port_destruct(mach_task_self(), name,
@@ -2173,7 +2561,8 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                     &previous);
                 if (ret == KERN_SUCCESS) {
                     record_workq_notification_port((mach_port_t)arg5,
-                                                   (mach_port_t)arg2);
+                                                   (mach_port_t)arg2,
+                                                   (mach_msg_id_t)arg3);
                 }
                 if (do_strace) {
                     fprintf(stderr, "  port_request_notification: "
@@ -2503,16 +2892,26 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                             hdr->msgh_id, options,
                             vec[0].msgv_send_size,
                             vec[0].msgv_rcv_size);
-                        fprintf(stderr,
-                            "    vec[0]: data=0x%llx rcv=0x%llx "
-                            "ssz=%u rsz=%u | vec[1]: data=0x%llx "
-                            "rcv=0x%llx ssz=%u rsz=%u | "
-                            "snd_count=%u nentries=%d\n",
-                            vec[0].msgv_data, vec[0].msgv_rcv_addr,
-                            vec[0].msgv_send_size, vec[0].msgv_rcv_size,
-                            vec[1].msgv_data, vec[1].msgv_rcv_addr,
-                            vec[1].msgv_send_size, vec[1].msgv_rcv_size,
-                            (uint32_t)((uint64_t)arg3 >> 32), nentries);
+                        if (nentries >= 2) {
+                            fprintf(stderr,
+                                "    vec[0]: data=0x%llx rcv=0x%llx "
+                                "ssz=%u rsz=%u | vec[1]: data=0x%llx "
+                                "rcv=0x%llx ssz=%u rsz=%u | "
+                                "snd_count=%u nentries=%d\n",
+                                vec[0].msgv_data, vec[0].msgv_rcv_addr,
+                                vec[0].msgv_send_size, vec[0].msgv_rcv_size,
+                                vec[1].msgv_data, vec[1].msgv_rcv_addr,
+                                vec[1].msgv_send_size, vec[1].msgv_rcv_size,
+                                (uint32_t)((uint64_t)arg3 >> 32), nentries);
+                        } else {
+                            fprintf(stderr,
+                                "    vec[0]: data=0x%llx rcv=0x%llx "
+                                "ssz=%u rsz=%u | snd_count=%u "
+                                "nentries=%d\n",
+                                vec[0].msgv_data, vec[0].msgv_rcv_addr,
+                                vec[0].msgv_send_size, vec[0].msgv_rcv_size,
+                                (uint32_t)((uint64_t)arg3 >> 32), nentries);
+                        }
                     }
                 }
 
@@ -2520,13 +2919,20 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                 kern_return_t mig_ret;
                 void *msg_buf =
                     (void *)(uintptr_t)vec[0].msgv_data;
-                if (msg_buf && handle_mig_message(msg_buf, options,
-                                                  (uint64_t)arg3,
+                void *vec_reply_buf = NULL;
+                mach_msg_size_t vec_reply_size = vec[0].msgv_rcv_size;
+                if (vec_reply_size) {
+                    vec_reply_buf = vec[0].msgv_rcv_addr ?
+                        (void *)(uintptr_t)vec[0].msgv_rcv_addr : msg_buf;
+                }
+                if (msg_buf && handle_mig_message(msg_buf, vec_reply_buf,
+                                                  vec_reply_size, options,
                                                   &mig_ret)) {
                     ret = mig_ret;
                 } else {
                     /* Translate guest addresses in MIG requests */
-                    struct ool_save ool_sv = {0};
+                    struct ool_save ool_sv;
+                    ool_save_init(&ool_sv);
                     if (msg_buf && (options & 0x1)) {
                         fixup_mig_request_addrs(msg_buf,
                             vec[0].msgv_send_size);
@@ -2608,70 +3014,84 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                     flush_deferred_active_rcv_port_ops(vec_rcv_port,
                                                        do_strace);
 
-                    if (ret == 0x10000004 && msg_buf && (vec_opts & 0x1)) {
+                    if (ret == MACH_SEND_TIMED_OUT && msg_buf &&
+                        (vec_opts & 0x1)) {
                         mach_msg_header_t *retry_hdr =
                             (mach_msg_header_t *)msg_buf;
-                        mach_port_type_t retry_ptype = 0;
-                        kern_return_t ptype_rc =
-                            mach_port_type(mach_task_self(),
-                                           retry_hdr->msgh_remote_port,
-                                           &retry_ptype);
-                        if (ptype_rc == KERN_SUCCESS &&
-                            (retry_ptype & MACH_PORT_TYPE_RECEIVE) &&
-                            receive_port_has_zero_qlimit(
-                                retry_hdr->msgh_remote_port)) {
-                            if (vec_opts & MACH_SEND_NOTIFY) {
-                                if (do_strace) {
-                                    fprintf(stderr,
-                                        "  mach_msg2[vec]: preserving "
-                                        "MACH_SEND_TIMED_OUT for notify "
-                                        "port 0x%x\n",
-                                        retry_hdr->msgh_remote_port);
-                                }
-                            } else {
-                                mach_port_limits_t retry_limits = {
-                                    .mpl_qlimit = MACH_PORT_QLIMIT_SMALL,
-                                };
-                                kern_return_t retry_lret =
-                                    mach_port_set_attributes(
-                                        mach_task_self(),
-                                        retry_hdr->msgh_remote_port,
-                                        MACH_PORT_LIMITS_INFO,
-                                        (mach_port_info_t)&retry_limits,
-                                        MACH_PORT_LIMITS_INFO_COUNT);
-                                service_pending_workloop_reqs();
-                                service_workloop_machport_events();
-                                service_workq_notification_events();
-                                ret = host_mach_msg2_trap(host_data, vec_opts,
-                                                          (uint64_t)arg3,
-                                                          (uint64_t)arg4,
-                                                          (uint64_t)arg5,
-                                                          (uint64_t)arg6,
-                                                          (uint64_t)arg7,
-                                                          vec_tmout);
-                                if (do_strace && ret == KERN_SUCCESS) {
-                                    fprintf(stderr,
-                                        "  mach_msg2[vec]: local-send retry "
-                                        "succeeded for port 0x%x "
-                                        "qlimit_ret=%d\n",
-                                        retry_hdr->msgh_remote_port,
-                                        retry_lret);
-                                }
+                        if (false && mach_msg_send_moves_rights(
+                                msg_buf, vec[0].msgv_send_size)) {
+                            service_pending_workloop_reqs();
+                            service_workloop_machport_events();
+                            service_workq_notification_events();
+                            if (do_strace) {
+                                fprintf(stderr,
+                                    "  mach_msg2[vec]: preserving "
+                                    "MACH_SEND_TIMED_OUT for move-right "
+                                    "message id=%u port 0x%x\n",
+                                    retry_hdr->msgh_id,
+                                    retry_hdr->msgh_remote_port);
                             }
-                        } else if (ptype_rc == KERN_SUCCESS &&
-                                   (retry_ptype & MACH_PORT_TYPE_SEND) &&
-                                   !(retry_ptype & MACH_PORT_TYPE_RECEIVE) &&
-                                   vec_tmout == 0) {
-                            if (is_dead_dispatch_port(
+                        } else {
+                            mach_port_type_t retry_ptype = 0;
+                            kern_return_t ptype_rc =
+                                mach_port_type(mach_task_self(),
+                                               retry_hdr->msgh_remote_port,
+                                               &retry_ptype);
+                            if (ptype_rc == KERN_SUCCESS &&
+                                (retry_ptype & MACH_PORT_TYPE_RECEIVE) &&
+                                receive_port_has_zero_qlimit(
                                     retry_hdr->msgh_remote_port)) {
-                                if (do_strace) {
-                                    fprintf(stderr,
-                                        "  mach_msg2[vec]: dead dispatch "
-                                        "channel port 0x%x -> INVALID_DEST\n",
-                                        retry_hdr->msgh_remote_port);
+                                if (vec_opts & MACH_SEND_NOTIFY) {
+                                    if (do_strace) {
+                                        fprintf(stderr,
+                                            "  mach_msg2[vec]: preserving "
+                                            "MACH_SEND_TIMED_OUT for notify "
+                                            "port 0x%x\n",
+                                            retry_hdr->msgh_remote_port);
+                                    }
+                                } else {
+                                    mach_port_limits_t retry_limits = {
+                                        .mpl_qlimit = MACH_PORT_QLIMIT_SMALL,
+                                    };
+                                    kern_return_t retry_lret =
+                                        mach_port_set_attributes(
+                                            mach_task_self(),
+                                            retry_hdr->msgh_remote_port,
+                                            MACH_PORT_LIMITS_INFO,
+                                            (mach_port_info_t)&retry_limits,
+                                            MACH_PORT_LIMITS_INFO_COUNT);
+                                    service_pending_workloop_reqs();
+                                    service_workloop_machport_events();
+                                    service_workq_notification_events();
+                                    ret = host_mach_msg2_trap(
+                                        host_data, vec_opts,
+                                        (uint64_t)arg3, (uint64_t)arg4,
+                                        (uint64_t)arg5, (uint64_t)arg6,
+                                        (uint64_t)arg7, vec_tmout);
+                                    if (do_strace && ret == KERN_SUCCESS) {
+                                        fprintf(stderr,
+                                            "  mach_msg2[vec]: local-send "
+                                            "retry succeeded for port 0x%x "
+                                            "qlimit_ret=%d\n",
+                                            retry_hdr->msgh_remote_port,
+                                            retry_lret);
+                                    }
                                 }
-                                ret = MACH_SEND_INVALID_DEST;
-                            } else {
+                            } else if (ptype_rc == KERN_SUCCESS &&
+                                       (retry_ptype & MACH_PORT_TYPE_SEND) &&
+                                       !(retry_ptype & MACH_PORT_TYPE_RECEIVE) &&
+                                       vec_tmout == 0) {
+                                if (is_dead_dispatch_port(
+                                        retry_hdr->msgh_remote_port)) {
+                                    if (do_strace) {
+                                        fprintf(stderr,
+                                            "  mach_msg2[vec]: dead dispatch "
+                                            "channel port 0x%x -> "
+                                            "INVALID_DEST\n",
+                                            retry_hdr->msgh_remote_port);
+                                    }
+                                    ret = MACH_SEND_INVALID_DEST;
+                                } else {
                             /*
                              * Send-only (external) port with zero timeout.
                              * The remote service may not have started its
@@ -2766,6 +3186,7 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                                  */
                                 ret = MACH_SEND_INVALID_DEST;
                             }
+                                }
                             }
                         }
                     }
@@ -2821,20 +3242,18 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                     }
                     /* Translate OOL descriptors in the reply */
                     if (ret == KERN_SUCCESS && (options & 0x2)) {
-                        void *rcv_buf;
-                        if (nentries >= 2 && vec[1].msgv_rcv_addr) {
-                            rcv_buf = g2h_untagged(save_rcv[1]);
-                        } else {
-                            rcv_buf = (void *)(uintptr_t)vec[0].msgv_data;
-                        }
-                        if (rcv_buf) {
-                            fixup_mig_reply_ool(
-                                rcv_buf,
+                        if (vec_reply_buf) {
+                            kern_return_t fix_ret = fixup_mig_reply_ool(
+                                vec_reply_buf, vec_reply_size,
                                 (mach_port_name_t)((uint64_t)arg6 >> 32));
+                            if (fix_ret != KERN_SUCCESS) {
+                                ret = fix_ret;
+                            }
                         }
                     }
                     /* Restore OOL descriptor addresses in send buffer */
                     restore_send_ool(&ool_sv);
+                    ool_save_destroy(&ool_sv);
                 }
 
                 /* Restore guest pointers */
@@ -2875,12 +3294,16 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                 }
 
                 kern_return_t mig_ret;
-                if (handle_mig_message(host_data, options,
-                                       (uint64_t)arg3, &mig_ret)) {
+                mach_msg_size_t direct_reply_size =
+                    (mach_msg_size_t)(uint32_t)((uint64_t)arg7);
+                if (handle_mig_message(host_data, host_data,
+                                       direct_reply_size, options,
+                                       &mig_ret)) {
                     ret = mig_ret;
                 } else {
                     /* Translate guest addresses in MIG requests */
-                    struct ool_save ool_sv = {0};
+                    struct ool_save ool_sv;
+                    ool_save_init(&ool_sv);
                     if (host_data && (options & 0x1)) {
                         mach_msg_header_t *shdr =
                             (mach_msg_header_t *)host_data;
@@ -2964,72 +3387,84 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                     flush_deferred_active_rcv_port_ops(direct_rcv_port,
                                                        do_strace);
 
-                    if (ret == 0x10000004 && host_data &&
+                    if (ret == MACH_SEND_TIMED_OUT && host_data &&
                         (trap_options & 0x1)) {
                         mach_msg_header_t *retry_hdr =
                             (mach_msg_header_t *)host_data;
-                        mach_port_type_t retry_ptype = 0;
-                        kern_return_t ptype_rc =
-                            mach_port_type(mach_task_self(),
-                                           retry_hdr->msgh_remote_port,
-                                           &retry_ptype);
-                        if (ptype_rc == KERN_SUCCESS &&
-                            (retry_ptype & MACH_PORT_TYPE_RECEIVE) &&
-                            receive_port_has_zero_qlimit(
-                                retry_hdr->msgh_remote_port)) {
-                            if (trap_options & MACH_SEND_NOTIFY) {
-                                if (do_strace) {
-                                    fprintf(stderr,
-                                        "  mach_msg2: preserving "
-                                        "MACH_SEND_TIMED_OUT for notify "
-                                        "port 0x%x\n",
-                                        retry_hdr->msgh_remote_port);
-                                }
-                            } else {
-                                mach_port_limits_t retry_limits = {
-                                    .mpl_qlimit = MACH_PORT_QLIMIT_SMALL,
-                                };
-                                kern_return_t retry_lret =
-                                    mach_port_set_attributes(
-                                        mach_task_self(),
-                                        retry_hdr->msgh_remote_port,
-                                        MACH_PORT_LIMITS_INFO,
-                                        (mach_port_info_t)&retry_limits,
-                                        MACH_PORT_LIMITS_INFO_COUNT);
-                                service_pending_workloop_reqs();
-                                service_workloop_machport_events();
-                                service_workq_notification_events();
-                                ret = host_mach_msg2_trap(host_data,
-                                                          trap_options,
-                                                          (uint64_t)arg3,
-                                                          (uint64_t)arg4,
-                                                          (uint64_t)arg5,
-                                                          (uint64_t)arg6,
-                                                          (uint64_t)arg7,
-                                                          trap_timeout);
-                                if (do_strace && ret == KERN_SUCCESS) {
-                                    fprintf(stderr,
-                                        "  mach_msg2: local-send retry "
-                                        "succeeded for port 0x%x "
-                                        "qlimit_ret=%d\n",
-                                        retry_hdr->msgh_remote_port,
-                                        retry_lret);
-                                }
+                        if (false && mach_msg_send_moves_rights(
+                                host_data, retry_hdr->msgh_size)) {
+                            service_pending_workloop_reqs();
+                            service_workloop_machport_events();
+                            service_workq_notification_events();
+                            if (do_strace) {
+                                fprintf(stderr,
+                                    "  mach_msg2: preserving "
+                                    "MACH_SEND_TIMED_OUT for move-right "
+                                    "message id=%u port 0x%x\n",
+                                    retry_hdr->msgh_id,
+                                    retry_hdr->msgh_remote_port);
                             }
-                        } else if (ptype_rc == KERN_SUCCESS &&
-                                   (retry_ptype & MACH_PORT_TYPE_SEND) &&
-                                   !(retry_ptype & MACH_PORT_TYPE_RECEIVE) &&
-                                   trap_timeout == 0) {
-                            if (is_dead_dispatch_port(
+                        } else {
+                            mach_port_type_t retry_ptype = 0;
+                            kern_return_t ptype_rc =
+                                mach_port_type(mach_task_self(),
+                                               retry_hdr->msgh_remote_port,
+                                               &retry_ptype);
+                            if (ptype_rc == KERN_SUCCESS &&
+                                (retry_ptype & MACH_PORT_TYPE_RECEIVE) &&
+                                receive_port_has_zero_qlimit(
                                     retry_hdr->msgh_remote_port)) {
-                                if (do_strace) {
-                                    fprintf(stderr,
-                                        "  mach_msg2: dead dispatch channel "
-                                        "port 0x%x -> INVALID_DEST\n",
-                                        retry_hdr->msgh_remote_port);
+                                if (trap_options & MACH_SEND_NOTIFY) {
+                                    if (do_strace) {
+                                        fprintf(stderr,
+                                            "  mach_msg2: preserving "
+                                            "MACH_SEND_TIMED_OUT for notify "
+                                            "port 0x%x\n",
+                                            retry_hdr->msgh_remote_port);
+                                    }
+                                } else {
+                                    mach_port_limits_t retry_limits = {
+                                        .mpl_qlimit = MACH_PORT_QLIMIT_SMALL,
+                                    };
+                                    kern_return_t retry_lret =
+                                        mach_port_set_attributes(
+                                            mach_task_self(),
+                                            retry_hdr->msgh_remote_port,
+                                            MACH_PORT_LIMITS_INFO,
+                                            (mach_port_info_t)&retry_limits,
+                                            MACH_PORT_LIMITS_INFO_COUNT);
+                                    service_pending_workloop_reqs();
+                                    service_workloop_machport_events();
+                                    service_workq_notification_events();
+                                    ret = host_mach_msg2_trap(
+                                        host_data, trap_options,
+                                        (uint64_t)arg3, (uint64_t)arg4,
+                                        (uint64_t)arg5, (uint64_t)arg6,
+                                        (uint64_t)arg7, trap_timeout);
+                                    if (do_strace && ret == KERN_SUCCESS) {
+                                        fprintf(stderr,
+                                            "  mach_msg2: local-send retry "
+                                            "succeeded for port 0x%x "
+                                            "qlimit_ret=%d\n",
+                                            retry_hdr->msgh_remote_port,
+                                            retry_lret);
+                                    }
                                 }
-                                ret = MACH_SEND_INVALID_DEST;
-                            } else {
+                            } else if (ptype_rc == KERN_SUCCESS &&
+                                       (retry_ptype & MACH_PORT_TYPE_SEND) &&
+                                       !(retry_ptype & MACH_PORT_TYPE_RECEIVE) &&
+                                       trap_timeout == 0) {
+                                if (is_dead_dispatch_port(
+                                        retry_hdr->msgh_remote_port)) {
+                                    if (do_strace) {
+                                        fprintf(stderr,
+                                            "  mach_msg2: dead dispatch "
+                                            "channel port 0x%x -> "
+                                            "INVALID_DEST\n",
+                                            retry_hdr->msgh_remote_port);
+                                    }
+                                    ret = MACH_SEND_INVALID_DEST;
+                                } else {
                             /*
                              * Send-only (external) port with zero timeout.
                              * Same escalating retry as the vector path.
@@ -3084,6 +3519,7 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                             if (ret == 0x10000004 && is_checkin) {
                                 ret = MACH_SEND_INVALID_DEST;
                             }
+                                }
                             }
                         }
                     }
@@ -3141,12 +3577,16 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                     /* Translate OOL descriptors in the reply */
                     if (ret == KERN_SUCCESS && host_data &&
                         (options & 0x2)) {
-                        fixup_mig_reply_ool(
-                            host_data,
+                        kern_return_t fix_ret = fixup_mig_reply_ool(
+                            host_data, direct_reply_size,
                             (mach_port_name_t)((uint64_t)arg6 >> 32));
+                        if (fix_ret != KERN_SUCCESS) {
+                            ret = fix_ret;
+                        }
                     }
                     /* Restore OOL descriptor addresses in send buffer */
                     restore_send_ool(&ool_sv);
+                    ool_save_destroy(&ool_sv);
                 }
             }
         }
