@@ -257,6 +257,8 @@ static pthread_mutex_t workloop_port_lock = PTHREAD_MUTEX_INITIALIZER;
 #define MAX_NOTIFICATION_PORTS 64
 static mach_port_t notification_ports[MAX_NOTIFICATION_PORTS];
 static mach_port_t notification_watched_ports[MAX_NOTIFICATION_PORTS];
+static mach_msg_id_t notification_msgids[MAX_NOTIFICATION_PORTS];
+static bool notification_send_possible_pending[MAX_NOTIFICATION_PORTS];
 static int notification_port_count = 0;
 static pthread_mutex_t notification_port_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -342,8 +344,7 @@ static void deliver_workloop_events_to_thread(uint64_t workloop_id,
                                               struct kevent_qos_s *events,
                                               int nevents);
 static bool has_parked_workloop_thread(uint64_t workloop_id);
-static bool is_workq_notification_port(mach_port_t port);
-static mach_port_t find_workq_notification_watched_port(mach_port_t port);
+bool is_workq_notification_port(mach_port_t port);
 static void register_workq_notification_template(mach_port_t port);
 static void service_workq_notification_events_filtered(bool synthetic_only);
 static int prereceive_machport_drain(struct kevent_qos_s *template_kev,
@@ -364,6 +365,7 @@ static int stash_workloop_port_events(mach_port_t port,
                                       const struct kevent_qos_s *events,
                                       int nevents);
 static void set_workloop_sync_wake_inflight(uint64_t wl_id, bool inflight);
+static void clear_pending_workloop_req(uint64_t wl_id);
 static int take_stashed_workloop_events(uint64_t wl_id,
                                         struct kevent_qos_s *out_events,
                                         int max_events);
@@ -429,6 +431,16 @@ static pending_workloop_req *ensure_pending_workloop_req_locked(uint64_t wl_id)
 static void refresh_workloop_req_value(struct kevent_qos_s *ev)
 {
     if (ev->ext[1]) {
+        if (!guest_range_valid_untagged((abi_ulong)ev->ext[1],
+                                        sizeof(uint64_t))) {
+            if (do_strace) {
+                fprintf(stderr, "  workloop THREAD_REQUEST WL_ADDR 0x%llx "
+                        "is invalid; keeping WL_VALUE=0x%llx\n",
+                        (unsigned long long)ev->ext[1],
+                        (unsigned long long)ev->ext[3]);
+            }
+            return;
+        }
         uint64_t *dq_state_p = (uint64_t *)g2h_untagged(ev->ext[1]);
         ev->ext[3] = *dq_state_p;
     }
@@ -634,6 +646,16 @@ static bool workloop_event_is_mach_notification(
         !event->ext[0]) {
         return false;
     }
+    if (!guest_range_valid_untagged((abi_ulong)event->ext[0],
+                                    sizeof(mach_msg_header_t))) {
+        if (do_strace) {
+            fprintf(stderr, "  workloop MACHPORT 0x%llx: prereceived "
+                    "message pointer 0x%llx is invalid\n",
+                    (unsigned long long)event->ident,
+                    (unsigned long long)event->ext[0]);
+        }
+        return false;
+    }
 
     gh = (mach_msg_header_t *)g2h_untagged((abi_ulong)event->ext[0]);
     return is_mach_notification_msg(gh);
@@ -670,10 +692,12 @@ static void store_pending_workloop_req(uint64_t wl_id,
                                        bool zero_wake)
 {
     pending_workloop_req *entry;
+    bool was_zero_wake = false;
 
     pthread_mutex_lock(&pending_wl_lock);
     entry = ensure_pending_workloop_req_locked(wl_id);
     if (entry) {
+        was_zero_wake = entry->zero_wake;
         entry->event = *ev;
         if (!zero_wake) {
             entry->template_event = *ev;
@@ -689,6 +713,11 @@ static void store_pending_workloop_req(uint64_t wl_id,
                     "filter=%d fflags=0x%x zero=%d\n",
                     (unsigned long long)wl_id, ev->filter, ev->fflags,
                     zero_wake);
+            if (was_zero_wake && !zero_wake) {
+                fprintf(stderr, "  workloop wl=0x%llx: replacing returned "
+                        "zero-wake THREAD_REQUEST with active request\n",
+                        (unsigned long long)wl_id);
+            }
         }
     }
     pthread_mutex_unlock(&pending_wl_lock);
@@ -913,6 +942,19 @@ static int take_stashed_workloop_events(uint64_t wl_id,
     pthread_mutex_unlock(&workloop_port_lock);
 
     if (total > 0) {
+        if (do_strace) {
+            for (int i = 0; i < total; i++) {
+                if (workloop_event_is_mach_notification(&out_events[i])) {
+                    mach_msg_header_t *gh =
+                        (mach_msg_header_t *)g2h_untagged(
+                            (abi_ulong)out_events[i].ext[0]);
+                    fprintf(stderr, "  workloop wl=0x%llx: unstashed Mach "
+                            "notification id=%u from port 0x%llx\n",
+                            (unsigned long long)wl_id, gh->msgh_id,
+                            (unsigned long long)out_events[i].ident);
+                }
+            }
+        }
         set_workloop_sync_wake_inflight(wl_id, false);
     }
 
@@ -931,6 +973,53 @@ static uint64_t find_workloop_for_port(mach_port_t port)
     }
     pthread_mutex_unlock(&workloop_port_lock);
     return wl_id;
+}
+
+typedef enum WorkloopMachportState {
+    WORKLOOP_MACHPORT_LIVE,
+    WORKLOOP_MACHPORT_NO_RIGHTS,
+    WORKLOOP_MACHPORT_DEAD_NAME,
+} WorkloopMachportState;
+
+static WorkloopMachportState workloop_machport_state(mach_port_t port)
+{
+    mach_port_type_t ptype = 0;
+    kern_return_t kr;
+
+    kr = mach_port_type(mach_task_self(), port, &ptype);
+    if (kr != KERN_SUCCESS) {
+        if (do_strace) {
+            fprintf(stderr, "  workloop: mach_port_type(0x%x) failed: %d\n",
+                    (unsigned)port, kr);
+        }
+        return WORKLOOP_MACHPORT_LIVE;
+    }
+
+    if (ptype & MACH_PORT_TYPE_DEAD_NAME) {
+        return WORKLOOP_MACHPORT_DEAD_NAME;
+    }
+    if (ptype == 0) {
+        return WORKLOOP_MACHPORT_NO_RIGHTS;
+    }
+    return WORKLOOP_MACHPORT_LIVE;
+}
+
+static void suppress_dead_workloop_machport_fallback(uint64_t wl_id,
+                                                     mach_port_t port,
+                                                     const char *where,
+                                                     WorkloopMachportState state)
+{
+    set_workloop_sync_wake_inflight(wl_id, false);
+    if (state == WORKLOOP_MACHPORT_DEAD_NAME) {
+        clear_pending_workloop_req(wl_id);
+    }
+    if (do_strace) {
+        fprintf(stderr, "  workloop wl=0x%llx: machport template 0x%x "
+                "is %s — suppressing %s fallback\n",
+                (unsigned long long)wl_id, (unsigned)port,
+                state == WORKLOOP_MACHPORT_DEAD_NAME ? "dead" : "released",
+                where);
+    }
 }
 
 static bool find_workloop_machport_template(uint64_t wl_id,
@@ -965,13 +1054,10 @@ static int prepare_workloop_events(uint64_t wl_id,
         struct kevent_qos_s zero_wake_ev;
 
         if (take_zero_wake_workloop_req(wl_id, &zero_wake_ev)) {
-            got = prepend_specific_workloop_req_event(&zero_wake_ev,
-                                                      out_events, got,
-                                                      max_events);
             if (do_strace) {
-                fprintf(stderr, "  workloop wl=0x%llx: replayed returned "
-                        "THREAD_REQUEST with %d stashed MACHPORT event(s)\n",
-                        (unsigned long long)wl_id, got - 1);
+                fprintf(stderr, "  workloop wl=0x%llx: consumed returned "
+                        "THREAD_REQUEST for %d stashed MACHPORT event(s)\n",
+                        (unsigned long long)wl_id, got);
             }
         }
         if (got > 0 && prepend_thread_req) {
@@ -987,9 +1073,18 @@ static int prepare_workloop_events(uint64_t wl_id,
     }
 
     if (find_workloop_machport_template(wl_id, &machport_kev)) {
+        bool notification_port =
+            is_workq_notification_port((mach_port_t)machport_kev.ident);
+
         if (is_port_active_rcv((mach_port_t)machport_kev.ident)) {
             /* Another thread is doing mach_msg2 receive on this port;
              * prereceiving here would steal its reply message. */
+            if (do_strace) {
+                fprintf(stderr, "  workloop wl=0x%llx: MACHPORT 0x%x "
+                        "has active receiver; using THREAD_REQUEST fallback\n",
+                        (unsigned long long)wl_id,
+                        (unsigned)machport_kev.ident);
+            }
             goto fallback;
         }
         got = prereceive_machport_drain(&machport_kev, out_events,
@@ -997,20 +1092,19 @@ static int prepare_workloop_events(uint64_t wl_id,
         if (got > 0) {
             struct kevent_qos_s zero_wake_ev;
 
-            got = filter_workloop_notification_events(out_events, got);
+            if (!notification_port) {
+                got = filter_workloop_notification_events(out_events, got);
+            }
             if (got > 0) {
                 set_workloop_sync_wake_inflight(wl_id, false);
             }
             if (got > 0 &&
                 take_zero_wake_workloop_req(wl_id, &zero_wake_ev)) {
-                got = prepend_specific_workloop_req_event(&zero_wake_ev,
-                                                          out_events, got,
-                                                          max_events);
                 if (do_strace) {
-                    fprintf(stderr, "  workloop wl=0x%llx: replayed returned "
-                            "THREAD_REQUEST with %d prereceived MACHPORT "
+                    fprintf(stderr, "  workloop wl=0x%llx: consumed returned "
+                            "THREAD_REQUEST for %d prereceived MACHPORT "
                             "event(s)\n",
-                            (unsigned long long)wl_id, got - 1);
+                            (unsigned long long)wl_id, got);
                 }
             }
         }
@@ -1027,11 +1121,37 @@ static int prepare_workloop_events(uint64_t wl_id,
             }
             return got;
         }
+
+        /*
+         * prereceive_machport_drain returned 0: the port queue was empty.
+         * If the port is also dead (no rights remain), suppress the fallback
+         * THREAD_REQUEST delivery — returning it would cause an infinite
+         * sync-wake spin where cleanup handlers park, get woken with just a
+         * THREAD_REQUEST, do nothing useful, and re-park indefinitely.
+         */
+        WorkloopMachportState state =
+            workloop_machport_state((mach_port_t)machport_kev.ident);
+        if (state != WORKLOOP_MACHPORT_LIVE) {
+            suppress_dead_workloop_machport_fallback(
+                wl_id, (mach_port_t)machport_kev.ident, "THREAD_REQUEST",
+                state);
+            return 0;
+        }
     }
 
 fallback:
     if (!fallback_ev) {
         return 0;
+    }
+    if (do_strace) {
+        fprintf(stderr, "  workloop wl=0x%llx: synthesizing fallback "
+                "THREAD_REQUEST filter=%d fflags=0x%x ext=[0x%llx,0x%llx,"
+                "0x%llx,0x%llx]\n",
+                (unsigned long long)wl_id, fallback_ev->filter,
+                fallback_ev->fflags, (unsigned long long)fallback_ev->ext[0],
+                (unsigned long long)fallback_ev->ext[1],
+                (unsigned long long)fallback_ev->ext[2],
+                (unsigned long long)fallback_ev->ext[3]);
     }
     out_events[0] = *fallback_ev;
     return 1;
@@ -1106,7 +1226,8 @@ static void synthesize_workq_notification_template(mach_port_t port)
     pthread_mutex_unlock(&workq_machport_lock);
 }
 
-void record_workq_notification_port(mach_port_t port, mach_port_t watched_port)
+void record_workq_notification_port(mach_port_t port, mach_port_t watched_port,
+                                    mach_msg_id_t msgid)
 {
     if (port == MACH_PORT_NULL) {
         return;
@@ -1118,6 +1239,7 @@ void record_workq_notification_port(mach_port_t port, mach_port_t watched_port)
             if (watched_port != MACH_PORT_NULL) {
                 notification_watched_ports[i] = watched_port;
             }
+            notification_msgids[i] = msgid;
             pthread_mutex_unlock(&notification_port_lock);
             return;
         }
@@ -1125,14 +1247,16 @@ void record_workq_notification_port(mach_port_t port, mach_port_t watched_port)
     if (notification_port_count < MAX_NOTIFICATION_PORTS) {
         notification_ports[notification_port_count] = port;
         notification_watched_ports[notification_port_count] = watched_port;
+        notification_msgids[notification_port_count] = msgid;
+        notification_send_possible_pending[notification_port_count] = false;
         notification_port_count++;
     }
     pthread_mutex_unlock(&notification_port_lock);
     if (do_strace) {
         fprintf(stderr,
                 "  record_workq_notification_port: port=0x%x watches=0x%x "
-                "(manual poll)\n",
-                port, watched_port);
+                "msgid=%d (manual poll)\n",
+                port, watched_port, msgid);
     }
 
     if (workq_notification_port_has_real_template(port)) {
@@ -1147,7 +1271,32 @@ void record_workq_notification_port(mach_port_t port, mach_port_t watched_port)
     }
 }
 
-static bool is_workq_notification_port(mach_port_t port)
+void queue_workq_send_possible_notification(mach_port_t watched_port)
+{
+    int queued = 0;
+
+    if (watched_port == MACH_PORT_NULL) {
+        return;
+    }
+
+    pthread_mutex_lock(&notification_port_lock);
+    for (int i = 0; i < notification_port_count; i++) {
+        if (notification_watched_ports[i] == watched_port &&
+            notification_msgids[i] == MACH_NOTIFY_SEND_POSSIBLE) {
+            notification_send_possible_pending[i] = true;
+            queued++;
+        }
+    }
+    pthread_mutex_unlock(&notification_port_lock);
+
+    if (do_strace && queued > 0) {
+        fprintf(stderr, "  queued SEND_POSSIBLE notification for port 0x%x "
+                "(%d target%s)\n", watched_port, queued,
+                queued == 1 ? "" : "s");
+    }
+}
+
+bool is_workq_notification_port(mach_port_t port)
 {
     bool found = false;
 
@@ -1162,19 +1311,83 @@ static bool is_workq_notification_port(mach_port_t port)
     return found;
 }
 
-static mach_port_t find_workq_notification_watched_port(mach_port_t port)
+static int take_synthetic_send_possible_events(
+    const struct kevent_qos_s *template_kev,
+    struct kevent_qos_s *out_events,
+    int max_events)
 {
-    mach_port_t watched = MACH_PORT_NULL;
+    mach_port_t notify_port = (mach_port_t)template_kev->ident;
+    mach_port_t watched_port = MACH_PORT_NULL;
+    bool pending = false;
+    mach_msg_size_t msg_size =
+        (mach_msg_size_t)offsetof(mach_send_possible_notification_t, trailer);
+    mach_msg_size_t alloc_size = msg_size + MAX_TRAILER_SIZE;
+    abi_long guest_buf_ret;
+    abi_ulong guest_buf;
+    mach_send_possible_notification_t *msg;
+
+    if (max_events <= 0) {
+        return 0;
+    }
 
     pthread_mutex_lock(&notification_port_lock);
     for (int i = 0; i < notification_port_count; i++) {
-        if (notification_ports[i] == port) {
-            watched = notification_watched_ports[i];
+        if (notification_ports[i] == notify_port &&
+            notification_msgids[i] == MACH_NOTIFY_SEND_POSSIBLE &&
+            notification_send_possible_pending[i]) {
+            notification_send_possible_pending[i] = false;
+            watched_port = notification_watched_ports[i];
+            pending = true;
             break;
         }
     }
     pthread_mutex_unlock(&notification_port_lock);
-    return watched;
+
+    if (!pending) {
+        return 0;
+    }
+
+    mmap_lock();
+    guest_buf_ret = target_mmap(0, alloc_size, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    mmap_unlock();
+    if (guest_buf_ret < 0) {
+        return 0;
+    }
+
+    guest_buf = (abi_ulong)guest_buf_ret;
+    memset(g2h_untagged(guest_buf), 0, alloc_size);
+    msg = (mach_send_possible_notification_t *)g2h_untagged(guest_buf);
+    msg->not_header.msgh_bits =
+        MACH_MSGH_BITS(0, MACH_MSG_TYPE_MOVE_SEND_ONCE);
+    msg->not_header.msgh_size = msg_size;
+    msg->not_header.msgh_remote_port = MACH_PORT_NULL;
+    msg->not_header.msgh_local_port = notify_port;
+    msg->not_header.msgh_voucher_port = MACH_PORT_NULL;
+    msg->not_header.msgh_id = MACH_NOTIFY_SEND_POSSIBLE;
+    msg->NDR = NDR_record;
+    msg->not_port = watched_port;
+    mach_msg_audit_trailer_t *trailer =
+        (mach_msg_audit_trailer_t *)((uint8_t *)msg + ((msg_size + 3) & ~3U));
+    trailer->msgh_trailer_type = MACH_MSG_TRAILER_FORMAT_0;
+    trailer->msgh_trailer_size = sizeof(*trailer);
+
+    out_events[0] = *template_kev;
+    out_events[0].flags = machport_runtime_event_flags(out_events[0].flags);
+    out_events[0].fflags = 0;
+    out_events[0].data = msg_size;
+    out_events[0].ext[0] = (uint64_t)guest_buf;
+    out_events[0].ext[1] = alloc_size;
+    out_events[0].ext[2] = 0;
+    out_events[0].ext[3] = 0;
+
+    if (do_strace) {
+        fprintf(stderr, "  synthesized SEND_POSSIBLE notify port 0x%x "
+                "watched=0x%x -> guest 0x%llx\n",
+                notify_port, watched_port, (unsigned long long)guest_buf);
+    }
+
+    return 1;
 }
 
 static void save_workq_machport_template(const struct kevent_qos_s *kev)
@@ -1205,53 +1418,9 @@ static void save_workq_machport_template(const struct kevent_qos_s *kev)
 
 static void register_workq_notification_template(mach_port_t port)
 {
-    struct kevent_qos_s kev;
-    struct kevent64_s k64;
-    bool found = false;
-    int wkq;
-    int rc;
-
-    pthread_mutex_lock(&workq_machport_lock);
-    for (int i = workq_machport_count - 1; i >= 0; i--) {
-        if (workq_machports[i].port == port &&
-            workq_machports[i].has_template) {
-            kev = workq_machports[i].template_kev;
-            found = true;
-            break;
-        }
-    }
-    pthread_mutex_unlock(&workq_machport_lock);
-
-    /* Also search workloop_ports — notification ports registered via
-     * kevent_id end up there, not in workq_machports. */
-    if (!found) {
-        pthread_mutex_lock(&workloop_port_lock);
-        for (int i = workloop_port_count - 1; i >= 0; i--) {
-            if (workloop_ports[i].port == port &&
-                workloop_ports[i].has_template) {
-                kev = workloop_ports[i].template_kev;
-                found = true;
-                break;
-            }
-        }
-        pthread_mutex_unlock(&workloop_port_lock);
-    }
-
-    if (!found) {
-        return;
-    }
-
-    wkq = get_workq_kqueue();
-    if (wkq < 0) {
-        return;
-    }
-
-    kqos_to_k64(&kev, &k64);
-    rc = kevent64(wkq, &k64, 1, NULL, 0, 0, NULL);
     if (do_strace) {
-        fprintf(stderr, "  register notify MACHPORT ident=0x%x on workq "
-                "kqueue rc=%d%s\n",
-                (unsigned)port, rc, rc < 0 ? " (FAILED)" : "");
+        fprintf(stderr, "  register notify MACHPORT ident=0x%x: "
+                "manual polling only\n", (unsigned)port);
     }
 }
 
@@ -1288,6 +1457,23 @@ void service_workloop_machport_events(void)
 
             if (wants_msg) {
                 if (!sync_gap) {
+                    got = prereceive_machport_drain_timeout(
+                        &snapshot[i].template_kev, drained,
+                        ARRAY_SIZE(drained), 0);
+                    if (got > 0) {
+                        got = prepend_workloop_req_event(snapshot[i].workloop_id,
+                                                         drained, got,
+                                                         ARRAY_SIZE(drained));
+                        if (do_strace) {
+                            fprintf(stderr, "  workloop wl=0x%llx: waking for "
+                                    "%d notification message event(s) on 0x%x\n",
+                                    (unsigned long long)snapshot[i].workloop_id,
+                                    got, (unsigned)snapshot[i].port);
+                        }
+                        deliver_workloop_events_to_thread(
+                            snapshot[i].workloop_id, drained, got);
+                        continue;
+                    }
                     if (do_strace) {
                         fprintf(stderr, "  workloop wl=0x%llx: deferring message "
                                 "notification port 0x%x until a parked thread is "
@@ -1301,9 +1487,6 @@ void service_workloop_machport_events(void)
                 got = prereceive_machport_drain_timeout(&snapshot[i].template_kev,
                                                         drained,
                                                         ARRAY_SIZE(drained), 0);
-                if (got > 0) {
-                    got = filter_workloop_notification_events(drained, got);
-                }
                 if (got > 0) {
                     int stashed = stash_workloop_port_events(snapshot[i].port,
                                                              drained, got);
@@ -1321,7 +1504,9 @@ void service_workloop_machport_events(void)
                                                     drained,
                                                     ARRAY_SIZE(drained), 0);
             if (got > 0) {
-                got = filter_workloop_notification_events(drained, got);
+                if (!notification_port) {
+                    got = filter_workloop_notification_events(drained, got);
+                }
             }
             if (got > 0) {
                 if (!wants_msg) {
@@ -1352,45 +1537,20 @@ void service_workloop_machport_events(void)
             continue;
         }
 
-        {
-            mach_port_t poll_port = snapshot[i].port;
-
-            if (parked && notification_port &&
-                template_needs_prereceived_msg(&snapshot[i].template_kev)) {
-                mach_port_t watched =
-                    find_workq_notification_watched_port(snapshot[i].port);
-
-                if (watched != MACH_PORT_NULL &&
-                    watched != snapshot[i].port &&
-                    !workq_notification_port_has_real_template(watched) &&
-                    !is_port_active_rcv(watched)) {
-                    poll_port = watched;
-                    if (do_strace) {
-                        fprintf(stderr, "  workloop wl=0x%llx: polling watched "
-                                "port 0x%x via notification template 0x%x\n",
-                                (unsigned long long)snapshot[i].workloop_id,
-                                (unsigned)watched,
-                                (unsigned)snapshot[i].port);
-                    }
-                }
-            }
-
-            got = prereceive_machport_drain_port_timeout(
-                &snapshot[i].template_kev, poll_port,
-                drained, ARRAY_SIZE(drained), 0);
-        }
+        got = prereceive_machport_drain_timeout(&snapshot[i].template_kev,
+                                                drained,
+                                                ARRAY_SIZE(drained), 0);
         if (got > 0) {
             struct kevent_qos_s zero_wake_ev;
 
-            got = filter_workloop_notification_events(drained, got);
+            if (!notification_port) {
+                got = filter_workloop_notification_events(drained, got);
+            }
             if (got > 0 && parked &&
                 take_zero_wake_workloop_req(snapshot[i].workloop_id,
                                             &zero_wake_ev)) {
-                got = prepend_specific_workloop_req_event(&zero_wake_ev,
-                                                          drained, got,
-                                                          ARRAY_SIZE(drained));
                 if (do_strace) {
-                    fprintf(stderr, "  workloop wl=0x%llx: replayed returned "
+                    fprintf(stderr, "  workloop wl=0x%llx: consumed returned "
                             "THREAD_REQUEST while waking parked thread\n",
                             (unsigned long long)snapshot[i].workloop_id);
                 }
@@ -1448,9 +1608,14 @@ static void service_workq_notification_events_filtered(bool synthetic_only)
             continue;
         }
 
-        got = prereceive_machport_drain_timeout(&snapshot[i].template_kev,
-                                                drained,
-                                                ARRAY_SIZE(drained), 0);
+        got = take_synthetic_send_possible_events(&snapshot[i].template_kev,
+                                                  drained,
+                                                  ARRAY_SIZE(drained));
+        if (got == 0) {
+            got = prereceive_machport_drain_timeout(&snapshot[i].template_kev,
+                                                    drained,
+                                                    ARRAY_SIZE(drained), 0);
+        }
         if (got > 0) {
             if (do_strace) {
                 fprintf(stderr, "  workq MACHPORT 0x%x: polling woke %d "
@@ -1778,16 +1943,21 @@ static abi_ulong prereceive_one_msg_timeout(mach_port_t port,
     void *buf = g_malloc0(buf_size);
     mach_msg_header_t *hdr = (mach_msg_header_t *)buf;
 
+    mach_msg_option_t rcv_options =
+        MACH_RCV_MSG | MACH_RCV_LARGE | MACH_RCV_TIMEOUT |
+        MACH_RCV_TRAILER_TYPE(MACH_MSG_TRAILER_FORMAT_0) |
+        MACH_RCV_TRAILER_ELEMENTS(MACH_RCV_TRAILER_AUDIT);
+
     kern_return_t kr = mach_msg(hdr,
-        MACH_RCV_MSG | MACH_RCV_LARGE | MACH_RCV_TIMEOUT,
+        rcv_options,
         0, buf_size, port, timeout_ms, MACH_PORT_NULL);
 
     if (kr == MACH_RCV_TOO_LARGE) {
         buf_size = hdr->msgh_size + MAX_TRAILER_SIZE;
         buf = g_realloc(buf, buf_size);
         hdr = (mach_msg_header_t *)buf;
-        kr = mach_msg(hdr, MACH_RCV_MSG | MACH_RCV_LARGE | MACH_RCV_TIMEOUT,
-                      0, buf_size, port, timeout_ms, MACH_PORT_NULL);
+        kr = mach_msg(hdr, rcv_options, 0, buf_size, port, timeout_ms,
+                      MACH_PORT_NULL);
     }
 
     if (kr != KERN_SUCCESS) {
@@ -1795,55 +1965,43 @@ static abi_ulong prereceive_one_msg_timeout(mach_port_t port,
         return (abi_ulong)-1;
     }
 
-    mach_msg_size_t received_size = hdr->msgh_size + MAX_TRAILER_SIZE;
-    mmap_lock();
-    abi_ulong guest_buf = target_mmap(0, received_size,
-        PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    mmap_unlock();
-
-    if (guest_buf == (abi_ulong)-1) {
+    if (hdr->msgh_size < sizeof(mach_msg_header_t) ||
+        hdr->msgh_size > buf_size ||
+        hdr->msgh_size > UINT32_MAX - MAX_TRAILER_SIZE) {
         g_free(buf);
         return (abi_ulong)-1;
     }
 
-    memcpy(g2h_untagged(guest_buf), buf, received_size);
+    mach_msg_size_t received_size = hdr->msgh_size + MAX_TRAILER_SIZE;
+    mach_msg_size_t copy_size = MIN(received_size, buf_size);
+    abi_long guest_buf_ret;
 
-    /* Fix up OOL descriptors */
-    if (guest_base && (hdr->msgh_bits & MACH_MSGH_BITS_COMPLEX)) {
-        mach_msg_header_t *gh =
-            (mach_msg_header_t *)g2h_untagged(guest_buf);
-        mach_msg_body_t *body = (mach_msg_body_t *)(gh + 1);
-        uint8_t *dp = (uint8_t *)(body + 1);
-        for (uint32_t i = 0; i < body->msgh_descriptor_count; i++) {
-            mach_msg_type_descriptor_t *td =
-                (mach_msg_type_descriptor_t *)dp;
-            if (td->type == MACH_MSG_OOL_DESCRIPTOR ||
-                td->type == MACH_MSG_OOL_VOLATILE_DESCRIPTOR) {
-                mach_msg_ool_descriptor_t *ool =
-                    (mach_msg_ool_descriptor_t *)dp;
-                void *host_addr = ool->address;
-                mach_msg_size_t sz = ool->size;
-                if (host_addr && sz > 0) {
-                    mmap_lock();
-                    abi_long ga = target_mmap(0, sz,
-                        PROT_READ | PROT_WRITE,
-                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-                    mmap_unlock();
-                    if (ga > 0) {
-                        memcpy(g2h_untagged(ga), host_addr, sz);
-                        munmap(host_addr, sz);
-                        ool->address = (void *)(uintptr_t)ga;
-                    }
-                }
-                dp += sizeof(mach_msg_ool_descriptor_t);
-            } else if (td->type == MACH_MSG_OOL_PORTS_DESCRIPTOR) {
-                dp += sizeof(mach_msg_ool_ports_descriptor_t);
-            } else if (td->type == MACH_MSG_PORT_DESCRIPTOR) {
-                dp += sizeof(mach_msg_port_descriptor_t);
-            } else {
-                dp += sizeof(mach_msg_type_descriptor_t);
-            }
+    mmap_lock();
+    guest_buf_ret = target_mmap(0, received_size,
+        PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    mmap_unlock();
+
+    if (guest_buf_ret < 0) {
+        g_free(buf);
+        return (abi_ulong)-1;
+    }
+
+    abi_ulong guest_buf = (abi_ulong)guest_buf_ret;
+    memcpy(g2h_untagged(guest_buf), buf, copy_size);
+
+    kern_return_t fix_ret = fixup_mig_reply_ool(g2h_untagged(guest_buf),
+                                                received_size,
+                                                MACH_PORT_NULL);
+    if (fix_ret != KERN_SUCCESS) {
+        if (do_strace) {
+            fprintf(stderr,
+                    "  workq_monitor: OOL fixup failed for port 0x%x "
+                    "msg_size=%u id=%u ret=%d\n",
+                    port, hdr->msgh_size, hdr->msgh_id, fix_ret);
         }
+        target_munmap(guest_buf, received_size);
+        g_free(buf);
+        return (abi_ulong)-1;
     }
 
     if (do_strace) {
@@ -2042,9 +2200,25 @@ static void *workq_kqueue_monitor_func(void *arg)
 
                 if (notification_port && !parked) {
                     bool wants_msg = template_needs_prereceived_msg(&events_qos[i]);
+                    int got = prereceive_machport_drain(&events_qos[i],
+                                                        drained,
+                                                        ARRAY_SIZE(drained));
 
                     if (wants_msg) {
-                        if (do_strace) {
+                        if (got > 0) {
+                            got = prepend_workloop_req_event(
+                                wl_id, drained, got, ARRAY_SIZE(drained));
+                            if (do_strace) {
+                                fprintf(stderr,
+                                        "  workq_monitor: delivering %d "
+                                        "notification message event(s) on port "
+                                        "0x%x for wl=0x%llx\n",
+                                        got, (unsigned)events_qos[i].ident,
+                                        (unsigned long long)wl_id);
+                            }
+                            deliver_workloop_events_to_thread(wl_id, drained,
+                                                              got);
+                        } else if (do_strace) {
                             fprintf(stderr,
                                     "  workq_monitor: deferring message "
                                     "notification port 0x%x for wl=0x%llx until "
@@ -2055,38 +2229,18 @@ static void *workq_kqueue_monitor_func(void *arg)
                         goto rearm_machport_event;
                     }
 
-                    int got = prereceive_machport_drain(&events_qos[i],
-                                                        drained,
-                                                        ARRAY_SIZE(drained));
                     if (got > 0) {
-                        got = filter_workloop_notification_events(drained, got);
-                    }
-                    if (got > 0) {
-                        if (!wants_msg) {
-                            if (do_strace) {
-                                fprintf(stderr,
-                                        "  workq_monitor: delivering %d "
-                                        "notification event(s) on port 0x%x "
-                                        "for wl=0x%llx\n",
-                                        got,
-                                        (unsigned)events_qos[i].ident,
-                                        (unsigned long long)wl_id);
-                            }
-                            deliver_workloop_events_to_thread(wl_id, drained,
-                                                              got);
-                        } else {
-                            int stashed = stash_workloop_port_events(
-                                (mach_port_t)events_qos[i].ident, drained, got);
-                            if (do_strace) {
-                                fprintf(stderr,
-                                        "  workq_monitor: stashed %d deferred "
-                                        "notification event(s) on port 0x%x "
-                                        "for wl=0x%llx\n",
-                                        stashed,
-                                        (unsigned)events_qos[i].ident,
-                                        (unsigned long long)wl_id);
-                            }
+                        if (do_strace) {
+                            fprintf(stderr,
+                                    "  workq_monitor: delivering %d "
+                                    "notification event(s) on port 0x%x "
+                                    "for wl=0x%llx\n",
+                                    got,
+                                    (unsigned)events_qos[i].ident,
+                                    (unsigned long long)wl_id);
                         }
+                        deliver_workloop_events_to_thread(wl_id, drained,
+                                                          got);
                     } else if (do_strace) {
                         fprintf(stderr,
                                 "  workq_monitor: deferring workloop "
@@ -2102,26 +2256,50 @@ static void *workq_kqueue_monitor_func(void *arg)
                                                     drained,
                                                     ARRAY_SIZE(drained));
                 if (got == 0) {
-                    /* Pre-receive failed — deliver raw event anyway */
+                    if (wl_id) {
+                        WorkloopMachportState state =
+                            workloop_machport_state(
+                                (mach_port_t)events_qos[i].ident);
+                        if (state != WORKLOOP_MACHPORT_LIVE) {
+                            suppress_dead_workloop_machport_fallback(
+                                wl_id, (mach_port_t)events_qos[i].ident,
+                                "monitor", state);
+                        } else if (do_strace) {
+                            fprintf(stderr,
+                                    "  workq_monitor: dropped empty MACHPORT "
+                                    "event on port 0x%x for wl=0x%llx\n",
+                                    (unsigned)events_qos[i].ident,
+                                    (unsigned long long)wl_id);
+                        }
+                        goto rearm_machport_event;
+                    }
+                    /* Non-workloop consumers can still handle raw events. */
                     drained[0] = events_qos[i];
                     got = 1;
                 } else if (wl_id) {
-                    got = filter_workloop_notification_events(drained, got);
+                    if (!notification_port) {
+                        got = filter_workloop_notification_events(drained, got);
+                    }
                     if (got > 0 && !parked) {
                         got = prepend_workloop_req_event(
                             wl_id, drained, got, ARRAY_SIZE(drained));
                     } else if (got > 0 && parked) {
                         /*
-                         * Replay the zero-wake THREAD_REQUEST alongside the
-                         * MACHPORT events so the parked workloop thread sees
-                         * the same event shape XNU delivers.
+                         * Pair the persistent zero-wake request with these
+                         * MACHPORT events, but do not deliver it as a separate
+                         * event: libdispatch treats the real MACHPORT message
+                         * as the wakeup and only needs the pending request
+                         * consumed.
                          */
                         struct kevent_qos_s zero_wake_ev;
                         if (take_zero_wake_workloop_req(wl_id,
                                                         &zero_wake_ev)) {
-                            got = prepend_specific_workloop_req_event(
-                                &zero_wake_ev, drained, got,
-                                ARRAY_SIZE(drained));
+                            if (do_strace) {
+                                fprintf(stderr, "  workloop wl=0x%llx: "
+                                        "consumed returned THREAD_REQUEST "
+                                        "while grouping MACHPORT event(s)\n",
+                                        (unsigned long long)wl_id);
+                            }
                         }
                     }
                 }
@@ -2344,6 +2522,15 @@ static void deliver_workloop_events_to_thread(uint64_t workloop_id,
                                               struct kevent_qos_s *events,
                                               int nevents)
 {
+    if (nevents <= 0) {
+        if (do_strace) {
+            fprintf(stderr, "  workq_monitor: skipping empty workloop "
+                    "delivery wl=0x%llx\n",
+                    (unsigned long long)workloop_id);
+        }
+        return;
+    }
+
     /* Try to wake a parked workloop thread first */
     parked_workloop_wq *pw = NULL;
     pthread_mutex_lock(&parked_workloop_lock);
@@ -2361,31 +2548,21 @@ static void deliver_workloop_events_to_thread(uint64_t workloop_id,
 
     if (pw) {
         /*
-         * If a zero-wake THREAD_REQUEST is pending for this workloop
-         * (from a prior WQOPS_THREAD_WORKLOOP_RETURN), prepend it to
-         * the delivered events.  This ensures the parked thread sees
-         * the same THREAD_REQUEST + MACHPORT event shape that XNU
-         * delivers when a workloop's knote fires while a thread
-         * request is active.  Callers that already consumed the
-         * zero-wake (via prepare_workloop_events) will find nothing
-         * here — take_zero_wake_workloop_req is idempotent after
-         * consumption.
+         * If a zero-wake THREAD_REQUEST is pending for this workloop, consume
+         * it when real events arrive.  The real MACHPORT event is the wakeup;
+         * delivering the returned THREAD_REQUEST as a second event can make
+         * libdispatch replay stale workloop state.
          */
         struct kevent_qos_s zero_wake_ev;
-        bool prepend_zero = (nevents > 0 &&
+        bool consumed_zero = (nevents > 0 &&
             take_zero_wake_workloop_req(workloop_id, &zero_wake_ev));
-        int total = nevents + (prepend_zero ? 1 : 0);
+        int total = nevents;
 
         if (total > 0) {
             pw->delivered_events = g_malloc(
                 total * sizeof(struct kevent_qos_s));
-            int off = 0;
-            if (prepend_zero) {
-                pw->delivered_events[0] = zero_wake_ev;
-                off = 1;
-            }
             if (events && nevents > 0) {
-                memcpy(&pw->delivered_events[off], events,
+                memcpy(pw->delivered_events, events,
                        nevents * sizeof(struct kevent_qos_s));
             }
         } else {
@@ -2395,6 +2572,11 @@ static void deliver_workloop_events_to_thread(uint64_t workloop_id,
         pw->workloop_id = workloop_id;
 
         if (do_strace) {
+            if (consumed_zero) {
+                fprintf(stderr, "  workq_monitor: consumed returned "
+                        "THREAD_REQUEST for wl=0x%llx before wake\n",
+                        (unsigned long long)workloop_id);
+            }
             fprintf(stderr, "  workq_monitor: waking parked workloop "
                     "thread self=0x%lx wl=0x%llx with %d events\n",
                     (unsigned long)pw->self_addr,
@@ -5074,6 +5256,7 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
             kevent_translate_machport_ptrs(
                 (struct kevent_qos_s *)el, (int)ret, false);
         }
+        break;
     }
 
     case TARGET_MACOS_NR_kevent_id: {
@@ -5218,8 +5401,10 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                                                               events,
                                                               ARRAY_SIZE(events));
                             clear_pending_workloop_req(arg1);
-                            deliver_workloop_events_to_thread(arg1, events,
-                                                              nevents);
+                            if (nevents > 0) {
+                                deliver_workloop_events_to_thread(arg1, events,
+                                                                  nevents);
+                            }
                         } else {
                             /*
                              * No MACHPORT data available yet.  In XNU the
@@ -5246,8 +5431,10 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                                                           events,
                                                           ARRAY_SIZE(events));
                         clear_pending_workloop_req(arg1);
-                        deliver_workloop_events_to_thread(arg1, events,
-                                                          nevents);
+                        if (nevents > 0) {
+                            deliver_workloop_events_to_thread(arg1, events,
+                                                              nevents);
+                        }
                     } else {
                         add_pending_workloop_req(arg1, &wl_ev);
                         /* strace is printed inside add_pending_workloop_req

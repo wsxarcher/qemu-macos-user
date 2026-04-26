@@ -10,6 +10,7 @@
 #include "user/guest-host.h"
 #include "exec/tb-flush.h"
 #include "exec/translation-block.h"
+#include <mach/mach.h>
 #include <sys/ioctl.h>
 
 /* Environment list */
@@ -176,8 +177,14 @@ void service_workloop_machport_events(void);
 void mark_active_rcv_port(mach_port_t port);
 void unmark_active_rcv_port(mach_port_t port);
 bool is_port_active_rcv(mach_port_t port);
-void record_workq_notification_port(mach_port_t port, mach_port_t watched_port);
+void record_workq_notification_port(mach_port_t port, mach_port_t watched_port,
+                                    mach_msg_id_t msgid);
+bool is_workq_notification_port(mach_port_t port);
+void queue_workq_send_possible_notification(mach_port_t watched_port);
 void service_workq_notification_events(void);
+kern_return_t fixup_mig_reply_ool(void *reply_buf,
+                                  mach_msg_size_t reply_buf_size,
+                                  mach_port_name_t receive_set);
 
 static inline void begin_parallel_context(CPUState *cs)
 {
