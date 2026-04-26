@@ -925,6 +925,7 @@ int main(void) {
         rc, out, _ = _run_emulated(exe)
         self.assertEqual(rc, 0)
         self.assertIn(b"rc=0", out)
+        self.assertIn(b"thread_result=42", out)
 
     def test_dispatch_async(self):
         """dispatch_async on a global concurrent queue (GCD workqueue)."""
