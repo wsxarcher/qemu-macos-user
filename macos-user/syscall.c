@@ -873,6 +873,87 @@ done:
     pthread_mutex_unlock(&workq_machport_lock);
 }
 
+static void remove_workq_machport_template(mach_port_t port)
+{
+    bool removed = false;
+
+    pthread_mutex_lock(&workq_machport_lock);
+    for (int i = 0; i < workq_machport_count; i++) {
+        if (workq_machports[i].port == port) {
+            workq_machports[i] = workq_machports[--workq_machport_count];
+            removed = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&workq_machport_lock);
+
+    if (do_strace && removed) {
+        fprintf(stderr, "  removed workq MACHPORT template ident=0x%x\n",
+                (unsigned)port);
+    }
+}
+
+static void unregister_workq_notification_port(mach_port_t port)
+{
+    bool removed = false;
+
+    pthread_mutex_lock(&notification_port_lock);
+    for (int i = 0; i < notification_port_count; i++) {
+        if (notification_ports[i] == port) {
+            int last = --notification_port_count;
+            notification_ports[i] = notification_ports[last];
+            notification_watched_ports[i] = notification_watched_ports[last];
+            notification_msgids[i] = notification_msgids[last];
+            notification_send_possible_pending[i] =
+                notification_send_possible_pending[last];
+            removed = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&notification_port_lock);
+
+    if (do_strace && removed) {
+        fprintf(stderr, "  unregistered notification MACHPORT ident=0x%x\n",
+                (unsigned)port);
+    }
+}
+
+static void remove_workloop_port(mach_port_t port)
+{
+    struct kevent_qos_s stashed[MAX_STASHED_WORKLOOP_EVENTS];
+    int stashed_count = 0;
+    bool removed = false;
+    uint64_t wl_id = 0;
+
+    pthread_mutex_lock(&workloop_port_lock);
+    for (int i = 0; i < workloop_port_count; i++) {
+        if (workloop_ports[i].port == port) {
+            wl_id = workloop_ports[i].workloop_id;
+            stashed_count = workloop_ports[i].stashed_count;
+            if (stashed_count > 0) {
+                memcpy(stashed, workloop_ports[i].stashed_events,
+                       stashed_count * sizeof(stashed[0]));
+            }
+            workloop_ports[i] = workloop_ports[--workloop_port_count];
+            removed = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&workloop_port_lock);
+
+    for (int i = 0; i < stashed_count; i++) {
+        release_prereceived_workloop_event(&stashed[i]);
+    }
+
+    if (do_strace && removed) {
+        fprintf(stderr, "  workloop wl=0x%llx: removed MACHPORT ident=0x%x\n",
+                (unsigned long long)wl_id, (unsigned)port);
+    }
+
+    remove_workq_machport_template(port);
+    unregister_workq_notification_port(port);
+}
+
 static int stash_workloop_port_events(mach_port_t port,
                                       const struct kevent_qos_s *events,
                                       int nevents)
@@ -2851,11 +2932,23 @@ static void write_mach_thread_self_tsd_slot(abi_ulong tsd_base,
  */
 static void *guest_thread_func(void *arg)
 {
-    new_thread_info *info = arg;
+    new_thread_info *shared_info = arg;
+    new_thread_info local_info = *shared_info;
+    new_thread_info *info = &local_info;
     CPUArchState *env;
     CPUState *cpu;
     TaskState *ts;
     mach_port_t self_port;
+
+    /*
+     * The startup record lives on the creator's stack.  Copy it before any
+     * potentially blocking registration, then let the creator release
+     * clone_lock.  Otherwise an RCU/TCG registration stall can deadlock other
+     * guest threads that need to clone concurrently.
+     */
+    pthread_mutex_lock(&shared_info->mutex);
+    pthread_cond_broadcast(&shared_info->cond);
+    pthread_mutex_unlock(&shared_info->mutex);
 
     rcu_register_thread();
     tcg_register_thread();
@@ -2892,11 +2985,6 @@ static void *guest_thread_func(void *arg)
     write_mach_thread_self_tsd_slot(
         info->is_workqueue ? info->wq_tsd_base : info->tsd_base,
         self_port);
-
-    /* Signal parent that we're ready */
-    pthread_mutex_lock(&info->mutex);
-    pthread_cond_broadcast(&info->cond);
-    pthread_mutex_unlock(&info->mutex);
 
     /* Wait for parent to finish setup */
     pthread_mutex_lock(&clone_lock);
@@ -4798,7 +4886,11 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
 
                 for (int i = 0; cl && i < nchanges; i++) {
                     if (cl[i].filter == EVFILT_MACHPORT) {
-                        add_workloop_port(current_wl_id, &cl[i]);
+                        if (cl[i].flags & EV_DELETE) {
+                            remove_workloop_port((mach_port_t)cl[i].ident);
+                        } else {
+                            add_workloop_port(current_wl_id, &cl[i]);
+                        }
                     } else if (cl[i].filter == EVFILT_WORKLOOP_PRIVATE &&
                                (cl[i].fflags & NOTE_WL_THREAD_REQUEST)) {
                         store_pending_workloop_req(current_wl_id, &cl[i],
@@ -5339,6 +5431,17 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
 
             for (int i = 0; i < nchanges; i++) {
                 if (cl[i].filter == EVFILT_MACHPORT) {
+                    mach_port_t mp = (mach_port_t)cl[i].ident;
+                    if (cl[i].flags & EV_DELETE) {
+                        remove_workloop_port(mp);
+                        if (do_strace) {
+                            fprintf(stderr, "    MACHPORT ident=0x%llx"
+                                    " -> untrack wl=0x%llx\n",
+                                    (unsigned long long)cl[i].ident,
+                                    (unsigned long long)arg1);
+                        }
+                        continue;
+                    }
                     add_workloop_port(arg1, &cl[i]);
                     if (do_strace) {
                         fprintf(stderr, "    MACHPORT ident=0x%llx"
@@ -5350,7 +5453,6 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                      * the host kqueue now that the template is saved.
                      * record_workq_notification_port() may have been called
                      * before the template existed. */
-                    mach_port_t mp = (mach_port_t)cl[i].ident;
                     if (is_workq_notification_port(mp)) {
                         register_workq_notification_template(mp);
                     }
