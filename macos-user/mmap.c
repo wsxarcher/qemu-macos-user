@@ -26,6 +26,54 @@ static __thread int mmap_lock_count;
  */
 static abi_ulong guest_mmap_next = 0x400000000ULL;  /* 16 GiB */
 
+static int prot_to_page_flags(int prot)
+{
+    int page_flags = PAGE_VALID;
+
+    if (prot & PROT_READ) {
+        page_flags |= PAGE_READ;
+    }
+    if (prot & PROT_WRITE) {
+        page_flags |= PAGE_WRITE;
+    }
+    if (prot & PROT_EXEC) {
+        page_flags |= PAGE_EXEC;
+    }
+    return page_flags;
+}
+
+static abi_ulong find_guest_mmap_hole(abi_ulong hint, abi_ulong len,
+                                      abi_ulong align)
+{
+    abi_ulong min = hint ? hint : guest_mmap_next;
+    vaddr found;
+
+    min = ROUND_UP(min, align);
+    if (len - 1 > guest_addr_max || min > guest_addr_max - len + 1) {
+        if (hint && guest_mmap_next <= guest_addr_max - len + 1) {
+            min = ROUND_UP(guest_mmap_next, align);
+        } else {
+            return (abi_ulong)-1;
+        }
+    }
+
+    if (hint && min == ROUND_UP(hint, align) &&
+        min <= guest_addr_max - len + 1 &&
+        page_check_range_empty(min, min + len - 1)) {
+        return min;
+    }
+
+    found = page_find_range_empty(min, guest_addr_max, len, align);
+    if (found == (vaddr)-1 && hint) {
+        min = ROUND_UP(guest_mmap_next, align);
+        if (min <= guest_addr_max - len + 1) {
+            found = page_find_range_empty(min, guest_addr_max, len, align);
+        }
+    }
+
+    return found == (vaddr)-1 ? (abi_ulong)-1 : (abi_ulong)found;
+}
+
 void mmap_lock(void)
 {
     if (mmap_lock_count++ == 0) {
@@ -69,6 +117,8 @@ abi_long target_mmap(abi_ulong start, abi_ulong len, int prot,
 {
     void *ret;
     void *host_addr;
+    abi_ulong guest_hint = start;
+    bool bump_alloc = false;
 
     /*
      * Align to host page boundaries.  macOS on Apple Silicon uses 16 KB
@@ -85,23 +135,30 @@ abi_long target_mmap(abi_ulong start, abi_ulong len, int prot,
         return -TARGET_EINVAL;
     }
 
-    if (flags & MAP_FIXED) {
+    mmap_lock();
+
+    if (guest_base) {
+        /*
+         * The host has pre-reserved the whole guest VA range.  Therefore
+         * host mmap hints cannot be used directly: without MAP_FIXED the host
+         * would avoid the reservation and return an address outside the guest.
+         * Pick a free guest range ourselves, then materialise it with
+         * MAP_FIXED inside the reservation.
+         */
+        if (!(flags & MAP_FIXED)) {
+            start = find_guest_mmap_hole(start, len, page_size);
+            if (start == (abi_ulong)-1) {
+                mmap_unlock();
+                return -TARGET_ENOMEM;
+            }
+            bump_alloc = guest_hint == 0;
+        }
         host_addr = g2h_untagged(start);
-        /* Unmap any existing mapping at this host address */
-        munmap(host_addr, len);
+        flags |= MAP_FIXED;
+    } else if (flags & MAP_FIXED) {
+        host_addr = g2h_untagged(start);
     } else if (start != 0) {
         host_addr = g2h_untagged(start);
-    } else if (guest_base) {
-        /*
-         * No address hint with guest_base active: allocate from guest
-         * address space using a bump allocator.  The guest region was
-         * pre-reserved with PROT_NONE in main(), so MAP_FIXED here
-         * simply overwrites the reservation.
-         */
-        abi_ulong alloc = (guest_mmap_next + page_size - 1) & page_mask;
-        guest_mmap_next = alloc + len;
-        host_addr = g2h_untagged(alloc);
-        flags |= MAP_FIXED;
     } else {
         host_addr = NULL;
     }
@@ -117,16 +174,20 @@ abi_long target_mmap(abi_ulong start, abi_ulong len, int prot,
                     prot, flags, fd, host_addr,
                     (unsigned long long)guest_mmap_next, errno);
         }
+        mmap_unlock();
         return -TARGET_ENOMEM;
     }
 
     /* Register pages in QEMU's internal page table */
     abi_ulong guest_ret = h2g(ret);
-    int page_flags = PAGE_VALID;
-    if (prot & PROT_READ)  page_flags |= PAGE_READ;
-    if (prot & PROT_WRITE) page_flags |= PAGE_WRITE;
-    if (prot & PROT_EXEC)  page_flags |= PAGE_EXEC;
-    page_set_flags(guest_ret, guest_ret + len - 1, page_flags, ~0);
+    page_set_flags(guest_ret, guest_ret + len - 1,
+                   prot_to_page_flags(prot), ~0);
+
+    if (bump_alloc) {
+        guest_mmap_next = guest_ret + len;
+    }
+
+    mmap_unlock();
 
     return guest_ret;
 }
@@ -134,16 +195,38 @@ abi_long target_mmap(abi_ulong start, abi_ulong len, int prot,
 int target_munmap(abi_ulong start, abi_ulong len)
 {
     int ret;
+    abi_ulong page_size = MAX(TARGET_PAGE_SIZE,
+                              (abi_ulong)qemu_real_host_page_size());
+    abi_ulong page_mask = page_size - 1;
 
     /* Align to page boundaries */
-    start = TARGET_PAGE_ALIGN(start);
-    len = TARGET_PAGE_ALIGN(len);
+    if (start & page_mask) {
+        return -TARGET_EINVAL;
+    }
+    len = (len + page_size - 1) & ~page_mask;
 
     if (len == 0) {
         return -TARGET_EINVAL;
     }
 
-    ret = munmap(g2h_untagged(start), len);
+    mmap_lock();
+    if (guest_base) {
+        /*
+         * Keep the pre-reserved guest VA range backed by a host VMA.  Large
+         * PROT_NONE Mach reservations rely on later mprotect() demand-faults;
+         * a real munmap() would punch holes that mprotect() cannot promote.
+         */
+        void *addr = g2h_untagged(start);
+        void *got = mmap(addr, len, PROT_NONE,
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        ret = got == addr ? 0 : -1;
+    } else {
+        ret = munmap(g2h_untagged(start), len);
+    }
+    if (ret == 0) {
+        page_set_flags(start, start + len - 1, 0, ~0);
+    }
+    mmap_unlock();
     return ret == 0 ? 0 : -TARGET_EINVAL;
 }
 
@@ -159,7 +242,13 @@ int target_mprotect(abi_ulong start, abi_ulong len, int prot)
         return -TARGET_EINVAL;
     }
 
+    mmap_lock();
     ret = mprotect(g2h_untagged(start), len, prot);
+    if (ret == 0) {
+        page_set_flags(start, start + len - 1,
+                       prot_to_page_flags(prot), PAGE_RWX);
+    }
+    mmap_unlock();
     return ret == 0 ? 0 : -TARGET_EACCES;
 }
 
