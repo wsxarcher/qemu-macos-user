@@ -1765,6 +1765,63 @@ int main(void) {
         self.assertEqual(rc, 0, f"appkit_terminate failed: {decoded}")
         self.assertIn("terminate:didFinishLaunching", decoded)
 
+    _APPKIT_DIRECT_NSALERT_SRC = r'''
+#import <AppKit/AppKit.h>
+#include <signal.h>
+#include <stdio.h>
+
+int main(void) {
+    alarm(20);
+
+    @autoreleasepool {
+        fprintf(stderr, "nsalert:main\n");
+        NSApplication *app = [NSApplication sharedApplication];
+        fprintf(stderr, "nsalert:sharedApplication\n");
+        [app setActivationPolicy:NSApplicationActivationPolicyAccessory];
+
+        NSAlert *alert = [[NSAlert alloc] init];
+        [alert setMessageText:@"qemu-macos-user NSAlert"];
+        [alert setInformativeText:@"unbundled modal alert"];
+        [alert addButtonWithTitle:@"OK"];
+
+        NSWindow *window = [alert window];
+        [window setLevel:NSFloatingWindowLevel];
+        [window center];
+        [window makeKeyAndOrderFront:nil];
+        [NSApp activateIgnoringOtherApps:YES];
+        fprintf(stderr, "nsalert:window\n");
+
+        NSTimer *timer = [NSTimer timerWithTimeInterval:0.5 repeats:NO block:
+            ^(NSTimer *timer) {
+                (void)timer;
+                fprintf(stderr, "nsalert:auto-close\n");
+                [NSApp stopModalWithCode:NSModalResponseOK];
+            }];
+        [[NSRunLoop mainRunLoop] addTimer:timer
+                                  forMode:NSModalPanelRunLoopMode];
+
+        fprintf(stderr, "nsalert:runModal\n");
+        NSInteger result = [alert runModal];
+        printf("nsalert=result:%ld\n", (long)result);
+        fprintf(stderr, "nsalert:done\n");
+    }
+    return 0;
+}
+'''
+
+    def test_appkit_direct_nsalert_modal(self):
+        """Unbundled direct NSAlert modal opens and closes cleanly."""
+        exe = _compile_framework_test("appkit_direct_nsalert",
+                                      self._APPKIT_DIRECT_NSALERT_SRC,
+                                      ["AppKit"])
+        rc, out, err = _run_emulated(exe, timeout=25)
+        decoded = err.decode(errors="replace")
+        self.assertEqual(rc, 0, f"appkit_direct_nsalert failed: {decoded}")
+        self.assertIn(b"nsalert=result:1", out)
+        self.assertIn("nsalert:runModal", decoded)
+        self.assertIn("nsalert:auto-close", decoded)
+        self.assertIn("nsalert:done", decoded)
+
     # -- WindowServer query test (SkyLight framework) -----------------------
 
     _WS_QUERY_SRC = r'''

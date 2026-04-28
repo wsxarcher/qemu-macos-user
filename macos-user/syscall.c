@@ -600,6 +600,23 @@ static abi_ulong prereceive_one_msg_timeout(mach_port_t port,
  */
 #define MAX_PENDING_WL 128
 #define WORKLOOP_ACTIVE_STALE_NS (100ULL * 1000 * 1000)
+#define WORKLOOP_SYNC_WAKE_STALE_NS (2ULL * 1000 * 1000 * 1000)
+typedef struct {
+    uint64_t workloop_id;
+    mach_port_t waiter;
+    abi_ulong wait_addr;
+    uint64_t value;
+    bool wake_pending;
+    bool active;
+} active_ulock_sync_wait;
+
+typedef struct {
+    uint64_t workloop_id;
+    mach_port_t waiter;
+    uint64_t created_ns;
+    bool active;
+} pending_sync_wake;
+
 typedef struct {
     uint64_t workloop_id;
     struct kevent_qos_s template_event;
@@ -616,9 +633,9 @@ static uint64_t active_workloop_ids[MAX_PENDING_WL];
 static uint64_t active_workloop_since_ns[MAX_PENDING_WL];
 static int active_workloop_count = 0;
 static pthread_mutex_t active_workloop_lock = PTHREAD_MUTEX_INITIALIZER;
-static uint64_t pending_sync_wake_ids[MAX_PENDING_WL];
-static int pending_sync_wake_count = 0;
-static pthread_mutex_t pending_sync_wake_lock = PTHREAD_MUTEX_INITIALIZER;
+static active_ulock_sync_wait active_ulock_sync_waits[MAX_PENDING_WL];
+static pending_sync_wake pending_sync_wakes[MAX_PENDING_WL];
+static pthread_mutex_t active_ulock_sync_wait_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static uint64_t workloop_monotonic_time_ns(void)
 {
@@ -724,50 +741,224 @@ static bool is_workloop_active(uint64_t wl_id)
     return active;
 }
 
-static void record_workloop_sync_wake(uint64_t wl_id, const char *where)
+static mach_port_t current_guest_thread_port(CPUARMState *env)
 {
+    abi_ulong tsd_base = env ? env->cp15.tpidrro_el[0] : 0;
+
+    if (tsd_base && saved_mach_thread_self_offset) {
+        abi_ulong slot_addr = tsd_base + saved_mach_thread_self_offset;
+
+        if (guest_range_valid_untagged(slot_addr, sizeof(uint64_t))) {
+            uint64_t self_name = *(uint64_t *)g2h_untagged(slot_addr);
+
+            if (self_name != MACH_PORT_NULL && self_name <= UINT32_MAX) {
+                return (mach_port_t)self_name;
+            }
+        }
+    }
+
+    return MACH_PORT_NULL;
+}
+
+static void begin_active_ulock_sync_wait(uint64_t wl_id, mach_port_t waiter,
+                                         abi_ulong wait_addr, uint64_t value)
+{
+    int free_slot = -1;
+
+    if (!wl_id || waiter == MACH_PORT_NULL) {
+        return;
+    }
+
+    pthread_mutex_lock(&active_ulock_sync_wait_lock);
+    for (int i = 0; i < MAX_PENDING_WL; i++) {
+        active_ulock_sync_wait *wait = &active_ulock_sync_waits[i];
+
+        if (!wait->active) {
+            if (free_slot < 0) {
+                free_slot = i;
+            }
+            continue;
+        }
+        if (wait->workloop_id == wl_id && wait->waiter == waiter &&
+            wait->wait_addr == wait_addr) {
+            wait->value = value;
+            wait->wake_pending = false;
+            pthread_mutex_unlock(&active_ulock_sync_wait_lock);
+            return;
+        }
+    }
+    if (free_slot >= 0) {
+        active_ulock_sync_waits[free_slot] = (active_ulock_sync_wait) {
+            .workloop_id = wl_id,
+            .waiter = waiter,
+            .wait_addr = wait_addr,
+            .value = value,
+            .wake_pending = false,
+            .active = true,
+        };
+    }
+    pthread_mutex_unlock(&active_ulock_sync_wait_lock);
+}
+
+static void end_active_ulock_sync_wait(uint64_t wl_id, mach_port_t waiter,
+                                       abi_ulong wait_addr)
+{
+    if (!wl_id || waiter == MACH_PORT_NULL) {
+        return;
+    }
+
+    pthread_mutex_lock(&active_ulock_sync_wait_lock);
+    for (int i = 0; i < MAX_PENDING_WL; i++) {
+        active_ulock_sync_wait *wait = &active_ulock_sync_waits[i];
+
+        if (wait->active && wait->workloop_id == wl_id &&
+            wait->waiter == waiter && wait->wait_addr == wait_addr) {
+            wait->active = false;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&active_ulock_sync_wait_lock);
+}
+
+static void prune_pending_sync_wakes_locked(uint64_t now_ns)
+{
+    for (int i = 0; i < MAX_PENDING_WL; i++) {
+        pending_sync_wake *wake = &pending_sync_wakes[i];
+
+        if (wake->active &&
+            now_ns - wake->created_ns >= WORKLOOP_SYNC_WAKE_STALE_NS) {
+            wake->active = false;
+        }
+    }
+}
+
+static void queue_pending_sync_wake_locked(uint64_t wl_id, mach_port_t waiter,
+                                           uint64_t now_ns)
+{
+    int free_slot = -1;
+
+    prune_pending_sync_wakes_locked(now_ns);
+    for (int i = 0; i < MAX_PENDING_WL; i++) {
+        pending_sync_wake *wake = &pending_sync_wakes[i];
+
+        if (!wake->active) {
+            if (free_slot < 0) {
+                free_slot = i;
+            }
+            continue;
+        }
+        if (wake->workloop_id == wl_id && wake->waiter == waiter) {
+            wake->created_ns = now_ns;
+            return;
+        }
+    }
+    if (free_slot >= 0) {
+        pending_sync_wakes[free_slot] = (pending_sync_wake) {
+            .workloop_id = wl_id,
+            .waiter = waiter,
+            .created_ns = now_ns,
+            .active = true,
+        };
+    }
+}
+
+static bool take_pending_sync_wake_locked(uint64_t wl_id, mach_port_t waiter,
+                                          uint64_t now_ns)
+{
+    prune_pending_sync_wakes_locked(now_ns);
+    for (int i = 0; i < MAX_PENDING_WL; i++) {
+        pending_sync_wake *wake = &pending_sync_wakes[i];
+
+        if (wake->active && wake->workloop_id == wl_id &&
+            (wake->waiter == waiter || wake->waiter == MACH_PORT_NULL)) {
+            wake->active = false;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void record_workloop_sync_wake(uint64_t wl_id, mach_port_t waiter,
+                                      const char *where)
+{
+    bool matched = false;
+    bool queued = false;
+    uint64_t now_ns;
+
     if (!wl_id) {
         return;
     }
 
-    pthread_mutex_lock(&pending_sync_wake_lock);
-    for (int i = 0; i < pending_sync_wake_count; i++) {
-        if (pending_sync_wake_ids[i] == wl_id) {
-            pthread_mutex_unlock(&pending_sync_wake_lock);
-            return;
+    now_ns = workloop_monotonic_time_ns();
+    pthread_mutex_lock(&active_ulock_sync_wait_lock);
+    for (int i = 0; i < MAX_PENDING_WL; i++) {
+        active_ulock_sync_wait *wait = &active_ulock_sync_waits[i];
+
+        if (wait->active && wait->workloop_id == wl_id &&
+            (waiter == MACH_PORT_NULL || wait->waiter == waiter)) {
+            wait->wake_pending = true;
+            matched = true;
         }
     }
-    if (pending_sync_wake_count < MAX_PENDING_WL) {
-        pending_sync_wake_ids[pending_sync_wake_count++] = wl_id;
-        if (do_strace) {
-            fprintf(stderr, "  workloop wl=0x%llx: recorded sync wake from %s\n",
-                    (unsigned long long)wl_id, where);
-        }
+    if (!matched && waiter != MACH_PORT_NULL) {
+        queue_pending_sync_wake_locked(wl_id, waiter, now_ns);
+        queued = true;
     }
-    pthread_mutex_unlock(&pending_sync_wake_lock);
+    pthread_mutex_unlock(&active_ulock_sync_wait_lock);
+
+    if (do_strace) {
+        fprintf(stderr, "  workloop wl=0x%llx: sync wake waiter=0x%x from %s%s%s\n",
+                (unsigned long long)wl_id, (unsigned)waiter, where,
+                matched ? "" : " (no active ulock waiter)",
+                queued ? " queued" : "");
+    }
 }
 
-static bool consume_workloop_sync_wake(uint64_t wl_id)
+static bool consume_active_ulock_sync_wake(uint64_t wl_id, mach_port_t waiter,
+                                           abi_ulong wait_addr, uint64_t value,
+                                           const char *where)
 {
-    if (!wl_id) {
+    bool consume = false;
+
+    if (!wl_id || waiter == MACH_PORT_NULL) {
         return false;
     }
 
-    pthread_mutex_lock(&pending_sync_wake_lock);
-    for (int i = 0; i < pending_sync_wake_count; i++) {
-        if (pending_sync_wake_ids[i] == wl_id) {
-            pending_sync_wake_ids[i] =
-                pending_sync_wake_ids[--pending_sync_wake_count];
-            pthread_mutex_unlock(&pending_sync_wake_lock);
-            if (do_strace) {
-                fprintf(stderr, "  workloop wl=0x%llx: consumed pending "
-                        "sync wake\n", (unsigned long long)wl_id);
-            }
-            return true;
+    pthread_mutex_lock(&active_ulock_sync_wait_lock);
+    for (int i = 0; i < MAX_PENDING_WL; i++) {
+        active_ulock_sync_wait *wait = &active_ulock_sync_waits[i];
+
+        if (wait->active && wait->wake_pending &&
+            wait->workloop_id == wl_id && wait->waiter == waiter &&
+            wait->wait_addr == wait_addr && wait->value == value) {
+            wait->wake_pending = false;
+            consume = true;
+            break;
         }
     }
-    pthread_mutex_unlock(&pending_sync_wake_lock);
-    return false;
+    if (!consume) {
+        consume = take_pending_sync_wake_locked(
+            wl_id, waiter, workloop_monotonic_time_ns());
+    }
+    pthread_mutex_unlock(&active_ulock_sync_wait_lock);
+
+    if (!consume) {
+        return false;
+    }
+
+    if (guest_range_valid_untagged(wait_addr, sizeof(uint32_t))) {
+        *(uint32_t *)g2h_untagged(wait_addr) = 0;
+    }
+    if (do_strace) {
+        fprintf(stderr, "  ulock_wait: consuming active workloop sync wake%s%s "
+                "wl=0x%llx waiter=0x%x addr=0x%llx value=0x%llx\n",
+                where && where[0] ? " " : "",
+                where && where[0] ? where : "",
+                (unsigned long long)wl_id, (unsigned)waiter,
+                (unsigned long long)wait_addr,
+                (unsigned long long)value);
+    }
+    return true;
 }
 
 static void defer_active_workloop_events(uint64_t wl_id,
@@ -1341,8 +1532,10 @@ static void add_workloop_port(uint64_t wl_id,
     for (int i = 0; i < workloop_port_count; i++) {
         if (workloop_ports[i].port == port) {
             workloop_ports[i].workloop_id = wl_id;
-            workloop_ports[i].template_kev = *kev;
-            workloop_ports[i].has_template = true;
+            if (kev->flags & EV_ADD) {
+                workloop_ports[i].template_kev = *kev;
+                workloop_ports[i].has_template = true;
+            }
             if (kev->flags & (EV_ADD | EV_ENABLE)) {
                 workloop_ports[i].readiness_inflight = false;
             }
@@ -1351,7 +1544,7 @@ static void add_workloop_port(uint64_t wl_id,
             goto done;
         }
     }
-    if (workloop_port_count < MAX_WORKLOOP_PORTS) {
+    if ((kev->flags & EV_ADD) && workloop_port_count < MAX_WORKLOOP_PORTS) {
         workloop_ports[workloop_port_count].workloop_id = wl_id;
         workloop_ports[workloop_port_count].port = port;
         workloop_ports[workloop_port_count].template_kev = *kev;
@@ -1366,6 +1559,11 @@ static void add_workloop_port(uint64_t wl_id,
 
 done:
     if (!drop_synthetic) {
+        if (do_strace) {
+            fprintf(stderr, "  workloop wl=0x%llx: ignored MACHPORT "
+                    "state update for untracked ident=0x%x flags=0x%x\n",
+                    (unsigned long long)wl_id, (unsigned)port, kev->flags);
+        }
         return;
     }
 
@@ -2093,13 +2291,6 @@ void record_workq_notification_port(mach_port_t port, mach_port_t watched_port,
 
     if (workq_notification_port_has_real_template(port)) {
         register_workq_notification_template(port);
-        return;
-    }
-
-    synthesize_workq_notification_template(port);
-    if (do_strace) {
-        fprintf(stderr, "  synthesized notify MACHPORT template ident=0x%x "
-                "for manual polling\n", (unsigned)port);
     }
 }
 
@@ -4713,30 +4904,6 @@ static bool macos_signal_pending(CPUARMState *env)
     return qatomic_read(&ts->signal_pending) != 0;
 }
 
-static bool consume_workloop_sync_wake_for_ulock(uint64_t wl_id,
-                                                 abi_ulong wait_addr,
-                                                 uint64_t value,
-                                                 const char *where)
-{
-    if (!consume_workloop_sync_wake(wl_id)) {
-        return false;
-    }
-
-    if (guest_range_valid_untagged(wait_addr, sizeof(uint32_t))) {
-        *(uint32_t *)g2h_untagged(wait_addr) = 0;
-    }
-    if (do_strace) {
-        fprintf(stderr, "  ulock_wait: consuming workloop sync wake%s%s "
-                "wl=0x%llx addr=0x%llx value=0x%llx\n",
-                where && where[0] ? " " : "",
-                where && where[0] ? where : "",
-                (unsigned long long)wl_id,
-                (unsigned long long)wait_addr,
-                (unsigned long long)value);
-    }
-    return true;
-}
-
 static long interrupted_ulock_ret(uint32_t op)
 {
     if (op & TARGET_ULF_NO_ERRNO) {
@@ -6049,30 +6216,36 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
             uint64_t value = (uint64_t)arg3;
             uint32_t remaining_us = (uint32_t)arg4;
             bool indefinite = remaining_us == 0;
+            uint64_t wait_workloop = indefinite ? (uint64_t)arg5 : 0;
+            mach_port_t wait_thread = wait_workloop
+                ? current_guest_thread_port(env) : MACH_PORT_NULL;
+            bool active_sync_wait = wait_workloop &&
+                wait_thread != MACH_PORT_NULL;
             long rv;
             int host_errno = 0;
 
+            if (active_sync_wait) {
+                begin_active_ulock_sync_wait(wait_workloop, wait_thread,
+                                             (abi_ulong)arg2, value);
+            }
             do {
                 uint32_t slice_us = indefinite
                     ? WORKLOOP_BLOCKING_POLL_SLICE_MS * 1000
                     : MIN(remaining_us,
                           WORKLOOP_BLOCKING_POLL_SLICE_MS * 1000);
-                uint64_t wait_workloop = (uint64_t)arg5;
 
-                if (indefinite && wait_workloop &&
-                    consume_workloop_sync_wake_for_ulock(wait_workloop,
-                                                         (abi_ulong)arg2,
-                                                         value, "")) {
+                if (active_sync_wait &&
+                    consume_active_ulock_sync_wake(wait_workloop, wait_thread,
+                                                   (abi_ulong)arg2, value,
+                                                   "")) {
                     rv = 0;
                     break;
                 }
-
                 service_blocking_workloop_events();
-                if (indefinite && wait_workloop &&
-                    consume_workloop_sync_wake_for_ulock(wait_workloop,
-                                                         (abi_ulong)arg2,
-                                                         value,
-                                                         "after service")) {
+                if (active_sync_wait &&
+                    consume_active_ulock_sync_wake(wait_workloop, wait_thread,
+                                                   (abi_ulong)arg2, value,
+                                                   "after service")) {
                     rv = 0;
                     break;
                 }
@@ -6082,11 +6255,10 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                     break;
                 }
                 service_blocking_workloop_events();
-                if (indefinite && wait_workloop &&
-                    consume_workloop_sync_wake_for_ulock(wait_workloop,
-                                                         (abi_ulong)arg2,
-                                                         value,
-                                                         "after timeout")) {
+                if (active_sync_wait &&
+                    consume_active_ulock_sync_wake(wait_workloop, wait_thread,
+                                                   (abi_ulong)arg2, value,
+                                                   "after timeout")) {
                     rv = 0;
                     break;
                 }
@@ -6101,6 +6273,10 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                     remaining_us -= slice_us;
                 }
             } while (indefinite || remaining_us > 0);
+            if (active_sync_wait) {
+                end_active_ulock_sync_wait(wait_workloop, wait_thread,
+                                           (abi_ulong)arg2);
+            }
 
             ret = finish_ulock_syscall(env, rv, op);
         }
@@ -6682,7 +6858,8 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                             if (cl[i].fflags == NOTE_WL_THREAD_REQUEST &&
                                 (cl[i].ext[EV_EXTIDX_WL_VALUE] >> 56) == 0xff) {
                                 record_workloop_sync_wake(
-                                    current_wl_id, "workloop-return");
+                                    current_wl_id, MACH_PORT_NULL,
+                                    "workloop-return");
                             }
                             store_pending_workloop_req(current_wl_id, &cl[i],
                                                        true);
@@ -6696,14 +6873,10 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                     clear_workloop_readiness_inflight(current_wl_id);
                 }
 
-                if (cl && nchanges > 0) {
-                    int rc = workq_kqueue_register(cl, nchanges);
-                    if (do_strace) {
-                        fprintf(stderr,
-                            "  WQOPS_THREAD_WORKLOOP_RETURN: "
-                            "registered %d events -> %d\n",
-                            nchanges, rc);
-                    }
+                if (do_strace && cl && nchanges > 0) {
+                    fprintf(stderr,
+                            "  WQOPS_THREAD_WORKLOOP_RETURN: processed %d "
+                            "workloop state update(s)\n", nchanges);
                 }
 
                 parked_workloop_wq pw;
@@ -7575,7 +7748,9 @@ redispatch_kevent_thread:
                                   cl[i].fflags);
                     }
                     if (cl[i].fflags & NOTE_WL_SYNC_WAKE) {
-                        record_workloop_sync_wake(arg1, "sync-wake");
+                        record_workloop_sync_wake(arg1,
+                                                  (mach_port_t)cl[i].ident,
+                                                  "sync-wake");
                     }
                     set_workloop_sync_wake_inflight(arg1, false);
                     clear_workloop_readiness_inflight(arg1);
