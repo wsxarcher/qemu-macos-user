@@ -41,6 +41,7 @@ void *lock_user_string(abi_ulong guest_addr);
 /* Error handling */
 #define TARGET_EPERM        1
 #define TARGET_ENOENT       2
+#define TARGET_ESRCH        3
 #define TARGET_EINTR        4
 #define TARGET_ENOMEM       12
 #define TARGET_EACCES       13

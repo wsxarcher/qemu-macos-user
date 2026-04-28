@@ -629,6 +629,23 @@ int main(void) {
 }
 '''
 
+    _FOUNDATION_AUTOSAVE_SEARCH_SRC = r'''
+#import <Foundation/Foundation.h>
+#include <stdio.h>
+int main(void) {
+    @autoreleasepool {
+        NSArray<NSString *> *paths = NSSearchPathForDirectoriesInDomains(
+            NSAutosavedInformationDirectory, NSUserDomainMask, YES);
+        printf("autosave_count=%lu\n", (unsigned long)[paths count]);
+        if ([paths count] == 0) {
+            return 1;
+        }
+        printf("autosave_path=%s\n", [[paths objectAtIndex:0] UTF8String]);
+    }
+    return 0;
+}
+'''
+
     # --- CoreFoundation tests ---
 
     def test_cf_hello(self):
@@ -707,6 +724,16 @@ int main(void) {
         rc, out, _ = _run_emulated(exe)
         self.assertEqual(rc, 0)
         self.assertIn(b"hosts_exists=YES", out)
+
+    def test_foundation_autosave_search_path(self):
+        """Foundation autosave directory search path does not corrupt stack."""
+        exe = _compile_framework_test("foundation_autosave",
+                                      self._FOUNDATION_AUTOSAVE_SEARCH_SRC,
+                                      ["Foundation"])
+        rc, out, err = _run_emulated(exe)
+        self.assertEqual(rc, 0, err.decode(errors="replace"))
+        self.assertIn(b"autosave_count=1", out)
+        self.assertIn(b"Autosave Information", out)
 
     # --- Advanced Foundation tests ---
 
