@@ -961,6 +961,100 @@ static kern_return_t host_mach_msg2_trap(
     return (kern_return_t)x0;
 }
 
+#define MAX_MK_TIMER_PORTS 64
+
+typedef struct MkTimerPortState {
+    bool known;
+    bool active;
+    mach_port_name_t port;
+    uint64_t deadline;
+} MkTimerPortState;
+
+static MkTimerPortState mk_timer_ports[MAX_MK_TIMER_PORTS];
+static pthread_mutex_t mk_timer_port_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void record_mk_timer_create(mach_port_name_t port)
+{
+    int slot = -1;
+
+    if (port == MACH_PORT_NULL) {
+        return;
+    }
+
+    pthread_mutex_lock(&mk_timer_port_lock);
+    for (int i = 0; i < MAX_MK_TIMER_PORTS; i++) {
+        if (mk_timer_ports[i].known && mk_timer_ports[i].port == port) {
+            slot = i;
+            break;
+        }
+        if (slot < 0 && !mk_timer_ports[i].known) {
+            slot = i;
+        }
+    }
+    if (slot >= 0) {
+        mk_timer_ports[slot] = (MkTimerPortState) {
+            .known = true,
+            .active = false,
+            .port = port,
+            .deadline = 0,
+        };
+    }
+    pthread_mutex_unlock(&mk_timer_port_lock);
+}
+
+static void record_mk_timer_arm(mach_port_name_t port, uint64_t deadline)
+{
+    int slot = -1;
+
+    if (port == MACH_PORT_NULL) {
+        return;
+    }
+
+    pthread_mutex_lock(&mk_timer_port_lock);
+    for (int i = 0; i < MAX_MK_TIMER_PORTS; i++) {
+        if (mk_timer_ports[i].known && mk_timer_ports[i].port == port) {
+            slot = i;
+            break;
+        }
+        if (slot < 0 && !mk_timer_ports[i].known) {
+            slot = i;
+        }
+    }
+    if (slot >= 0) {
+        mk_timer_ports[slot] = (MkTimerPortState) {
+            .known = true,
+            .active = true,
+            .port = port,
+            .deadline = deadline,
+        };
+    }
+    pthread_mutex_unlock(&mk_timer_port_lock);
+}
+
+static void record_mk_timer_cancel(mach_port_name_t port)
+{
+    pthread_mutex_lock(&mk_timer_port_lock);
+    for (int i = 0; i < MAX_MK_TIMER_PORTS; i++) {
+        if (mk_timer_ports[i].known && mk_timer_ports[i].port == port) {
+            mk_timer_ports[i].active = false;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&mk_timer_port_lock);
+}
+
+static void record_mk_timer_destroy(mach_port_name_t port)
+{
+    pthread_mutex_lock(&mk_timer_port_lock);
+    for (int i = 0; i < MAX_MK_TIMER_PORTS; i++) {
+        if (mk_timer_ports[i].known && mk_timer_ports[i].port == port) {
+            mk_timer_ports[i] = (MkTimerPortState) { 0 };
+            break;
+        }
+    }
+    pthread_mutex_unlock(&mk_timer_port_lock);
+}
+
 /*
  * Raw mk_timer traps via inline assembly.
  * mk_timer_create returns a port name (not kern_return_t).
@@ -2026,12 +2120,13 @@ mach_vm_remap_done:
  * We patch the embedded pointer(s) before forwarding the message.
  *
  * Known routines:
- *   2880  io_connect_method
+ *   2865/2880  io_connect_method
  *         Variable layout: selector(4) + scalar_input(var) + inband_input(var)
  *         + ool_input(8) + ool_input_size(8) + counts(8) + ool_output(8)
- *   2881  io_connect_async_method
- *         Same as 2880 but prepended with body(4) + port_desc(12) + NDR(8)
- *         + reference[8](64) + selector(4); scalar_inputCnt at offset 116.
+ *   2866/2881  io_connect_async_method
+ *         Same as io_connect_method, prepended with body(4) + port_desc(12)
+ *         + NDR(8) + reference[8](64) + selector(4); scalar_inputCnt at
+ *         offset 116.
  *   2888  io_registry_entry_get_properties_bin_buf
  *         Request: Head(24) + NDR(8) + buf(8) + bufsize(8) = 48
  *         buf at offset 32 (mach_vm_address_t)
@@ -2047,7 +2142,9 @@ static void fixup_mig_request_addrs(void *msg_buf, uint32_t send_size)
     }
 
     switch (hdr->msgh_id) {
+    case 2865:
     case 2880:   /* io_connect_method */
+    case 2866:
     case 2881: { /* io_connect_async_method */
         /*
          * io_connect_method — variable layout (pack(4)):
@@ -2065,7 +2162,7 @@ static void fixup_mig_request_addrs(void *msg_buf, uint32_t send_size)
          */
         uint8_t *p = (uint8_t *)hdr;
         uint32_t off;
-        if (hdr->msgh_id == 2881) {
+        if (hdr->msgh_id == 2866 || hdr->msgh_id == 2881) {
             if (send_size < 136) break;
             off = 116;  /* Head+body+port_desc+NDR+ref[8]+selector */
         } else {
@@ -4369,8 +4466,17 @@ vec_after_receive:
                                 vec_reply_size, do_strace);
                         }
                     }
-                    /* Restore OOL descriptor addresses in send buffer */
-                    restore_send_ool(&ool_sv);
+                    /*
+                     * A successful send+receive may overwrite the original
+                     * request buffer with a complex reply.  In that case the
+                     * saved OOL descriptor slots now belong to the reply, so
+                     * restoring the request addresses would corrupt the reply
+                     * descriptors before the guest destroys them.
+                     */
+                    if (!(ret == KERN_SUCCESS && (vec_opts & 0x2) &&
+                          vec_reply_buf == msg_buf)) {
+                        restore_send_ool(&ool_sv);
+                    }
                     ool_save_destroy(&ool_sv);
                 }
 
@@ -4439,10 +4545,10 @@ vec_after_receive:
                             shdr->msgh_size != direct_send_size) {
                             direct_orig_msgh_size = shdr->msgh_size;
                             shdr->msgh_size = direct_send_size;
-                            direct_patched_msgh_size = true;
-                        }
-                        fixup_mig_request_addrs(host_data,
-                            direct_send_size);
+                        direct_patched_msgh_size = true;
+                    }
+                    fixup_mig_request_addrs(host_data,
+                        direct_send_size);
                         fixup_send_ool(host_data,
                             direct_send_size, &ool_sv);
                         normalize_launchservices_lookup(host_data,
@@ -4842,7 +4948,15 @@ direct_after_receive:
                         !(ret == KERN_SUCCESS && (options & 0x2))) {
                         direct_shdr->msgh_size = direct_orig_msgh_size;
                     }
-                    restore_send_ool(&ool_sv);
+                    /*
+                     * Direct mach_msg2 send+receive uses one buffer for both
+                     * the request and reply.  If the receive succeeded, the
+                     * reply has replaced the request and must keep the OOL
+                     * descriptors installed by fixup_mig_reply_ool().
+                     */
+                    if (!(ret == KERN_SUCCESS && (options & 0x2))) {
+                        restore_send_ool(&ool_sv);
+                    }
                     ool_save_destroy(&ool_sv);
                 }
             }
@@ -4912,6 +5026,7 @@ direct_after_receive:
     case MACH_TRAP_MK_TIMER_CREATE:
         /* mk_timer_create — returns a port name, not kern_return_t */
         ret = (abi_long)host_mk_timer_create();
+        record_mk_timer_create((mach_port_name_t)ret);
         if (do_strace) {
             fprintf(stderr, "  mk_timer_create -> port=0x%lx\n",
                     (unsigned long)ret);
@@ -4921,6 +5036,9 @@ direct_after_receive:
     case MACH_TRAP_MK_TIMER_DESTROY:
         /* mk_timer_destroy(name) */
         ret = host_mk_timer_destroy((mach_port_name_t)arg1);
+        if (ret == KERN_SUCCESS) {
+            record_mk_timer_destroy((mach_port_name_t)arg1);
+        }
         if (do_strace) {
             fprintf(stderr, "  mk_timer_destroy(0x%lx) -> %ld\n",
                     (unsigned long)arg1, (long)ret);
@@ -4935,6 +5053,9 @@ direct_after_receive:
                     (unsigned long long)arg2);
         }
         ret = host_mk_timer_arm((mach_port_name_t)arg1, (uint64_t)arg2);
+        if (ret == KERN_SUCCESS) {
+            record_mk_timer_arm((mach_port_name_t)arg1, (uint64_t)arg2);
+        }
         if (do_strace) {
             fprintf(stderr, "  mk_timer_arm -> %ld\n", (long)ret);
         }
@@ -4953,6 +5074,9 @@ direct_after_receive:
                                        (uint64_t)arg2,
                                        (uint64_t)arg3,
                                        (uint64_t)arg4);
+        if (ret == KERN_SUCCESS) {
+            record_mk_timer_arm((mach_port_name_t)arg1, (uint64_t)arg3);
+        }
         if (do_strace) {
             fprintf(stderr, "  mk_timer_arm_leeway -> %ld\n", (long)ret);
         }
@@ -4963,6 +5087,9 @@ direct_after_receive:
         {
             uint64_t result_time = 0;
             ret = host_mk_timer_cancel((mach_port_name_t)arg1, &result_time);
+            if (ret == KERN_SUCCESS) {
+                record_mk_timer_cancel((mach_port_name_t)arg1);
+            }
             if (ret == KERN_SUCCESS && arg2) {
                 memcpy(g2h_untagged(arg2), &result_time, sizeof(result_time));
             }
