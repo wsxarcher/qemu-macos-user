@@ -5473,10 +5473,26 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
         /* gettid(uint64_t *thread_id, int who) — get thread ID */
         {
             uint64_t tid;
-            pthread_threadid_np(NULL, &tid);
-            if (arg1) {
-                *(uint64_t *)g2h_untagged(arg1) = tid;
+            if (!arg1) {
+                ret = -TARGET_EINVAL;
+                break;
             }
+            ret = 0;
+            switch ((int)arg2) {
+            case 1:
+                pthread_threadid_np(NULL, &tid);
+                break;
+            case 2:
+                tid = getpid();
+                break;
+            default:
+                ret = -TARGET_ESRCH;
+                break;
+            }
+            if (ret < 0) {
+                break;
+            }
+            *(uint64_t *)g2h_untagged(arg1) = tid;
             ret = 0;
         }
         break;
