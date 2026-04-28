@@ -1775,6 +1775,20 @@ static bool trans_B_cond(DisasContext *s, arg_B_cond *a)
     return true;
 }
 
+static TCGv_i64 strip_branch_target_if_pauth_inactive(DisasContext *s,
+                                                      TCGv_i64 dst)
+{
+    TCGv_i64 truedst;
+
+    if (s->pauth_active) {
+        return dst;
+    }
+
+    truedst = tcg_temp_new_i64();
+    gen_helper_xpaci(truedst, tcg_env, dst);
+    return truedst;
+}
+
 static void set_btype_for_br(DisasContext *s, int rn)
 {
     if (dc_isar_feature(aa64_bti, s)) {
@@ -1800,21 +1814,26 @@ static void set_btype_for_blr(DisasContext *s)
 
 static bool trans_BR(DisasContext *s, arg_r *a)
 {
+    TCGv_i64 target = strip_branch_target_if_pauth_inactive(s,
+                                                            cpu_reg(s, a->rn));
+
     set_btype_for_br(s, a->rn);
-    gen_a64_set_pc(s, cpu_reg(s, a->rn));
+    gen_a64_set_pc(s, target);
     s->base.is_jmp = DISAS_JUMP;
     return true;
 }
 
 static bool trans_BLR(DisasContext *s, arg_r *a)
 {
+    TCGv_i64 target = strip_branch_target_if_pauth_inactive(s,
+                                                            cpu_reg(s, a->rn));
     TCGv_i64 link = tcg_temp_new_i64();
 
     gen_pc_plus_diff(s, link, 4);
     if (s->gcs_en) {
         gen_add_gcs_record(s, link);
     }
-    gen_a64_set_pc(s, cpu_reg(s, a->rn));
+    gen_a64_set_pc(s, target);
     tcg_gen_mov_i64(cpu_reg(s, 30), link);
 
     set_btype_for_blr(s);
@@ -1824,7 +1843,8 @@ static bool trans_BLR(DisasContext *s, arg_r *a)
 
 static bool trans_RET(DisasContext *s, arg_r *a)
 {
-    TCGv_i64 target = cpu_reg(s, a->rn);
+    TCGv_i64 target = strip_branch_target_if_pauth_inactive(s,
+                                                            cpu_reg(s, a->rn));
 
     if (s->gcs_en) {
         gen_load_check_gcs_record(s, target, GCS_IT_RET_nPauth, a->rn);
@@ -1845,7 +1865,9 @@ static TCGv_i64 auth_branch_target(DisasContext *s, TCGv_i64 dst,
      * done and the code removed from the high bits.
      */
     if (!s->pauth_active) {
-        return dst;
+        truedst = tcg_temp_new_i64();
+        gen_helper_xpaci(truedst, tcg_env, dst);
+        return truedst;
     }
 
     truedst = tcg_temp_new_i64();
@@ -8803,22 +8825,64 @@ static bool gen_pacaut(DisasContext *s, arg_pacaut *a, NeonGenTwo64OpEnvFn fn)
     return true;
 }
 
+static bool do_aut(DisasContext *s, arg_pacaut *a, NeonGenTwo64OpEnvFn fn,
+                   bool data)
+{
+    TCGv_i64 tcg_rd, tcg_rn;
+
+    if (a->z) {
+        if (a->rn != 31) {
+            return false;
+        }
+        tcg_rn = tcg_constant_i64(0);
+    } else {
+        tcg_rn = cpu_reg_sp(s, a->rn);
+    }
+    if (s->pauth_active) {
+        tcg_rd = cpu_reg(s, a->rd);
+        fn(tcg_rd, tcg_env, tcg_rd, tcg_rn);
+    } else {
+        /*
+         * macOS user-mode runs arm64 processes with an arm64e shared cache.
+         * XNU disables guest PAC generation for arm64 ABI processes, but
+         * shared-cache AUT instructions still have to strip authenticated
+         * data/code pointers before libdispatch and dyld dereference them.
+         */
+        tcg_rd = cpu_reg(s, a->rd);
+        if (data) {
+            gen_helper_xpacd(tcg_rd, tcg_env, tcg_rd);
+        } else {
+            gen_helper_xpaci(tcg_rd, tcg_env, tcg_rd);
+        }
+    }
+    return true;
+}
+
+static bool gen_aut_i(DisasContext *s, arg_pacaut *a, NeonGenTwo64OpEnvFn fn)
+{
+    return do_aut(s, a, fn, false);
+}
+
+static bool gen_aut_d(DisasContext *s, arg_pacaut *a, NeonGenTwo64OpEnvFn fn)
+{
+    return do_aut(s, a, fn, true);
+}
+
 TRANS_FEAT(PACIA, aa64_pauth, gen_pacaut, a, gen_helper_pacia)
 TRANS_FEAT(PACIB, aa64_pauth, gen_pacaut, a, gen_helper_pacib)
 TRANS_FEAT(PACDA, aa64_pauth, gen_pacaut, a, gen_helper_pacda)
 TRANS_FEAT(PACDB, aa64_pauth, gen_pacaut, a, gen_helper_pacdb)
 
-TRANS_FEAT(AUTIA, aa64_pauth, gen_pacaut, a, gen_helper_autia)
-TRANS_FEAT(AUTIB, aa64_pauth, gen_pacaut, a, gen_helper_autib)
-TRANS_FEAT(AUTDA, aa64_pauth, gen_pacaut, a, gen_helper_autda)
-TRANS_FEAT(AUTDB, aa64_pauth, gen_pacaut, a, gen_helper_autdb)
+TRANS_FEAT(AUTIA, aa64_pauth, gen_aut_i, a, gen_helper_autia)
+TRANS_FEAT(AUTIB, aa64_pauth, gen_aut_i, a, gen_helper_autib)
+TRANS_FEAT(AUTDA, aa64_pauth, gen_aut_d, a, gen_helper_autda)
+TRANS_FEAT(AUTDB, aa64_pauth, gen_aut_d, a, gen_helper_autdb)
 
 static bool do_xpac(DisasContext *s, int rd, NeonGenOne64OpEnvFn *fn)
 {
-    if (s->pauth_active) {
-        TCGv_i64 tcg_rd = cpu_reg(s, rd);
-        fn(tcg_rd, tcg_env, tcg_rd);
-    }
+    TCGv_i64 tcg_rd = cpu_reg(s, rd);
+
+    fn(tcg_rd, tcg_env, tcg_rd);
     return true;
 }
 

@@ -468,7 +468,7 @@ uint64_t HELPER(pacia)(CPUARMState *env, uint64_t x, uint64_t y)
 {
     int el = arm_current_el(env);
     if (!pauth_key_enabled(env, el, SCTLR_EnIA)) {
-        return x;
+        return pauth_strip(env, x, false);
     }
     pauth_check_trap(env, el, GETPC());
     return pauth_addpac(env, x, y, &env->keys.apia, false);
@@ -478,7 +478,7 @@ uint64_t HELPER(pacib)(CPUARMState *env, uint64_t x, uint64_t y)
 {
     int el = arm_current_el(env);
     if (!pauth_key_enabled(env, el, SCTLR_EnIB)) {
-        return x;
+        return pauth_strip(env, x, false);
     }
     pauth_check_trap(env, el, GETPC());
     return pauth_addpac(env, x, y, &env->keys.apib, false);
@@ -488,7 +488,7 @@ uint64_t HELPER(pacda)(CPUARMState *env, uint64_t x, uint64_t y)
 {
     int el = arm_current_el(env);
     if (!pauth_key_enabled(env, el, SCTLR_EnDA)) {
-        return x;
+        return pauth_strip(env, x, true);
     }
     pauth_check_trap(env, el, GETPC());
     return pauth_addpac(env, x, y, &env->keys.apda, true);
@@ -498,7 +498,7 @@ uint64_t HELPER(pacdb)(CPUARMState *env, uint64_t x, uint64_t y)
 {
     int el = arm_current_el(env);
     if (!pauth_key_enabled(env, el, SCTLR_EnDB)) {
-        return x;
+        return pauth_strip(env, x, true);
     }
     pauth_check_trap(env, el, GETPC());
     return pauth_addpac(env, x, y, &env->keys.apdb, true);
