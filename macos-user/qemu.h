@@ -106,6 +106,8 @@ struct TaskState {
     abi_ulong wq_stack_top;
     abi_ulong wq_stack_bottom;
     abi_ulong wq_tsd_base;
+    uint64_t active_workloop_id;
+    bool wq_event_manager;
 } __attribute__((aligned(16)));
 
 abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,

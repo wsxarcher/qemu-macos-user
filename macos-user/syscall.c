@@ -30,6 +30,33 @@
 
 /* csops is a private syscall, declare it here */
 extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
+#define CS_OPS_DER_ENTITLEMENTS_BLOB 16
+
+static const uint8_t qemu_macos_user_der_entitlements[] = {
+    0xfa, 0xde, 0x71, 0x72, 0x00, 0x00, 0x00, 0xd9,
+    0x31, 0x81, 0xce, 0x30, 0x32, 0x0c, 0x2d, 'c',
+    'o', 'm', '.', 'a', 'p', 'p', 'l', 'e', '.', 'p',
+    'r', 'i', 'v', 'a', 't', 'e', '.', 'x', 'p', 'c',
+    '.', 'l', 'a', 'u', 'n', 'c', 'h', 'd', '.', 'p',
+    'e', 'r', '-', 'u', 's', 'e', 'r', '-', 'l', 'o',
+    'o', 'k', 'u', 'p', 0x01, 0x01, 0x01, 0x30, 0x24,
+    0x0c, 0x1f, 'c', 'o', 'm', '.', 'a', 'p', 'p',
+    'l', 'e', '.', 's', 'e', 'c', 'u', 'r', 'i', 't',
+    'y', '.', 'c', 's', '.', 'a', 'l', 'l', 'o', 'w',
+    '-', 'j', 'i', 't', 0x01, 0x01, 0x01, 0x30, 0x3b,
+    0x0c, 0x36, 'c', 'o', 'm', '.', 'a', 'p', 'p',
+    'l', 'e', '.', 's', 'e', 'c', 'u', 'r', 'i', 't',
+    'y', '.', 'c', 's', '.', 'a', 'l', 'l', 'o', 'w',
+    '-', 'u', 'n', 's', 'i', 'g', 'n', 'e', 'd', '-',
+    'e', 'x', 'e', 'c', 'u', 't', 'a', 'b', 'l', 'e',
+    '-', 'm', 'e', 'm', 'o', 'r', 'y', 0x01, 0x01,
+    0x01, 0x30, 0x35, 0x0c, 0x30, 'c', 'o', 'm', '.',
+    'a', 'p', 'p', 'l', 'e', '.', 's', 'e', 'c', 'u',
+    'r', 'i', 't', 'y', '.', 'c', 's', '.', 'd', 'i',
+    's', 'a', 'b', 'l', 'e', '-', 'l', 'i', 'b', 'r',
+    'a', 'r', 'y', '-', 'v', 'a', 'l', 'i', 'd', 'a',
+    't', 'i', 'o', 'n', 0x01, 0x01, 0x01,
+};
 
 /*
  * Private kevent_qos_s structure (not in public headers).
@@ -143,10 +170,50 @@ static int get_workq_kqueue(void)
  * afterward so libdispatch sees its own addresses.
  */
 #define EVFILT_MACHPORT (-8)
+#define EVFILT_TIMER_PRIVATE (-7)
+#define EVFILT_USER_PRIVATE (-10)
 #define EVFILT_WORKLOOP_PRIVATE (-17)
 #define NOTE_WL_THREAD_REQUEST 0x00000001
-#define NOTE_WL_SYNC_WAIT      0x00000010
-#define NOTE_WL_SYNC_IPC       0x00000100
+#define NOTE_WL_SYNC_WAIT      0x00000004
+#define NOTE_WL_SYNC_WAKE      0x00000008
+#define NOTE_WL_UPDATE_QOS     0x00000010
+#define NOTE_WL_END_OWNERSHIP  0x00000020
+#define NOTE_WL_DISCOVER_OWNER 0x00000080
+#define NOTE_WL_IGNORE_ESTALE  0x00000100
+#define NOTE_WL_SYNC_IPC       0x80000000
+#define EV_EXTIDX_WL_ADDR      1
+#define EV_EXTIDX_WL_MASK      2
+#define EV_EXTIDX_WL_VALUE     3
+
+static int refresh_workloop_state_update(struct kevent_qos_s *kev)
+{
+    uint64_t addr;
+    uint64_t mask;
+    uint64_t expected;
+    uint64_t current;
+
+    if (kev->filter != EVFILT_WORKLOOP_PRIVATE) {
+        return 0;
+    }
+
+    addr = kev->ext[EV_EXTIDX_WL_ADDR];
+    mask = kev->ext[EV_EXTIDX_WL_MASK];
+    if (!addr) {
+        return 0;
+    }
+    if (!guest_range_valid_untagged(addr, sizeof(current))) {
+        return EFAULT;
+    }
+
+    expected = kev->ext[EV_EXTIDX_WL_VALUE];
+    current = *(uint64_t *)g2h_untagged(addr);
+    kev->ext[EV_EXTIDX_WL_VALUE] = current;
+
+    if (mask && ((current & mask) != (expected & mask))) {
+        return ESTALE;
+    }
+    return 0;
+}
 
 static void kevent_translate_machport_ptrs(struct kevent_qos_s *kev,
                                            int count, bool to_host)
@@ -249,6 +316,9 @@ typedef struct {
     struct kevent_qos_s template_kev;
     bool has_template;
     bool sync_wake_inflight;
+    bool readiness_inflight;
+    mach_port_seqno_t readiness_seqno;
+    mach_port_msgcount_t readiness_msgcount;
     struct kevent_qos_s stashed_events[MAX_STASHED_WORKLOOP_EVENTS];
     int stashed_count;
 } workloop_port_entry;
@@ -279,48 +349,168 @@ static pthread_mutex_t workq_machport_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /*
  * Global active-receive port guard.  When a guest thread is inside a
- * mach_msg2 receive-only on a port, that port is registered here so
- * that *all* threads' prereceive paths skip it.  Without this, a
+ * mach_msg2 receive on a port, that port is registered here so that
+ * *all* threads' prereceive paths skip it.  Without this, a
  * service_pending_workloop_reqs() call on a different thread (e.g.
- * __semwait_signal) can steal the reply message the receiver is
- * waiting for, causing an eventual IPC timeout and port-died teardown.
+ * __semwait_signal) can steal the reply message the receiver is waiting
+ * for, causing an eventual IPC timeout and port-died teardown.
  */
-#define MAX_ACTIVE_RCV_PORTS 8
-static mach_port_t active_rcv_ports[MAX_ACTIVE_RCV_PORTS];
+#define MAX_ACTIVE_RCV_PORTS 128
+#define MAX_ACTIVE_RCV_GROUPS 16
+#define MAX_ACTIVE_RCV_GROUP_PORTS 64
+
+typedef struct ActiveRcvPort {
+    mach_port_t port;
+    unsigned int refs;
+} ActiveRcvPort;
+
+typedef struct ActiveRcvGroup {
+    mach_port_t root;
+    mach_port_t ports[MAX_ACTIVE_RCV_GROUP_PORTS];
+    int count;
+} ActiveRcvGroup;
+
+static ActiveRcvPort active_rcv_ports[MAX_ACTIVE_RCV_PORTS];
 static int active_rcv_count;
+static ActiveRcvGroup active_rcv_groups[MAX_ACTIVE_RCV_GROUPS];
+static int active_rcv_group_count;
 static pthread_mutex_t active_rcv_lock = PTHREAD_MUTEX_INITIALIZER;
 
-void mark_active_rcv_port(mach_port_t port)
+static void active_rcv_collect_ports(mach_port_t port, mach_port_t *ports,
+                                     int *count, int max_count)
 {
-    if (port == MACH_PORT_NULL) {
+    mach_port_type_t ptype = 0;
+    mach_port_name_array_t members = NULL;
+    mach_msg_type_number_t member_count = 0;
+
+    if (port == MACH_PORT_NULL || max_count <= 0) {
         return;
     }
-    pthread_mutex_lock(&active_rcv_lock);
+
+    ports[(*count)++] = port;
+    if (*count >= max_count ||
+        mach_port_type(mach_task_self(), port, &ptype) != KERN_SUCCESS ||
+        !(ptype & MACH_PORT_TYPE_PORT_SET)) {
+        return;
+    }
+
+    if (mach_port_get_set_status(mach_task_self(), port, &members,
+                                 &member_count) != KERN_SUCCESS) {
+        return;
+    }
+
+    for (mach_msg_type_number_t i = 0; i < member_count && *count < max_count;
+         i++) {
+        bool seen = false;
+
+        for (int j = 0; j < *count; j++) {
+            if (ports[j] == members[i]) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) {
+            ports[(*count)++] = members[i];
+        }
+    }
+
+    if (members) {
+        vm_deallocate(mach_task_self(), (vm_address_t)members,
+                      member_count * sizeof(*members));
+    }
+}
+
+static void active_rcv_add_locked(mach_port_t port)
+{
     for (int i = 0; i < active_rcv_count; i++) {
-        if (active_rcv_ports[i] == port) {
-            pthread_mutex_unlock(&active_rcv_lock);
+        if (active_rcv_ports[i].port == port) {
+            active_rcv_ports[i].refs++;
             return;
         }
     }
     if (active_rcv_count < MAX_ACTIVE_RCV_PORTS) {
-        active_rcv_ports[active_rcv_count++] = port;
+        active_rcv_ports[active_rcv_count].port = port;
+        active_rcv_ports[active_rcv_count].refs = 1;
+        active_rcv_count++;
+    }
+}
+
+static void active_rcv_remove_locked(mach_port_t port)
+{
+    for (int i = 0; i < active_rcv_count; i++) {
+        if (active_rcv_ports[i].port != port) {
+            continue;
+        }
+        if (active_rcv_ports[i].refs > 1) {
+            active_rcv_ports[i].refs--;
+        } else {
+            active_rcv_ports[i] = active_rcv_ports[--active_rcv_count];
+        }
+        return;
+    }
+}
+
+void mark_active_rcv_port(mach_port_t port)
+{
+    mach_port_t ports[MAX_ACTIVE_RCV_GROUP_PORTS];
+    int count = 0;
+
+    active_rcv_collect_ports(port, ports, &count, ARRAY_SIZE(ports));
+    if (count == 0) {
+        return;
+    }
+
+    pthread_mutex_lock(&active_rcv_lock);
+    for (int i = 0; i < count; i++) {
+        active_rcv_add_locked(ports[i]);
+    }
+    if (active_rcv_group_count < MAX_ACTIVE_RCV_GROUPS) {
+        ActiveRcvGroup *group = &active_rcv_groups[active_rcv_group_count++];
+
+        group->root = port;
+        group->count = count;
+        memcpy(group->ports, ports, count * sizeof(ports[0]));
     }
     pthread_mutex_unlock(&active_rcv_lock);
 }
 
 void unmark_active_rcv_port(mach_port_t port)
 {
+    mach_port_t fallback_ports[MAX_ACTIVE_RCV_GROUP_PORTS];
+    int fallback_count = 0;
+    ActiveRcvGroup group;
+    bool found_group = false;
+
     if (port == MACH_PORT_NULL) {
         return;
     }
+
     pthread_mutex_lock(&active_rcv_lock);
-    for (int i = 0; i < active_rcv_count; i++) {
-        if (active_rcv_ports[i] == port) {
-            active_rcv_ports[i] = active_rcv_ports[--active_rcv_count];
+    for (int i = active_rcv_group_count - 1; i >= 0; i--) {
+        if (active_rcv_groups[i].root == port) {
+            group = active_rcv_groups[i];
+            active_rcv_groups[i] =
+                active_rcv_groups[--active_rcv_group_count];
+            found_group = true;
             break;
         }
     }
+    if (found_group) {
+        for (int i = 0; i < group.count; i++) {
+            active_rcv_remove_locked(group.ports[i]);
+        }
+    }
     pthread_mutex_unlock(&active_rcv_lock);
+
+    if (!found_group) {
+        active_rcv_collect_ports(port, fallback_ports, &fallback_count,
+                                 ARRAY_SIZE(fallback_ports));
+        pthread_mutex_lock(&active_rcv_lock);
+        for (int i = 0; i < fallback_count; i++) {
+            active_rcv_remove_locked(fallback_ports[i]);
+        }
+        pthread_mutex_unlock(&active_rcv_lock);
+    }
 }
 
 bool is_port_active_rcv(mach_port_t port)
@@ -331,7 +521,7 @@ bool is_port_active_rcv(mach_port_t port)
     bool found = false;
     pthread_mutex_lock(&active_rcv_lock);
     for (int i = 0; i < active_rcv_count; i++) {
-        if (active_rcv_ports[i] == port) {
+        if (active_rcv_ports[i].port == port) {
             found = true;
             break;
         }
@@ -346,6 +536,7 @@ static void deliver_kevents_to_thread(struct kevent_qos_s *events,
 static void deliver_workloop_events_to_thread(uint64_t workloop_id,
                                               struct kevent_qos_s *events,
                                               int nevents);
+static bool has_exact_parked_workloop_thread(uint64_t workloop_id);
 static bool has_parked_workloop_thread(uint64_t workloop_id);
 bool is_workq_notification_port(mach_port_t port);
 static void register_workq_notification_template(mach_port_t port);
@@ -364,9 +555,16 @@ static int prereceive_machport_drain_port_timeout(
     struct kevent_qos_s *out_events,
     int max_events,
     mach_msg_timeout_t timeout_ms);
+static int drain_notification_machport_events(
+    struct kevent_qos_s *template_kev,
+    struct kevent_qos_s *out_events,
+    int max_events,
+    mach_msg_timeout_t timeout_ms);
 static int stash_workloop_port_events(mach_port_t port,
                                       const struct kevent_qos_s *events,
                                       int nevents);
+static void cache_workloop_req_template(uint64_t wl_id,
+                                        const struct kevent_qos_s *ev);
 static void set_workloop_sync_wake_inflight(uint64_t wl_id, bool inflight);
 static void clear_pending_workloop_req(uint64_t wl_id);
 static int take_stashed_workloop_events(uint64_t wl_id,
@@ -376,12 +574,22 @@ static int prepare_workloop_events(uint64_t wl_id,
                                    bool prepend_thread_req,
                                    const struct kevent_qos_s *fallback_ev,
                                    struct kevent_qos_s *out_events,
-                                   int max_events);
+                                   int max_events,
+                                   bool allow_active_prereceive);
+static int prepare_workloop_events_ex(uint64_t wl_id,
+                                      bool prepend_thread_req,
+                                      const struct kevent_qos_s *fallback_ev,
+                                      struct kevent_qos_s *out_events,
+                                      int max_events,
+                                      bool allow_active_prereceive,
+                                      bool park_only_fallback);
 static void kqos_to_k64(const struct kevent_qos_s *src,
                         struct kevent64_s *dst);
 static abi_ulong prereceive_one_msg_timeout(mach_port_t port,
                                             mach_msg_size_t hint,
-                                            mach_msg_timeout_t timeout_ms);
+                                            uint32_t receive_flags,
+                                            mach_msg_timeout_t timeout_ms,
+                                            mach_msg_size_t *received_size_out);
 
 /*
  * Pending workloop thread requests.  Instead of immediately creating
@@ -390,7 +598,8 @@ static abi_ulong prereceive_one_msg_timeout(mach_port_t port,
  * __semwait_signal detects the main thread is blocked waiting for
  * serial queue work.
  */
-#define MAX_PENDING_WL 16
+#define MAX_PENDING_WL 128
+#define WORKLOOP_ACTIVE_STALE_NS (100ULL * 1000 * 1000)
 typedef struct {
     uint64_t workloop_id;
     struct kevent_qos_s template_event;
@@ -403,6 +612,178 @@ typedef struct {
 static pending_workloop_req pending_wl_reqs[MAX_PENDING_WL];
 static int pending_wl_count = 0;
 static pthread_mutex_t pending_wl_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t active_workloop_ids[MAX_PENDING_WL];
+static uint64_t active_workloop_since_ns[MAX_PENDING_WL];
+static int active_workloop_count = 0;
+static pthread_mutex_t active_workloop_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t pending_sync_wake_ids[MAX_PENDING_WL];
+static int pending_sync_wake_count = 0;
+static pthread_mutex_t pending_sync_wake_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static uint64_t workloop_monotonic_time_ns(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+static bool mark_workloop_active(uint64_t wl_id)
+{
+    if (!wl_id) {
+        return true;
+    }
+
+    pthread_mutex_lock(&active_workloop_lock);
+    for (int i = 0; i < active_workloop_count; i++) {
+        if (active_workloop_ids[i] == wl_id) {
+            pthread_mutex_unlock(&active_workloop_lock);
+            return false;
+        }
+    }
+    if (active_workloop_count < MAX_PENDING_WL) {
+        active_workloop_ids[active_workloop_count] = wl_id;
+        active_workloop_since_ns[active_workloop_count] =
+            workloop_monotonic_time_ns();
+        active_workloop_count++;
+    }
+    pthread_mutex_unlock(&active_workloop_lock);
+    return true;
+}
+
+static void clear_workloop_active(uint64_t wl_id)
+{
+    if (!wl_id) {
+        return;
+    }
+
+    pthread_mutex_lock(&active_workloop_lock);
+    for (int i = 0; i < active_workloop_count; i++) {
+        if (active_workloop_ids[i] == wl_id) {
+            active_workloop_ids[i] =
+                active_workloop_ids[--active_workloop_count];
+            active_workloop_since_ns[i] =
+                active_workloop_since_ns[active_workloop_count];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&active_workloop_lock);
+}
+
+static bool clear_stale_workloop_active(uint64_t wl_id, const char *where)
+{
+    bool cleared = false;
+    uint64_t now_ns;
+
+    if (!wl_id) {
+        return false;
+    }
+
+    now_ns = workloop_monotonic_time_ns();
+    pthread_mutex_lock(&active_workloop_lock);
+    for (int i = 0; i < active_workloop_count; i++) {
+        if (active_workloop_ids[i] == wl_id &&
+            now_ns - active_workloop_since_ns[i] >= WORKLOOP_ACTIVE_STALE_NS) {
+            uint64_t age_ms =
+                (now_ns - active_workloop_since_ns[i]) / 1000000ULL;
+
+            active_workloop_ids[i] =
+                active_workloop_ids[--active_workloop_count];
+            active_workloop_since_ns[i] =
+                active_workloop_since_ns[active_workloop_count];
+            cleared = true;
+            if (do_strace) {
+                fprintf(stderr, "  workloop wl=0x%llx: clearing stale active "
+                        "owner after %llums in %s\n",
+                        (unsigned long long)wl_id,
+                        (unsigned long long)age_ms, where);
+            }
+            break;
+        }
+    }
+    pthread_mutex_unlock(&active_workloop_lock);
+    return cleared;
+}
+
+static bool is_workloop_active(uint64_t wl_id)
+{
+    bool active = false;
+
+    if (!wl_id) {
+        return false;
+    }
+
+    pthread_mutex_lock(&active_workloop_lock);
+    for (int i = 0; i < active_workloop_count; i++) {
+        if (active_workloop_ids[i] == wl_id) {
+            active = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&active_workloop_lock);
+    return active;
+}
+
+static void record_workloop_sync_wake(uint64_t wl_id, const char *where)
+{
+    if (!wl_id) {
+        return;
+    }
+
+    pthread_mutex_lock(&pending_sync_wake_lock);
+    for (int i = 0; i < pending_sync_wake_count; i++) {
+        if (pending_sync_wake_ids[i] == wl_id) {
+            pthread_mutex_unlock(&pending_sync_wake_lock);
+            return;
+        }
+    }
+    if (pending_sync_wake_count < MAX_PENDING_WL) {
+        pending_sync_wake_ids[pending_sync_wake_count++] = wl_id;
+        if (do_strace) {
+            fprintf(stderr, "  workloop wl=0x%llx: recorded sync wake from %s\n",
+                    (unsigned long long)wl_id, where);
+        }
+    }
+    pthread_mutex_unlock(&pending_sync_wake_lock);
+}
+
+static bool consume_workloop_sync_wake(uint64_t wl_id)
+{
+    if (!wl_id) {
+        return false;
+    }
+
+    pthread_mutex_lock(&pending_sync_wake_lock);
+    for (int i = 0; i < pending_sync_wake_count; i++) {
+        if (pending_sync_wake_ids[i] == wl_id) {
+            pending_sync_wake_ids[i] =
+                pending_sync_wake_ids[--pending_sync_wake_count];
+            pthread_mutex_unlock(&pending_sync_wake_lock);
+            if (do_strace) {
+                fprintf(stderr, "  workloop wl=0x%llx: consumed pending "
+                        "sync wake\n", (unsigned long long)wl_id);
+            }
+            return true;
+        }
+    }
+    pthread_mutex_unlock(&pending_sync_wake_lock);
+    return false;
+}
+
+static void defer_active_workloop_events(uint64_t wl_id,
+                                         struct kevent_qos_s *events,
+                                         int nevents)
+{
+    for (int i = 0; events && i < nevents; i++) {
+        if (events[i].filter == EVFILT_MACHPORT) {
+            stash_workloop_port_events((mach_port_t)events[i].ident,
+                                       &events[i], 1);
+        } else if (events[i].filter == EVFILT_WORKLOOP_PRIVATE &&
+                   (events[i].fflags & NOTE_WL_THREAD_REQUEST)) {
+            cache_workloop_req_template(wl_id, &events[i]);
+        }
+    }
+}
 
 static pending_workloop_req *find_pending_workloop_req_locked(uint64_t wl_id)
 {
@@ -422,6 +803,11 @@ static pending_workloop_req *ensure_pending_workloop_req_locked(uint64_t wl_id)
         return entry;
     }
     if (pending_wl_count >= MAX_PENDING_WL) {
+        if (do_strace) {
+            fprintf(stderr, "  workloop wl=0x%llx: pending request table full "
+                    "(%d entries)\n", (unsigned long long)wl_id,
+                    pending_wl_count);
+        }
         return NULL;
     }
 
@@ -446,6 +832,17 @@ static void refresh_workloop_req_value(struct kevent_qos_s *ev)
         }
         uint64_t *dq_state_p = (uint64_t *)g2h_untagged(ev->ext[1]);
         ev->ext[3] = *dq_state_p;
+    }
+}
+
+static void refresh_workloop_delivery_values(struct kevent_qos_s *events,
+                                             int nevents)
+{
+    for (int i = 0; events && i < nevents; i++) {
+        if (events[i].filter == EVFILT_WORKLOOP_PRIVATE &&
+            (events[i].fflags & NOTE_WL_THREAD_REQUEST)) {
+            refresh_workloop_req_value(&events[i]);
+        }
     }
 }
 
@@ -474,7 +871,7 @@ static void cache_workloop_req_template(uint64_t wl_id,
 }
 
 static bool lookup_workloop_req_template(uint64_t wl_id,
-                                         struct kevent_qos_s *out_ev)
+                                            struct kevent_qos_s *out_ev)
 {
     bool found = false;
 
@@ -495,39 +892,54 @@ static bool lookup_workloop_req_template(uint64_t wl_id,
     return found;
 }
 
-static int prepend_specific_workloop_req_event(const struct kevent_qos_s *wl_ev,
-                                               struct kevent_qos_s *events,
-                                               int nevents,
-                                               int max_events)
+static bool take_active_workloop_req(uint64_t wl_id,
+                                     struct kevent_qos_s *out_ev)
 {
-    if (nevents <= 0 || nevents >= max_events) {
-        return nevents;
-    }
+    bool found = false;
 
-    memmove(&events[1], &events[0], nevents * sizeof(events[0]));
-    events[0] = *wl_ev;
-    return nevents + 1;
+    pthread_mutex_lock(&pending_wl_lock);
+    for (int i = pending_wl_count - 1; i >= 0; i--) {
+        if (pending_wl_reqs[i].workloop_id == wl_id &&
+            pending_wl_reqs[i].active &&
+            !pending_wl_reqs[i].zero_wake) {
+            *out_ev = pending_wl_reqs[i].event;
+            pending_wl_reqs[i].active = false;
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&pending_wl_lock);
+
+    if (found) {
+        refresh_workloop_req_value(out_ev);
+    }
+    return found;
 }
 
 static int prepend_workloop_req_event(uint64_t wl_id,
+                                      const struct kevent_qos_s *fallback_ev,
                                       struct kevent_qos_s *events,
                                       int nevents,
                                       int max_events)
 {
     struct kevent_qos_s wl_ev;
 
-    if (nevents <= 0 || nevents >= max_events ||
-        !lookup_workloop_req_template(wl_id, &wl_ev)) {
+    if (nevents <= 0 || nevents >= max_events) {
         return nevents;
     }
 
-    nevents = prepend_specific_workloop_req_event(&wl_ev, events, nevents,
-                                                  max_events);
+    if (fallback_ev) {
+        wl_ev = *fallback_ev;
+        refresh_workloop_req_value(&wl_ev);
+    } else if (!take_active_workloop_req(wl_id, &wl_ev)) {
+        return nevents;
+    }
+    (void)wl_ev;
 
     if (do_strace) {
-        fprintf(stderr, "  workloop wl=0x%llx: prepended THREAD_REQUEST "
-                "to %d MACHPORT event(s)\n",
-                (unsigned long long)wl_id, nevents - 1);
+        fprintf(stderr, "  workloop wl=0x%llx: consumed THREAD_REQUEST "
+                "while delivering %d MACHPORT event(s)\n",
+                (unsigned long long)wl_id, nevents);
     }
     return nevents;
 }
@@ -580,7 +992,7 @@ static bool template_needs_prereceived_msg(const struct kevent_qos_s *template_k
     }
 
     dst = (const guest_dispatch_source_type *)g2h_untagged(dst_addr);
-    if (do_strace && template_kev->fflags) {
+    if (do_strace) {
         fprintf(stderr, "  machport template ident=0x%llx udata=0x%llx "
                 "dst=0x%llx dst_filter=%d fflags=0x%x merge_msg=0x%llx\n",
                 (unsigned long long)template_kev->ident,
@@ -601,12 +1013,11 @@ static uint16_t machport_runtime_event_flags(uint16_t flags)
 {
     /*
      * Replay the kernel/runtime delivery shape, not the latest guest rearm
-     * changelist. Workloop rearms often replace EV_ADD with bookkeeping bits
-     * like EV_UDATA_SPECIFIC/EV_VANISHED, but subsequent delivered MACHPORT
-     * events still need the active dispatch shape that libdispatch saw on the
-     * first delivery.
+     * changelist. Workloop rearms often replace EV_ADD with bookkeeping bits,
+     * but delivered MACHPORT events still need the active dispatch shape that
+     * libdispatch saw on the first delivery.
      */
-    flags &= ~(uint16_t)(EV_DELETE | EV_DISABLE |
+    flags &= ~(uint16_t)(EV_DELETE | EV_DISABLE | EV_ONESHOT |
                          EV_UDATA_SPECIFIC | EV_VANISHED);
     flags |= EV_ADD | EV_ENABLE | EV_DISPATCH;
     return flags;
@@ -620,8 +1031,19 @@ static bool machport_has_pending_message(mach_port_t port)
 
     kr = mach_port_get_attributes(mach_task_self(), port,
                                   MACH_PORT_RECEIVE_STATUS,
-                                  (mach_port_info_t)&status, &count);
+                                   (mach_port_info_t)&status, &count);
     return kr == KERN_SUCCESS && status.mps_msgcount > 0;
+}
+
+static bool machport_get_receive_status(mach_port_t port,
+                                        mach_port_status_t *status)
+{
+    mach_msg_type_number_t count = MACH_PORT_RECEIVE_STATUS_COUNT;
+
+    return mach_port_get_attributes(mach_task_self(), port,
+                                    MACH_PORT_RECEIVE_STATUS,
+                                    (mach_port_info_t)status,
+                                    &count) == KERN_SUCCESS;
 }
 
 static void release_prereceived_workloop_event(struct kevent_qos_s *event)
@@ -662,6 +1084,53 @@ static bool workloop_event_is_mach_notification(
 
     gh = (mach_msg_header_t *)g2h_untagged((abi_ulong)event->ext[0]);
     return is_mach_notification_msg(gh);
+}
+
+static bool workq_notification_accepts_msgid(mach_port_t port,
+                                             mach_msg_id_t msgid)
+{
+    bool accepts = false;
+
+    pthread_mutex_lock(&notification_port_lock);
+    for (int i = 0; i < notification_port_count; i++) {
+        if (notification_ports[i] == port &&
+            notification_msgids[i] == msgid) {
+            accepts = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&notification_port_lock);
+    return accepts;
+}
+
+static int filter_workq_notification_events(mach_port_t port,
+                                            struct kevent_qos_s *events,
+                                            int nevents)
+{
+    int out = 0;
+
+    for (int i = 0; i < nevents; i++) {
+        if (workloop_event_is_mach_notification(&events[i])) {
+            mach_msg_header_t *gh =
+                (mach_msg_header_t *)g2h_untagged((abi_ulong)events[i].ext[0]);
+
+            if (!workq_notification_accepts_msgid(port, gh->msgh_id)) {
+                if (do_strace) {
+                    fprintf(stderr, "  workq notification port 0x%x: "
+                            "dropping unexpected Mach notification id=%u\n",
+                            (unsigned)port, gh->msgh_id);
+                }
+                release_prereceived_workloop_event(&events[i]);
+                continue;
+            }
+        }
+        if (out != i) {
+            events[out] = events[i];
+        }
+        out++;
+    }
+
+    return out;
 }
 
 static int filter_workloop_notification_events(struct kevent_qos_s *events,
@@ -754,14 +1223,34 @@ static void add_pending_workloop_req(uint64_t wl_id,
             struct kevent_qos_s events[16];
             int nevents = prepare_workloop_events(wl_id, true, &fresh_ev,
                                                   events,
-                                                  ARRAY_SIZE(events));
-            deliver_workloop_events_to_thread(wl_id, events, nevents);
+                                                  ARRAY_SIZE(events), false);
+            if (nevents > 0) {
+                deliver_workloop_events_to_thread(wl_id, events, nevents);
+            } else {
+                store_pending_workloop_req(wl_id, &fresh_ev, true);
+            }
             return;
         }
     }
     /* First request — defer */
     pthread_mutex_unlock(&pending_wl_lock);
     store_pending_workloop_req(wl_id, ev, false);
+}
+
+static bool workloop_has_machport_template(uint64_t wl_id)
+{
+    bool found = false;
+
+    pthread_mutex_lock(&workloop_port_lock);
+    for (int i = 0; i < workloop_port_count; i++) {
+        if (workloop_ports[i].workloop_id == wl_id &&
+            workloop_ports[i].has_template) {
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&workloop_port_lock);
+    return found;
 }
 
 static void clear_pending_workloop_req(uint64_t wl_id)
@@ -815,10 +1304,22 @@ void service_pending_workloop_reqs(void)
                     "wl=0x%llx\n", (unsigned long long)wl_id);
         }
         struct kevent_qos_s events[16];
-        int nevents = prepare_workloop_events(wl_id, true,
-                                              &ev, events,
-                                              ARRAY_SIZE(events));
+        int nevents = prepare_workloop_events(wl_id, true, &ev, events,
+                                               ARRAY_SIZE(events), false);
         if (nevents == 0) {
+            if (!(ev.fflags & NOTE_WL_SYNC_WAIT) &&
+                !workloop_has_machport_template(wl_id)) {
+                events[0] = ev;
+                deliver_workloop_events_to_thread(wl_id, events, 1);
+                pthread_mutex_lock(&pending_wl_lock);
+                continue;
+            }
+            if (do_strace) {
+                fprintf(stderr, "  workloop wl=0x%llx: preserving pending "
+                        "THREAD_REQUEST until real work arrives\n",
+                        (unsigned long long)wl_id);
+            }
+            store_pending_workloop_req(wl_id, &ev, true);
             pthread_mutex_lock(&pending_wl_lock);
             continue;
         }
@@ -842,6 +1343,9 @@ static void add_workloop_port(uint64_t wl_id,
             workloop_ports[i].workloop_id = wl_id;
             workloop_ports[i].template_kev = *kev;
             workloop_ports[i].has_template = true;
+            if (kev->flags & (EV_ADD | EV_ENABLE)) {
+                workloop_ports[i].readiness_inflight = false;
+            }
             pthread_mutex_unlock(&workloop_port_lock);
             drop_synthetic = true;
             goto done;
@@ -852,6 +1356,9 @@ static void add_workloop_port(uint64_t wl_id,
         workloop_ports[workloop_port_count].port = port;
         workloop_ports[workloop_port_count].template_kev = *kev;
         workloop_ports[workloop_port_count].has_template = true;
+        workloop_ports[workloop_port_count].readiness_inflight = false;
+        workloop_ports[workloop_port_count].readiness_seqno = 0;
+        workloop_ports[workloop_port_count].readiness_msgcount = 0;
         workloop_port_count++;
         drop_synthetic = true;
     }
@@ -918,6 +1425,23 @@ static void unregister_workq_notification_port(mach_port_t port)
     }
 }
 
+static void unregister_workq_kqueue_machport(mach_port_t port)
+{
+    struct kevent64_s k64;
+    int kq = get_workq_kqueue();
+
+    memset(&k64, 0, sizeof(k64));
+    k64.ident = port;
+    k64.filter = EVFILT_MACHPORT;
+    k64.flags = EV_DELETE;
+
+    int rc = kevent64(kq, &k64, 1, NULL, 0, 0, NULL);
+    if (do_strace && rc < 0 && errno != ENOENT) {
+        fprintf(stderr, "  workq_kqueue_unregister: MACHPORT ident=0x%x "
+                "failed errno=%d\n", (unsigned)port, errno);
+    }
+}
+
 static void remove_workloop_port(mach_port_t port)
 {
     struct kevent_qos_s stashed[MAX_STASHED_WORKLOOP_EVENTS];
@@ -950,6 +1474,9 @@ static void remove_workloop_port(mach_port_t port)
                 (unsigned long long)wl_id, (unsigned)port);
     }
 
+    if (removed) {
+        unregister_workq_kqueue_machport(port);
+    }
     remove_workq_machport_template(port);
     unregister_workq_notification_port(port);
 }
@@ -995,14 +1522,26 @@ static void set_workloop_sync_wake_inflight(uint64_t wl_id, bool inflight)
     pthread_mutex_unlock(&workloop_port_lock);
 }
 
+static void clear_workloop_readiness_inflight(uint64_t wl_id)
+{
+    pthread_mutex_lock(&workloop_port_lock);
+    for (int i = 0; i < workloop_port_count; i++) {
+        if (wl_id == 0 || workloop_ports[i].workloop_id == wl_id) {
+            workloop_ports[i].readiness_inflight = false;
+        }
+    }
+    pthread_mutex_unlock(&workloop_port_lock);
+}
+
 static int take_stashed_workloop_events(uint64_t wl_id,
                                         struct kevent_qos_s *out_events,
                                         int max_events)
 {
     int total = 0;
+    int delivery_limit = MIN(max_events, 1);
 
     pthread_mutex_lock(&workloop_port_lock);
-    for (int i = 0; i < workloop_port_count && total < max_events; i++) {
+    for (int i = 0; i < workloop_port_count && total < delivery_limit; i++) {
         int take;
 
         if (workloop_ports[i].workloop_id != wl_id ||
@@ -1010,7 +1549,7 @@ static int take_stashed_workloop_events(uint64_t wl_id,
             continue;
         }
 
-        take = MIN(workloop_ports[i].stashed_count, max_events - total);
+        take = MIN(workloop_ports[i].stashed_count, delivery_limit - total);
         memcpy(&out_events[total], workloop_ports[i].stashed_events,
                take * sizeof(out_events[0]));
         total += take;
@@ -1057,6 +1596,92 @@ static uint64_t find_workloop_for_port(mach_port_t port)
     }
     pthread_mutex_unlock(&workloop_port_lock);
     return wl_id;
+}
+
+static bool workloop_template_is_readiness_only(
+    const struct kevent_qos_s *template_kev)
+{
+    return template_kev->filter == EVFILT_MACHPORT &&
+           (template_kev->flags & EV_DISPATCH) &&
+           !is_workq_notification_port((mach_port_t)template_kev->ident) &&
+           !template_needs_prereceived_msg(template_kev);
+}
+
+static bool suppress_workloop_readiness_delivery(
+    const struct kevent_qos_s *template_kev)
+{
+    mach_port_t port = (mach_port_t)template_kev->ident;
+    mach_port_status_t status = {0};
+    bool suppress = false;
+
+    if (!workloop_template_is_readiness_only(template_kev) ||
+        !machport_get_receive_status(port, &status)) {
+        return false;
+    }
+
+    if (status.mps_msgcount == 0) {
+        pthread_mutex_lock(&workloop_port_lock);
+        for (int i = 0; i < workloop_port_count; i++) {
+            if (workloop_ports[i].port == port) {
+                workloop_ports[i].readiness_inflight = false;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&workloop_port_lock);
+        return false;
+    }
+
+    pthread_mutex_lock(&workloop_port_lock);
+    for (int i = 0; i < workloop_port_count; i++) {
+        if (workloop_ports[i].port == port &&
+            workloop_ports[i].readiness_inflight &&
+            workloop_ports[i].readiness_seqno == status.mps_seqno &&
+            workloop_ports[i].readiness_msgcount == status.mps_msgcount) {
+            suppress = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&workloop_port_lock);
+
+    if (do_strace && suppress) {
+        fprintf(stderr, "  workloop MACHPORT 0x%x: suppressing duplicate "
+                "readiness event seq=%u msgcount=%u\n",
+                (unsigned)port, status.mps_seqno, status.mps_msgcount);
+    }
+    return suppress;
+}
+
+static bool mark_workloop_readiness_delivered(
+    const struct kevent_qos_s *template_kev)
+{
+    mach_port_t port = (mach_port_t)template_kev->ident;
+    mach_port_status_t status = {0};
+    bool marked = false;
+
+    if (!workloop_template_is_readiness_only(template_kev) ||
+        !machport_get_receive_status(port, &status) ||
+        status.mps_msgcount == 0) {
+        return false;
+    }
+
+    pthread_mutex_lock(&workloop_port_lock);
+    for (int i = 0; i < workloop_port_count; i++) {
+        if (workloop_ports[i].port == port) {
+            workloop_ports[i].readiness_inflight = true;
+            workloop_ports[i].readiness_seqno = status.mps_seqno;
+            workloop_ports[i].readiness_msgcount = status.mps_msgcount;
+            marked = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&workloop_port_lock);
+
+    if (do_strace && marked) {
+        fprintf(stderr, "  workloop MACHPORT 0x%x: marked readiness event "
+                "in flight seq=%u msgcount=%u\n",
+                (unsigned)port, status.mps_seqno, status.mps_msgcount);
+    }
+    return marked;
 }
 
 typedef enum WorkloopMachportState {
@@ -1106,32 +1731,93 @@ static void suppress_dead_workloop_machport_fallback(uint64_t wl_id,
     }
 }
 
-static bool find_workloop_machport_template(uint64_t wl_id,
-                                            struct kevent_qos_s *out_kev)
+static int snapshot_workloop_machport_templates(uint64_t wl_id,
+                                                workloop_port_entry *snapshot,
+                                                int max_snapshot)
 {
-    bool found = false;
+    int count = 0;
 
     pthread_mutex_lock(&workloop_port_lock);
-    for (int i = workloop_port_count - 1; i >= 0; i--) {
+    for (int i = workloop_port_count - 1; i >= 0 && count < max_snapshot; i--) {
         if (workloop_ports[i].workloop_id == wl_id &&
             workloop_ports[i].has_template) {
-            *out_kev = workloop_ports[i].template_kev;
-            found = true;
-            break;
+            snapshot[count++] = workloop_ports[i];
         }
     }
     pthread_mutex_unlock(&workloop_port_lock);
-    return found;
+    return count;
 }
 
-static int prepare_workloop_events(uint64_t wl_id,
-                                   bool prepend_thread_req,
-                                   const struct kevent_qos_s *fallback_ev,
-                                   struct kevent_qos_s *out_events,
-                                   int max_events)
+static int stash_active_workloop_notification_events(
+    uint64_t wl_id, const workloop_port_entry *entry, const char *where)
+{
+    struct kevent_qos_s drained[16];
+    struct kevent_qos_s template_kev = entry->template_kev;
+    int got;
+    int stashed;
+
+    if (!is_workq_notification_port(entry->port) ||
+        is_port_active_rcv(entry->port)) {
+        return 0;
+    }
+
+    got = drain_notification_machport_events(&template_kev, drained,
+                                             ARRAY_SIZE(drained), 0);
+    if (got <= 0) {
+        return 0;
+    }
+
+    stashed = stash_workloop_port_events(entry->port, drained, got);
+    if (do_strace) {
+        fprintf(stderr, "  workloop wl=0x%llx: stashed %d active-owner "
+                "notification event(s) on 0x%x from %s\n",
+                (unsigned long long)wl_id, stashed, (unsigned)entry->port,
+                where);
+    }
+    return stashed;
+}
+
+static int stash_active_workloop_notifications(uint64_t wl_id,
+                                               const char *where)
+{
+    workloop_port_entry templates[MAX_WORKLOOP_PORTS];
+    int template_count;
+    int total = 0;
+
+    template_count = snapshot_workloop_machport_templates(
+        wl_id, templates, ARRAY_SIZE(templates));
+    for (int i = 0; i < template_count; i++) {
+        total += stash_active_workloop_notification_events(wl_id,
+                                                           &templates[i],
+                                                           where);
+    }
+    return total;
+}
+
+static int prepare_workloop_events_ex(uint64_t wl_id,
+                                      bool prepend_thread_req,
+                                      const struct kevent_qos_s *fallback_ev,
+                                      struct kevent_qos_s *out_events,
+                                      int max_events,
+                                      bool allow_active_prereceive,
+                                      bool park_only_fallback)
 {
     int got;
-    struct kevent_qos_s machport_kev;
+    int total = 0;
+    bool saw_dead_template = false;
+    bool saw_live_empty_template = false;
+    workloop_port_entry templates[MAX_WORKLOOP_PORTS];
+    int template_count;
+
+    if (!allow_active_prereceive && is_workloop_active(wl_id) &&
+        !clear_stale_workloop_active(wl_id, "prepare")) {
+        stash_active_workloop_notifications(wl_id, "prepare");
+        if (do_strace) {
+            fprintf(stderr, "  workloop wl=0x%llx: active owner present, "
+                    "deferring prereceive\n", (unsigned long long)wl_id);
+        }
+        return 0;
+    }
 
     got = take_stashed_workloop_events(wl_id, out_events, max_events);
     if (got > 0) {
@@ -1141,11 +1827,11 @@ static int prepare_workloop_events(uint64_t wl_id,
             if (do_strace) {
                 fprintf(stderr, "  workloop wl=0x%llx: consumed returned "
                         "THREAD_REQUEST for %d stashed MACHPORT event(s)\n",
-                        (unsigned long long)wl_id, got);
+                (unsigned long long)wl_id, got);
             }
         }
         if (got > 0 && prepend_thread_req) {
-            got = prepend_workloop_req_event(wl_id, out_events, got,
+            got = prepend_workloop_req_event(wl_id, fallback_ev, out_events, got,
                                              max_events);
         }
         if (do_strace) {
@@ -1156,54 +1842,54 @@ static int prepare_workloop_events(uint64_t wl_id,
         return got;
     }
 
-    if (find_workloop_machport_template(wl_id, &machport_kev)) {
+    template_count = snapshot_workloop_machport_templates(
+        wl_id, templates, ARRAY_SIZE(templates));
+    for (int i = 0; i < template_count && total < max_events; i++) {
+        struct kevent_qos_s machport_kev = templates[i].template_kev;
         bool notification_port =
             is_workq_notification_port((mach_port_t)machport_kev.ident);
 
         if (is_port_active_rcv((mach_port_t)machport_kev.ident)) {
-            /* Another thread is doing mach_msg2 receive on this port;
-             * prereceiving here would steal its reply message. */
+            /*
+             * Another thread is doing mach_msg2 receive on this port;
+             * prereceiving here would steal its reply message.  Keep
+             * scanning: the same workloop can have other ready ports.
+             */
             if (do_strace) {
                 fprintf(stderr, "  workloop wl=0x%llx: MACHPORT 0x%x "
-                        "has active receiver; using THREAD_REQUEST fallback\n",
+                        "has active receiver; skipping prereceive\n",
                         (unsigned long long)wl_id,
                         (unsigned)machport_kev.ident);
             }
-            goto fallback;
+            continue;
         }
-        got = prereceive_machport_drain(&machport_kev, out_events,
-                                        max_events);
+        if (suppress_workloop_readiness_delivery(&machport_kev)) {
+            continue;
+        }
+        if (notification_port) {
+            got = drain_notification_machport_events(
+                &machport_kev, &out_events[total], max_events - total, 100);
+        } else {
+            got = prereceive_machport_drain(
+                &machport_kev, &out_events[total], max_events - total);
+        }
         if (got > 0) {
-            struct kevent_qos_s zero_wake_ev;
-
             if (!notification_port) {
-                got = filter_workloop_notification_events(out_events, got);
+                got = filter_workloop_notification_events(&out_events[total],
+                                                          got);
             }
             if (got > 0) {
                 set_workloop_sync_wake_inflight(wl_id, false);
+                mark_workloop_readiness_delivered(&machport_kev);
+                total += got;
             }
-            if (got > 0 &&
-                take_zero_wake_workloop_req(wl_id, &zero_wake_ev)) {
-                if (do_strace) {
-                    fprintf(stderr, "  workloop wl=0x%llx: consumed returned "
-                            "THREAD_REQUEST for %d prereceived MACHPORT "
-                            "event(s)\n",
-                            (unsigned long long)wl_id, got);
-                }
-            }
-        }
-        if (got > 0 && prepend_thread_req) {
-            got = prepend_workloop_req_event(wl_id, out_events, got,
-                                             max_events);
-        }
-        if (got > 0) {
             if (do_strace) {
                 fprintf(stderr, "  workloop wl=0x%llx: using %d "
                         "prereceived MACHPORT event(s) from 0x%x\n",
                         (unsigned long long)wl_id, got,
                         (unsigned)machport_kev.ident);
             }
-            return got;
+            continue;
         }
 
         /*
@@ -1216,29 +1902,55 @@ static int prepare_workloop_events(uint64_t wl_id,
         WorkloopMachportState state =
             workloop_machport_state((mach_port_t)machport_kev.ident);
         if (state != WORKLOOP_MACHPORT_LIVE) {
+            saw_dead_template = true;
             suppress_dead_workloop_machport_fallback(
                 wl_id, (mach_port_t)machport_kev.ident, "THREAD_REQUEST",
                 state);
-            return 0;
+        } else {
+            saw_live_empty_template = true;
         }
     }
 
-fallback:
-    if (!fallback_ev) {
+    if (total > 0) {
+        struct kevent_qos_s zero_wake_ev;
+
+        if (take_zero_wake_workloop_req(wl_id, &zero_wake_ev)) {
+            if (do_strace) {
+                fprintf(stderr, "  workloop wl=0x%llx: consumed returned "
+                        "THREAD_REQUEST for %d prereceived MACHPORT event(s)\n",
+                        (unsigned long long)wl_id, total);
+            }
+        }
+        if (prepend_thread_req) {
+            total = prepend_workloop_req_event(wl_id, fallback_ev, out_events,
+                                               total,
+                                               max_events);
+        }
+        return total;
+    }
+
+    if (saw_dead_template && !saw_live_empty_template) {
         return 0;
     }
-    if (do_strace) {
-        fprintf(stderr, "  workloop wl=0x%llx: synthesizing fallback "
-                "THREAD_REQUEST filter=%d fflags=0x%x ext=[0x%llx,0x%llx,"
-                "0x%llx,0x%llx]\n",
-                (unsigned long long)wl_id, fallback_ev->filter,
-                fallback_ev->fflags, (unsigned long long)fallback_ev->ext[0],
-                (unsigned long long)fallback_ev->ext[1],
-                (unsigned long long)fallback_ev->ext[2],
-                (unsigned long long)fallback_ev->ext[3]);
+
+    if (fallback_ev && do_strace) {
+        fprintf(stderr, "  workloop wl=0x%llx: preserving THREAD_REQUEST "
+                "until real MACHPORT work arrives\n",
+                (unsigned long long)wl_id);
     }
-    out_events[0] = *fallback_ev;
-    return 1;
+    return 0;
+}
+
+static int prepare_workloop_events(uint64_t wl_id,
+                                   bool prepend_thread_req,
+                                   const struct kevent_qos_s *fallback_ev,
+                                   struct kevent_qos_s *out_events,
+                                   int max_events,
+                                   bool allow_active_prereceive)
+{
+    return prepare_workloop_events_ex(wl_id, prepend_thread_req, fallback_ev,
+                                      out_events, max_events,
+                                      allow_active_prereceive, true);
 }
 
 static bool workq_notification_port_has_real_template(mach_port_t port)
@@ -1474,6 +2186,26 @@ static int take_synthetic_send_possible_events(
     return 1;
 }
 
+static int drain_notification_machport_events(
+    struct kevent_qos_s *template_kev,
+    struct kevent_qos_s *out_events,
+    int max_events,
+    mach_msg_timeout_t timeout_ms)
+{
+    int got = take_synthetic_send_possible_events(template_kev, out_events,
+                                                  max_events);
+
+    if (got > 0) {
+        return filter_workq_notification_events((mach_port_t)template_kev->ident,
+                                                out_events, got);
+    }
+
+    got = prereceive_machport_drain_timeout(template_kev, out_events,
+                                            max_events, timeout_ms);
+    return filter_workq_notification_events((mach_port_t)template_kev->ident,
+                                            out_events, got);
+}
+
 static void save_workq_machport_template(const struct kevent_qos_s *kev)
 {
     mach_port_t port = (mach_port_t)kev->ident;
@@ -1528,65 +2260,105 @@ void service_workloop_machport_events(void)
         bool notification_port;
         int got;
 
+        notification_port = is_workq_notification_port(snapshot[i].port);
         if (is_port_active_rcv(snapshot[i].port)) {
+            if (notification_port) {
+                got = take_synthetic_send_possible_events(
+                    &snapshot[i].template_kev, drained, ARRAY_SIZE(drained));
+                if (got > 0) {
+                    got = filter_workq_notification_events(
+                        snapshot[i].port, drained, got);
+                }
+                if (got > 0) {
+                    if (do_strace) {
+                        fprintf(stderr, "  workloop wl=0x%llx: delivering %d "
+                                "synthetic SEND_POSSIBLE event(s) on active "
+                                "receive notification port 0x%x\n",
+                                (unsigned long long)snapshot[i].workloop_id,
+                                got, (unsigned)snapshot[i].port);
+                    }
+                    deliver_workloop_events_to_thread(snapshot[i].workloop_id,
+                                                      drained, got);
+                } else if (do_strace) {
+                    fprintf(stderr, "  workloop wl=0x%llx: active receive on "
+                            "notification port 0x%x has no synthetic "
+                            "SEND_POSSIBLE event\n",
+                            (unsigned long long)snapshot[i].workloop_id,
+                            (unsigned)snapshot[i].port);
+                }
+            }
             continue;
         }
-
-        parked = has_parked_workloop_thread(snapshot[i].workloop_id);
-        notification_port = is_workq_notification_port(snapshot[i].port);
+        if (suppress_workloop_readiness_delivery(
+                &snapshot[i].template_kev)) {
+            continue;
+        }
+        if (is_workloop_active(snapshot[i].workloop_id) &&
+            !clear_stale_workloop_active(snapshot[i].workloop_id, "poll")) {
+            if (notification_port) {
+                stash_active_workloop_notification_events(
+                    snapshot[i].workloop_id, &snapshot[i], "poll");
+                continue;
+            }
+            if (do_strace) {
+                fprintf(stderr, "  workloop wl=0x%llx: active owner present, "
+                        "skipping monitor prereceive on 0x%x\n",
+                        (unsigned long long)snapshot[i].workloop_id,
+                        (unsigned)snapshot[i].port);
+            }
+            continue;
+        }
+        parked = workloop_template_is_readiness_only(&snapshot[i].template_kev)
+            ? has_exact_parked_workloop_thread(snapshot[i].workloop_id)
+            : has_parked_workloop_thread(snapshot[i].workloop_id);
         if (notification_port && !parked) {
             bool wants_msg =
                 template_needs_prereceived_msg(&snapshot[i].template_kev);
-            bool sync_gap = snapshot[i].sync_wake_inflight;
 
             if (wants_msg) {
-                if (!sync_gap) {
-                    got = prereceive_machport_drain_timeout(
-                        &snapshot[i].template_kev, drained,
-                        ARRAY_SIZE(drained), 0);
-                    if (got > 0) {
-                        got = prepend_workloop_req_event(snapshot[i].workloop_id,
-                                                         drained, got,
-                                                         ARRAY_SIZE(drained));
+                got = drain_notification_machport_events(
+                    &snapshot[i].template_kev, drained,
+                    ARRAY_SIZE(drained), 0);
+                if (got > 0) {
+                    struct kevent_qos_s zero_wake_ev;
+
+                    if (take_zero_wake_workloop_req(snapshot[i].workloop_id,
+                                                    &zero_wake_ev)) {
                         if (do_strace) {
-                            fprintf(stderr, "  workloop wl=0x%llx: waking for "
-                                    "%d notification message event(s) on 0x%x\n",
+                            fprintf(stderr, "  workloop wl=0x%llx: consumed "
+                                    "pending THREAD_REQUEST for notification "
+                                    "message on 0x%x\n",
                                     (unsigned long long)snapshot[i].workloop_id,
-                                    got, (unsigned)snapshot[i].port);
+                                    (unsigned)snapshot[i].port);
                         }
-                        deliver_workloop_events_to_thread(
-                            snapshot[i].workloop_id, drained, got);
-                        continue;
+                    } else {
+                        got = prepend_workloop_req_event(
+                            snapshot[i].workloop_id, NULL, drained, got,
+                            ARRAY_SIZE(drained));
                     }
                     if (do_strace) {
-                        fprintf(stderr, "  workloop wl=0x%llx: deferring message "
-                                "notification port 0x%x until a parked thread is "
-                                "available\n",
-                                (unsigned long long)snapshot[i].workloop_id,
-                                (unsigned)snapshot[i].port);
+                        fprintf(stderr, "  workloop wl=0x%llx: waking for "
+                                "%d notification message event(s) on 0x%x\n",
+                                 (unsigned long long)snapshot[i].workloop_id,
+                                 got, (unsigned)snapshot[i].port);
                     }
+                    deliver_workloop_events_to_thread(
+                        snapshot[i].workloop_id, drained, got);
                     continue;
                 }
-
-                got = prereceive_machport_drain_timeout(&snapshot[i].template_kev,
-                                                        drained,
-                                                        ARRAY_SIZE(drained), 0);
-                if (got > 0) {
-                    int stashed = stash_workloop_port_events(snapshot[i].port,
-                                                             drained, got);
-                    if (do_strace) {
-                        fprintf(stderr, "  workloop wl=0x%llx: stashed %d sync-gap "
-                                "notification event(s) on 0x%x\n",
-                                (unsigned long long)snapshot[i].workloop_id,
-                                stashed, (unsigned)snapshot[i].port);
-                    }
+                if (do_strace) {
+                    fprintf(stderr, "  workloop wl=0x%llx: deferring message "
+                            "notification port 0x%x until a message is "
+                            "available\n",
+                            (unsigned long long)snapshot[i].workloop_id,
+                            (unsigned)snapshot[i].port);
                 }
                 continue;
             }
 
-            got = prereceive_machport_drain_timeout(&snapshot[i].template_kev,
-                                                    drained,
-                                                    ARRAY_SIZE(drained), 0);
+            got = drain_notification_machport_events(&snapshot[i].template_kev,
+                                                     drained,
+                                                     ARRAY_SIZE(drained), 0);
             if (got > 0) {
                 if (!notification_port) {
                     got = filter_workloop_notification_events(drained, got);
@@ -1621,14 +2393,23 @@ void service_workloop_machport_events(void)
             continue;
         }
 
-        got = prereceive_machport_drain_timeout(&snapshot[i].template_kev,
-                                                drained,
-                                                ARRAY_SIZE(drained), 0);
+        if (notification_port) {
+            got = drain_notification_machport_events(&snapshot[i].template_kev,
+                                                     drained,
+                                                     ARRAY_SIZE(drained), 0);
+        } else {
+            got = prereceive_machport_drain_timeout(&snapshot[i].template_kev,
+                                                    drained,
+                                                    ARRAY_SIZE(drained), 0);
+        }
         if (got > 0) {
             struct kevent_qos_s zero_wake_ev;
 
             if (!notification_port) {
                 got = filter_workloop_notification_events(drained, got);
+            }
+            if (got > 0) {
+                mark_workloop_readiness_delivered(&snapshot[i].template_kev);
             }
             if (got > 0 && parked &&
                 take_zero_wake_workloop_req(snapshot[i].workloop_id,
@@ -1643,7 +2424,7 @@ void service_workloop_machport_events(void)
         if (got > 0) {
             if (!parked) {
                 got = prepend_workloop_req_event(snapshot[i].workloop_id,
-                                                 drained, got,
+                                                 NULL, drained, got,
                                                  ARRAY_SIZE(drained));
             }
             if (do_strace) {
@@ -1689,6 +2470,26 @@ static void service_workq_notification_events_filtered(bool synthetic_only)
         int got;
 
         if (is_port_active_rcv(snapshot[i].port)) {
+            got = take_synthetic_send_possible_events(&snapshot[i].template_kev,
+                                                      drained,
+                                                      ARRAY_SIZE(drained));
+            if (got > 0) {
+                got = filter_workq_notification_events(snapshot[i].port,
+                                                       drained, got);
+            }
+            if (got > 0) {
+                if (do_strace) {
+                    fprintf(stderr, "  workq MACHPORT 0x%x: delivering %d "
+                            "synthetic SEND_POSSIBLE event(s) while active "
+                            "receive is pending\n",
+                            (unsigned)snapshot[i].port, got);
+                }
+                deliver_kevents_to_thread(drained, got);
+            } else if (do_strace) {
+                fprintf(stderr, "  workq MACHPORT 0x%x: active receive has no "
+                        "synthetic SEND_POSSIBLE event\n",
+                        (unsigned)snapshot[i].port);
+            }
             continue;
         }
 
@@ -1697,8 +2498,12 @@ static void service_workq_notification_events_filtered(bool synthetic_only)
                                                   ARRAY_SIZE(drained));
         if (got == 0) {
             got = prereceive_machport_drain_timeout(&snapshot[i].template_kev,
-                                                    drained,
-                                                    ARRAY_SIZE(drained), 0);
+                                                     drained,
+                                                     ARRAY_SIZE(drained), 0);
+        }
+        if (got > 0) {
+            got = filter_workq_notification_events(snapshot[i].port, drained,
+                                                   got);
         }
         if (got > 0) {
             if (do_strace) {
@@ -1785,7 +2590,7 @@ typedef struct parked_workloop_wq {
 static parked_workloop_wq *parked_workloop_list = NULL;
 static pthread_mutex_t parked_workloop_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static bool has_parked_workloop_thread(uint64_t workloop_id)
+static bool has_exact_parked_workloop_thread(uint64_t workloop_id)
 {
     bool found = false;
 
@@ -1798,6 +2603,11 @@ static bool has_parked_workloop_thread(uint64_t workloop_id)
     }
     pthread_mutex_unlock(&parked_workloop_lock);
     return found;
+}
+
+static bool has_parked_workloop_thread(uint64_t workloop_id)
+{
+    return has_exact_parked_workloop_thread(workloop_id);
 }
 
 /*
@@ -1818,6 +2628,334 @@ static TaskState *workq_monitor_parent_ts;
 static uint64_t saved_evfilt_user_udata;
 static uint32_t saved_evfilt_user_qos;
 
+#define _PTHREAD_PRIORITY_EVENT_MANAGER_FLAG 0x02000000
+
+static pthread_mutex_t event_manager_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool event_manager_active;
+static struct kevent_qos_s pending_event_manager_events[16];
+static int pending_event_manager_count;
+
+static bool kevent_needs_event_manager(const struct kevent_qos_s *ev)
+{
+    uint32_t qos;
+
+    if (ev->filter != EVFILT_USER_PRIVATE &&
+        ev->filter != EVFILT_TIMER_PRIVATE) {
+        return false;
+    }
+
+    qos = ev->qos ? ev->qos : saved_evfilt_user_qos;
+    return qos & _PTHREAD_PRIORITY_EVENT_MANAGER_FLAG;
+}
+
+static bool kevent_list_needs_event_manager(const struct kevent_qos_s *events,
+                                            int nevents)
+{
+    for (int i = 0; events && i < nevents; i++) {
+        if (kevent_needs_event_manager(&events[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void stash_event_manager_events(const struct kevent_qos_s *events,
+                                       int nevents)
+{
+    for (int i = 0; events && i < nevents; i++) {
+        bool duplicate_user_poke = false;
+
+        if (events[i].filter == EVFILT_USER_PRIVATE) {
+            for (int j = 0; j < pending_event_manager_count; j++) {
+                if (pending_event_manager_events[j].filter ==
+                    EVFILT_USER_PRIVATE &&
+                    pending_event_manager_events[j].ident == events[i].ident) {
+                    duplicate_user_poke = true;
+                    break;
+                }
+            }
+        }
+        if (duplicate_user_poke) {
+            continue;
+        }
+        if (pending_event_manager_count <
+            ARRAY_SIZE(pending_event_manager_events)) {
+            pending_event_manager_events[pending_event_manager_count++] =
+                events[i];
+        }
+    }
+}
+
+static int finish_event_manager_turn(struct kevent_qos_s *events,
+                                     int max_events)
+{
+    int count;
+
+    pthread_mutex_lock(&event_manager_lock);
+    count = MIN(pending_event_manager_count, max_events);
+    if (count > 0) {
+        memcpy(events, pending_event_manager_events,
+               count * sizeof(events[0]));
+        if (count < pending_event_manager_count) {
+            memmove(pending_event_manager_events,
+                    &pending_event_manager_events[count],
+                    (pending_event_manager_count - count) *
+                    sizeof(pending_event_manager_events[0]));
+        }
+        pending_event_manager_count -= count;
+        event_manager_active = true;
+    } else {
+        event_manager_active = false;
+    }
+    pthread_mutex_unlock(&event_manager_lock);
+
+    return count;
+}
+
+#define MAX_WORKQ_KNOTE_QOS 64
+typedef struct WorkqKnoteQos {
+    int16_t filter;
+    uint64_t ident;
+    uint64_t udata;
+    uint32_t qos;
+} WorkqKnoteQos;
+
+static WorkqKnoteQos workq_knote_qos[MAX_WORKQ_KNOTE_QOS];
+static int workq_knote_qos_count;
+static pthread_mutex_t workq_knote_qos_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void remember_workq_knote_qos(const struct kevent_qos_s *kev)
+{
+    if (kev->filter != EVFILT_USER_PRIVATE &&
+        kev->filter != EVFILT_TIMER_PRIVATE) {
+        return;
+    }
+
+    pthread_mutex_lock(&workq_knote_qos_lock);
+    for (int i = 0; i < workq_knote_qos_count; i++) {
+        if (workq_knote_qos[i].filter == kev->filter &&
+            workq_knote_qos[i].ident == kev->ident &&
+            workq_knote_qos[i].udata == kev->udata) {
+            if (kev->flags & EV_DELETE) {
+                workq_knote_qos[i] =
+                    workq_knote_qos[--workq_knote_qos_count];
+            } else if (kev->flags & EV_ADD) {
+                workq_knote_qos[i].qos = kev->qos;
+            }
+            pthread_mutex_unlock(&workq_knote_qos_lock);
+            return;
+        }
+    }
+
+    if ((kev->flags & EV_ADD) && workq_knote_qos_count < MAX_WORKQ_KNOTE_QOS) {
+        workq_knote_qos[workq_knote_qos_count++] = (WorkqKnoteQos) {
+            .filter = kev->filter,
+            .ident = kev->ident,
+            .udata = kev->udata,
+            .qos = kev->qos,
+        };
+    }
+    pthread_mutex_unlock(&workq_knote_qos_lock);
+}
+
+static bool lookup_workq_knote_qos(int16_t filter, uint64_t ident,
+                                   uint64_t udata, uint32_t *qos)
+{
+    bool found = false;
+
+    pthread_mutex_lock(&workq_knote_qos_lock);
+    for (int i = 0; i < workq_knote_qos_count; i++) {
+        if (workq_knote_qos[i].filter == filter &&
+            workq_knote_qos[i].ident == ident &&
+            workq_knote_qos[i].udata == udata) {
+            *qos = workq_knote_qos[i].qos;
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&workq_knote_qos_lock);
+    return found;
+}
+
+#define MAX_WORKQ_TIMERS 32
+
+typedef struct WorkqTimer {
+    bool active;
+    bool relative;
+    uint64_t deadline;
+    uint64_t interval;
+    struct kevent_qos_s kev;
+} WorkqTimer;
+
+static WorkqTimer workq_timers[MAX_WORKQ_TIMERS];
+static pthread_mutex_t workq_timer_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static uint64_t ns_to_mach_ticks(uint64_t ns)
+{
+    static mach_timebase_info_data_t timebase;
+
+    if (timebase.denom == 0) {
+        mach_timebase_info(&timebase);
+    }
+    if (timebase.numer == 0) {
+        return ns;
+    }
+
+    __uint128_t ticks = (__uint128_t)ns * timebase.denom;
+    ticks /= timebase.numer;
+    return ticks > UINT64_MAX ? UINT64_MAX : (uint64_t)ticks;
+}
+
+static uint64_t timer_data_to_mach_ticks(int64_t data, uint32_t fflags)
+{
+    uint64_t value = data > 0 ? (uint64_t)data : 0;
+
+    if (fflags & NOTE_MACHTIME) {
+        return value;
+    }
+    if (fflags & NOTE_SECONDS) {
+        return ns_to_mach_ticks(value * 1000000000ULL);
+    }
+    if (fflags & NOTE_USECONDS) {
+        return ns_to_mach_ticks(value * 1000ULL);
+    }
+    if (fflags & NOTE_NSECONDS) {
+        return ns_to_mach_ticks(value);
+    }
+    return ns_to_mach_ticks(value * 1000000ULL);
+}
+
+static bool workq_timer_deadline(const struct kevent_qos_s *kev,
+                                 uint64_t now, uint64_t *deadline,
+                                 uint64_t *interval, bool *relative)
+{
+    if ((kev->fflags & NOTE_ABSOLUTE) && !(kev->fflags & NOTE_MACHTIME)) {
+        return false;
+    }
+
+    uint64_t ticks = timer_data_to_mach_ticks(kev->data, kev->fflags);
+    *relative = !(kev->fflags & NOTE_ABSOLUTE);
+    *interval = ticks;
+    if (*relative) {
+        *deadline = UINT64_MAX - now < ticks ? UINT64_MAX : now + ticks;
+    } else {
+        *deadline = ticks;
+    }
+    return true;
+}
+
+static bool workq_timer_same_knote(const WorkqTimer *timer,
+                                   const struct kevent_qos_s *kev)
+{
+    return timer->active &&
+           timer->kev.ident == kev->ident &&
+           timer->kev.udata == kev->udata;
+}
+
+static int register_workq_timer(const struct kevent_qos_s *kev)
+{
+    uint64_t now = mach_absolute_time();
+    uint64_t deadline;
+    uint64_t interval;
+    bool relative;
+    int slot = -1;
+
+    if (kev->filter != EVFILT_TIMER_PRIVATE) {
+        return -1;
+    }
+
+    pthread_mutex_lock(&workq_timer_lock);
+    for (int i = 0; i < MAX_WORKQ_TIMERS; i++) {
+        if (workq_timer_same_knote(&workq_timers[i], kev)) {
+            slot = i;
+            break;
+        }
+        if (slot < 0 && !workq_timers[i].active) {
+            slot = i;
+        }
+    }
+
+    if (kev->flags & EV_DELETE) {
+        if (slot >= 0 && workq_timer_same_knote(&workq_timers[slot], kev)) {
+            workq_timers[slot].active = false;
+        }
+        pthread_mutex_unlock(&workq_timer_lock);
+        return 0;
+    }
+
+    if (kev->flags & EV_DISABLE) {
+        if (slot >= 0 && workq_timer_same_knote(&workq_timers[slot], kev)) {
+            workq_timers[slot].active = false;
+        }
+        pthread_mutex_unlock(&workq_timer_lock);
+        return 0;
+    }
+
+    if (slot < 0 ||
+        !workq_timer_deadline(kev, now, &deadline, &interval, &relative)) {
+        pthread_mutex_unlock(&workq_timer_lock);
+        return -1;
+    }
+
+    workq_timers[slot].active = true;
+    workq_timers[slot].relative = relative;
+    workq_timers[slot].deadline = deadline;
+    workq_timers[slot].interval = interval;
+    workq_timers[slot].kev = *kev;
+    remember_workq_knote_qos(kev);
+
+    if (do_strace) {
+        fprintf(stderr, "  workq_timer: armed ident=0x%llx udata=0x%llx "
+                "flags=0x%x fflags=0x%x data=%lld deadline=%llu now=%llu "
+                "qos=0x%x\n",
+                (unsigned long long)kev->ident,
+                (unsigned long long)kev->udata, kev->flags, kev->fflags,
+                (long long)kev->data, (unsigned long long)deadline,
+                (unsigned long long)now, kev->qos);
+    }
+
+    pthread_mutex_unlock(&workq_timer_lock);
+    return 0;
+}
+
+static int collect_due_workq_timers(struct kevent_qos_s *events, int max_events)
+{
+    uint64_t now = mach_absolute_time();
+    int count = 0;
+
+    pthread_mutex_lock(&workq_timer_lock);
+    for (int i = 0; i < MAX_WORKQ_TIMERS && count < max_events; i++) {
+        WorkqTimer *timer = &workq_timers[i];
+
+        if (!timer->active || timer->deadline > now) {
+            continue;
+        }
+
+        events[count] = timer->kev;
+        events[count].flags = EV_ADD | EV_ENABLE | EV_CLEAR |
+                              (timer->kev.flags & EV_ONESHOT);
+        events[count].fflags = 0;
+        events[count].xflags = 0;
+        events[count].data = 1;
+        memset(events[count].ext, 0, sizeof(events[count].ext));
+        count++;
+
+        if ((timer->kev.flags & EV_ONESHOT) || !timer->relative ||
+            timer->interval == 0) {
+            timer->active = false;
+        } else {
+            timer->deadline = UINT64_MAX - now < timer->interval
+                            ? UINT64_MAX : now + timer->interval;
+        }
+    }
+    pthread_mutex_unlock(&workq_timer_lock);
+
+    if (do_strace && count > 0) {
+        fprintf(stderr, "  workq_timer: %d timer event(s) due\n", count);
+    }
+    return count;
+}
+
 /* Stack allocation constants (must match WQOPS_QUEUE_REQTHREADS) */
 #define PTH_DEFAULT_STACKSZ    (512 * 1024)
 #define PTHREAD_T_OFFSET_ARM64 (12 * 1024)
@@ -1831,7 +2969,8 @@ static int create_guest_thread(CPUArchState *parent_env,
                                TaskState *parent_ts,
                                bool is_workqueue,
                                abi_ulong wq_self, abi_ulong wq_stop,
-                               abi_ulong wq_sbot, abi_ulong wq_tsd);
+                               abi_ulong wq_sbot, abi_ulong wq_tsd,
+                               uint64_t active_workloop_id);
 
 static void deliver_kevents_to_thread(struct kevent_qos_s *events,
                                       int nevents);
@@ -1911,7 +3050,7 @@ static int create_guest_thread_for_wq(CPUArchState *env, uint32_t qos)
         saved_wqthread, stack_top,
         self_addr, 0, stack_bottom,
         0, flags, 0, tsd_base, parent_ts,
-        true, self_addr, stack_top, stack_bottom, tsd_base);
+        true, self_addr, stack_top, stack_bottom, tsd_base, 0);
 }
 
 /*
@@ -1977,6 +3116,20 @@ static int workq_kqueue_register(const struct kevent_qos_s *changelist,
     for (int i = 0; i < nchanges; i++) {
         if (changelist[i].filter == EVFILT_MACHPORT ||
             changelist[i].filter == EVFILT_TIMER) {
+            if (changelist[i].filter == EVFILT_TIMER) {
+                int rc = register_workq_timer(&changelist[i]);
+                if (rc == 0) {
+                    registered++;
+                } else if (do_strace) {
+                    fprintf(stderr, "  workq_kqueue_register TIMER: "
+                            "unsupported ident=0x%llx flags=0x%x "
+                            "fflags=0x%x data=%lld\n",
+                            (unsigned long long)changelist[i].ident,
+                            changelist[i].flags, changelist[i].fflags,
+                            (long long)changelist[i].data);
+                }
+                continue;
+            }
             struct kevent64_s k64;
             kqos_to_k64(&changelist[i], &k64);
             int rc = kevent64(kq, &k64, 1, NULL, 0, 0, NULL);
@@ -2018,27 +3171,32 @@ static int workq_kqueue_register(const struct kevent_qos_s *changelist,
  */
 static abi_ulong prereceive_one_msg_timeout(mach_port_t port,
                                             mach_msg_size_t hint_size,
-                                            mach_msg_timeout_t timeout_ms)
+                                            uint32_t receive_flags,
+                                            mach_msg_timeout_t timeout_ms,
+                                            mach_msg_size_t *received_size_out)
 {
-    mach_msg_size_t buf_size = hint_size + MAX_TRAILER_SIZE;
+    mach_msg_option_t rcv_options =
+        MACH_RCV_MSG | MACH_RCV_LARGE | MACH_RCV_TIMEOUT |
+        (receive_flags & (MACH_RCV_LARGE_IDENTITY |
+                          MACH_RCV_TRAILER_MASK |
+                          MACH_RCV_VOUCHER |
+                          MACH_MSG_STRICT_REPLY));
+    mach_msg_size_t trailer_size = REQUESTED_TRAILER_SIZE(rcv_options);
+    mach_msg_size_t buf_size = hint_size + trailer_size;
     if (buf_size < 4096) {
         buf_size = 4096;
     }
     void *buf = g_malloc0(buf_size);
     mach_msg_header_t *hdr = (mach_msg_header_t *)buf;
 
-    mach_msg_option_t rcv_options =
-        MACH_RCV_MSG | MACH_RCV_LARGE | MACH_RCV_TIMEOUT |
-        MACH_RCV_TRAILER_TYPE(MACH_MSG_TRAILER_FORMAT_0) |
-        MACH_RCV_TRAILER_ELEMENTS(MACH_RCV_TRAILER_AUDIT);
-
     kern_return_t kr = mach_msg(hdr,
         rcv_options,
         0, buf_size, port, timeout_ms, MACH_PORT_NULL);
 
     if (kr == MACH_RCV_TOO_LARGE) {
-        buf_size = hdr->msgh_size + MAX_TRAILER_SIZE;
+        buf_size = hdr->msgh_size + trailer_size;
         buf = g_realloc(buf, buf_size);
+        memset(buf, 0, buf_size);
         hdr = (mach_msg_header_t *)buf;
         kr = mach_msg(hdr, rcv_options, 0, buf_size, port, timeout_ms,
                       MACH_PORT_NULL);
@@ -2056,7 +3214,23 @@ static abi_ulong prereceive_one_msg_timeout(mach_port_t port,
         return (abi_ulong)-1;
     }
 
-    mach_msg_size_t received_size = hdr->msgh_size + MAX_TRAILER_SIZE;
+    mach_msg_size_t msg_rounded = (hdr->msgh_size + 3U) & ~3U;
+    if (msg_rounded > buf_size ||
+        msg_rounded > UINT32_MAX - MAX_TRAILER_SIZE) {
+        g_free(buf);
+        return (abi_ulong)-1;
+    }
+
+    mach_msg_trailer_t *trailer =
+        (mach_msg_trailer_t *)((uint8_t *)buf + msg_rounded);
+    if (msg_rounded + sizeof(*trailer) <= buf_size &&
+        trailer->msgh_trailer_size >= sizeof(*trailer) &&
+        trailer->msgh_trailer_size <= MAX_TRAILER_SIZE &&
+        msg_rounded <= buf_size - trailer->msgh_trailer_size) {
+        trailer_size = trailer->msgh_trailer_size;
+    }
+
+    mach_msg_size_t received_size = msg_rounded + trailer_size;
     mach_msg_size_t copy_size = MIN(received_size, buf_size);
     abi_long guest_buf_ret;
 
@@ -2096,13 +3270,20 @@ static abi_ulong prereceive_one_msg_timeout(mach_port_t port,
     }
 
     g_free(buf);
+    if (received_size_out) {
+        *received_size_out = received_size;
+    }
     return guest_buf;
 }
 
 static abi_ulong prereceive_one_msg(mach_port_t port,
                                     mach_msg_size_t hint_size)
 {
-    return prereceive_one_msg_timeout(port, hint_size, 100);
+    return prereceive_one_msg_timeout(
+        port, hint_size,
+        MACH_RCV_TRAILER_TYPE(MACH_MSG_TRAILER_FORMAT_0) |
+        MACH_RCV_TRAILER_ELEMENTS(MACH_RCV_TRAILER_AUDIT),
+        100, NULL);
 }
 
 /*
@@ -2145,14 +3326,18 @@ static int prereceive_machport_drain_port_timeout(
     bool wants_msg = template_needs_prereceived_msg(template_kev);
 
     if (!wants_msg) {
-        if (!max_events || !machport_has_pending_message(port)) {
+        mach_port_status_t status;
+
+        if (!max_events ||
+            !machport_get_receive_status(port, &status) ||
+            status.mps_msgcount == 0) {
             return 0;
         }
         out_events[0] = *template_kev;
         out_events[0].flags &= ~(uint16_t)(EV_UDATA_SPECIFIC |
                                            EV_VANISHED);
         out_events[0].fflags = 0;
-        out_events[0].data = 0;
+        out_events[0].data = status.mps_msgcount;
         out_events[0].ext[0] = 0;
         out_events[0].ext[1] = 0;
         out_events[0].ext[2] = 0;
@@ -2160,9 +3345,19 @@ static int prereceive_machport_drain_port_timeout(
         return 1;
     }
 
+    /*
+     * XNU reports one prereceived MACH_RCV_MSG knote activation per turn.
+     * Draining a whole port queue into one dispatch workloop handoff can make
+     * libdispatch invoke async-reply state with messages from later turns.
+     */
+    max_events = MIN(max_events, 1);
+
     while (count < max_events) {
+        mach_msg_size_t received_size = 0;
         abi_ulong guest_buf = prereceive_one_msg_timeout(port, hint,
-                                                         timeout_ms);
+                                                         template_kev->fflags,
+                                                         timeout_ms,
+                                                         &received_size);
         if (guest_buf == (abi_ulong)-1) {
             break;
         }
@@ -2179,7 +3374,9 @@ static int prereceive_machport_drain_port_timeout(
             (mach_msg_header_t *)g2h_untagged(guest_buf);
         out_events[count].data = gh->msgh_size;
         out_events[count].ext[0] = (uint64_t)guest_buf;
-        out_events[count].ext[1] = gh->msgh_size + MAX_TRAILER_SIZE;
+        out_events[count].ext[1] = received_size;
+        out_events[count].ext[2] = 0;
+        out_events[count].ext[3] = 0;
         count++;
         hint = 4096;  /* next message might be any size */
     }
@@ -2220,7 +3417,17 @@ static void *workq_kqueue_monitor_func(void *arg)
              * queue and processes timers.
              */
             static int idle_ticks;
+            struct kevent_qos_s timer_events[8];
+            int timer_count = collect_due_workq_timers(
+                timer_events, ARRAY_SIZE(timer_events));
 
+            if (timer_count > 0) {
+                deliver_kevents_to_thread(timer_events, timer_count);
+                idle_ticks = 0;
+                continue;
+            }
+
+            service_workloop_machport_events();
             service_workq_notification_events_filtered(true);
             idle_ticks++;
             if (idle_ticks >= 2 && saved_wqthread
@@ -2233,7 +3440,14 @@ static void *workq_kqueue_monitor_func(void *arg)
 
         /* Convert to kevent_qos_s for the guest */
         for (int i = 0; i < n; i++) {
+            uint32_t qos = 0;
+
             k64_to_kqos(&events64[i], &events_qos[i]);
+            if (lookup_workq_knote_qos(events_qos[i].filter,
+                                       events_qos[i].ident,
+                                       events_qos[i].udata, &qos)) {
+                events_qos[i].qos = qos;
+            }
         }
 
         if (do_strace) {
@@ -2261,6 +3475,8 @@ static void *workq_kqueue_monitor_func(void *arg)
          */
         struct kevent_qos_s regular_buf[16];
         int regular_count = 0;
+        regular_count = collect_due_workq_timers(
+            regular_buf, ARRAY_SIZE(regular_buf));
         struct {
             uint64_t wl_id;
             struct kevent_qos_s events[16];
@@ -2271,27 +3487,35 @@ static void *workq_kqueue_monitor_func(void *arg)
         for (int i = 0; i < n; i++) {
             if (events_qos[i].filter == EVFILT_MACHPORT) {
                 struct kevent_qos_s drained[16];
-                uint64_t wl_id = find_workloop_for_port(
-                    (mach_port_t)events_qos[i].ident);
-                bool parked = wl_id && has_parked_workloop_thread(wl_id);
-                bool notification_port = wl_id &&
-                    is_workq_notification_port((mach_port_t)events_qos[i].ident);
+                mach_port_t event_port = (mach_port_t)events_qos[i].ident;
+                uint64_t wl_id = find_workloop_for_port(event_port);
+                bool parked = wl_id &&
+                    (workloop_template_is_readiness_only(&events_qos[i])
+                     ? has_exact_parked_workloop_thread(wl_id)
+                     : has_parked_workloop_thread(wl_id));
+                bool workq_notification_port =
+                    is_workq_notification_port(event_port);
+                bool notification_port = wl_id && workq_notification_port;
+                bool rearm_machport = true;
 
-                if (is_port_active_rcv(
-                        (mach_port_t)events_qos[i].ident)) {
+                if (is_port_active_rcv(event_port)) {
                     goto rearm_machport_event;
                 }
-
+                if (wl_id &&
+                    suppress_workloop_readiness_delivery(&events_qos[i])) {
+                    rearm_machport = false;
+                    goto rearm_machport_event;
+                }
                 if (notification_port && !parked) {
                     bool wants_msg = template_needs_prereceived_msg(&events_qos[i]);
-                    int got = prereceive_machport_drain(&events_qos[i],
-                                                        drained,
-                                                        ARRAY_SIZE(drained));
+                    int got = drain_notification_machport_events(
+                        &events_qos[i], drained, ARRAY_SIZE(drained), 100);
 
                     if (wants_msg) {
                         if (got > 0) {
                             got = prepend_workloop_req_event(
-                                wl_id, drained, got, ARRAY_SIZE(drained));
+                                wl_id, NULL, drained, got,
+                                ARRAY_SIZE(drained));
                             if (do_strace) {
                                 fprintf(stderr,
                                         "  workq_monitor: delivering %d "
@@ -2357,6 +3581,15 @@ static void *workq_kqueue_monitor_func(void *arg)
                         }
                         goto rearm_machport_event;
                     }
+                    if (workq_notification_port) {
+                        if (do_strace) {
+                            fprintf(stderr,
+                                    "  workq_monitor: dropped empty workq "
+                                    "notification event on port 0x%x\n",
+                                    (unsigned)event_port);
+                        }
+                        goto rearm_machport_event;
+                    }
                     /* Non-workloop consumers can still handle raw events. */
                     drained[0] = events_qos[i];
                     got = 1;
@@ -2364,9 +3597,14 @@ static void *workq_kqueue_monitor_func(void *arg)
                     if (!notification_port) {
                         got = filter_workloop_notification_events(drained, got);
                     }
+                    if (got > 0 &&
+                        mark_workloop_readiness_delivered(&events_qos[i])) {
+                        rearm_machport = false;
+                    }
                     if (got > 0 && !parked) {
                         got = prepend_workloop_req_event(
-                            wl_id, drained, got, ARRAY_SIZE(drained));
+                            wl_id, NULL, drained, got,
+                            ARRAY_SIZE(drained));
                     } else if (got > 0 && parked) {
                         /*
                          * Pair the persistent zero-wake request with these
@@ -2385,6 +3623,12 @@ static void *workq_kqueue_monitor_func(void *arg)
                                         (unsigned long long)wl_id);
                             }
                         }
+                    }
+                } else if (workq_notification_port) {
+                    got = filter_workq_notification_events(event_port, drained,
+                                                          got);
+                    if (got == 0) {
+                        goto rearm_machport_event;
                     }
                 }
 
@@ -2422,17 +3666,18 @@ static void *workq_kqueue_monitor_func(void *arg)
                  * EV_DISPATCH is one-shot; we must re-enable it.
                  */
 rearm_machport_event:
-                ;
-                struct kevent64_s rearm;
-                memset(&rearm, 0, sizeof(rearm));
-                rearm.ident = events_qos[i].ident;
-                rearm.filter = EVFILT_MACHPORT;
-                rearm.flags = EV_ENABLE;
-                rearm.fflags = events_qos[i].fflags;
-                rearm.udata = events64[i].udata;
-                rearm.ext[0] = events64[i].ext[0];
-                rearm.ext[1] = events64[i].ext[1];
-                kevent64(kq, &rearm, 1, NULL, 0, 0, NULL);
+                if (rearm_machport) {
+                    struct kevent64_s rearm;
+                    memset(&rearm, 0, sizeof(rearm));
+                    rearm.ident = events_qos[i].ident;
+                    rearm.filter = EVFILT_MACHPORT;
+                    rearm.flags = EV_ENABLE;
+                    rearm.fflags = events_qos[i].fflags;
+                    rearm.udata = events64[i].udata;
+                    rearm.ext[0] = events64[i].ext[0];
+                    rearm.ext[1] = events64[i].ext[1];
+                    kevent64(kq, &rearm, 1, NULL, 0, 0, NULL);
+                }
             } else {
                 /* Non-MACHPORT event, pass through */
                 if (regular_count < ARRAY_SIZE(regular_buf)) {
@@ -2460,6 +3705,23 @@ rearm_machport_event:
 static void deliver_kevents_to_thread(struct kevent_qos_s *events,
                                       int nevents)
 {
+    bool needs_event_manager = kevent_list_needs_event_manager(events, nevents);
+
+    if (needs_event_manager) {
+        pthread_mutex_lock(&event_manager_lock);
+        if (event_manager_active) {
+            stash_event_manager_events(events, nevents);
+            if (do_strace) {
+                fprintf(stderr, "  workq_monitor: deferred %d event-manager "
+                        "kevent(s) while manager active\n", nevents);
+            }
+            pthread_mutex_unlock(&event_manager_lock);
+            return;
+        }
+        event_manager_active = true;
+        pthread_mutex_unlock(&event_manager_lock);
+    }
+
     /* Try to wake a parked kevent thread first */
     parked_kevent_wq *pk = NULL;
     pthread_mutex_lock(&parked_kevent_lock);
@@ -2479,6 +3741,21 @@ static void deliver_kevents_to_thread(struct kevent_qos_s *events,
             fprintf(stderr, "  workq_monitor: waking parked kevent "
                     "thread self=0x%lx with %d events\n",
                     (unsigned long)pk->self_addr, nevents);
+            for (int i = 0; i < nevents; i++) {
+                fprintf(stderr,
+                        "    deliver-kevent[%d]: filter=%d ident=0x%llx "
+                        "flags=0x%x fflags=0x%x data=%lld udata=0x%llx "
+                        "ext=[0x%llx,0x%llx,0x%llx,0x%llx]\n",
+                        i, events[i].filter,
+                        (unsigned long long)events[i].ident,
+                        events[i].flags, events[i].fflags,
+                        (long long)events[i].data,
+                        (unsigned long long)events[i].udata,
+                        (unsigned long long)events[i].ext[0],
+                        (unsigned long long)events[i].ext[1],
+                        (unsigned long long)events[i].ext[2],
+                        (unsigned long long)events[i].ext[3]);
+            }
         }
 
         pthread_mutex_lock(&pk->mutex);
@@ -2490,6 +3767,11 @@ static void deliver_kevents_to_thread(struct kevent_qos_s *events,
 
     /* No parked kevent thread — create a new workqueue thread */
     if (!saved_wqthread || !workq_monitor_parent_env) {
+        if (needs_event_manager) {
+            pthread_mutex_lock(&event_manager_lock);
+            event_manager_active = false;
+            pthread_mutex_unlock(&event_manager_lock);
+        }
         return;
     }
 
@@ -2506,6 +3788,11 @@ static void deliver_kevents_to_thread(struct kevent_qos_s *events,
     mmap_unlock();
 
     if (stackaddr == (abi_ulong)-1) {
+        if (needs_event_manager) {
+            pthread_mutex_lock(&event_manager_lock);
+            event_manager_active = false;
+            pthread_mutex_unlock(&event_manager_lock);
+        }
         return;
     }
 
@@ -2554,12 +3841,12 @@ static void deliver_kevents_to_thread(struct kevent_qos_s *events,
      * the event manager.  XNU sets EVENT_MANAGER *without*
      * PRIO_QOS — they are mutually exclusive.
      */
-#define _PTHREAD_PRIORITY_EVENT_MANAGER_FLAG 0x02000000
     bool is_event_manager = false;
     for (int i = 0; i < nevents; i++) {
         if ((events[i].filter == EVFILT_USER ||
              events[i].filter == EVFILT_TIMER) &&
-            (saved_evfilt_user_qos & _PTHREAD_PRIORITY_EVENT_MANAGER_FLAG)) {
+            ((events[i].qos ? events[i].qos : saved_evfilt_user_qos) &
+             _PTHREAD_PRIORITY_EVENT_MANAGER_FLAG)) {
             is_event_manager = true;
             break;
         }
@@ -2569,7 +3856,6 @@ static void deliver_kevents_to_thread(struct kevent_qos_s *events,
     } else {
         flags |= WQ_FLAG_THREAD_PRIO_QOS | 4;  /* QoS default */
     }
-#undef _PTHREAD_PRIORITY_EVENT_MANAGER_FLAG
 
     if (do_strace) {
         fprintf(stderr, "  workq_monitor: creating kevent thread "
@@ -2579,7 +3865,7 @@ static void deliver_kevents_to_thread(struct kevent_qos_s *events,
                 (unsigned long)keventlist, nevents, flags);
     }
 
-    create_guest_thread(
+    int rc = create_guest_thread(
         workq_monitor_parent_env,
         saved_wqthread,
         sp,
@@ -2592,7 +3878,16 @@ static void deliver_kevents_to_thread(struct kevent_qos_s *events,
         tsd_base,
         workq_monitor_parent_ts,
         true, self_addr, stack_top,
-        stack_bottom, tsd_base);
+        stack_bottom, tsd_base, 0);
+    if (do_strace) {
+        fprintf(stderr, "  workq_monitor: kevent thread create rc=%d "
+                "self=0x%lx\n", rc, (unsigned long)self_addr);
+    }
+    if (rc < 0 && needs_event_manager) {
+        pthread_mutex_lock(&event_manager_lock);
+        event_manager_active = false;
+        pthread_mutex_unlock(&event_manager_lock);
+    }
 }
 
 /*
@@ -2614,6 +3909,18 @@ static void deliver_workloop_events_to_thread(uint64_t workloop_id,
         }
         return;
     }
+
+    if (!mark_workloop_active(workloop_id)) {
+        if (do_strace) {
+            fprintf(stderr, "  workq_monitor: deferring %d event(s) for "
+                    "active workloop wl=0x%llx\n", nevents,
+                    (unsigned long long)workloop_id);
+        }
+        defer_active_workloop_events(workloop_id, events, nevents);
+        return;
+    }
+
+    refresh_workloop_delivery_values(events, nevents);
 
     /* Try to wake a parked workloop thread first */
     parked_workloop_wq *pw = NULL;
@@ -2667,11 +3974,12 @@ static void deliver_workloop_events_to_thread(uint64_t workloop_id,
                     (unsigned long long)workloop_id, nevents);
             for (int i = 0; events && i < nevents; i++) {
                 fprintf(stderr, "    deliver kev[%d]: filter=%d ident=0x%llx "
-                        "flags=0x%x fflags=0x%x qos=0x%x udata=0x%llx "
+                        "flags=0x%x fflags=0x%x data=%lld qos=0x%x udata=0x%llx "
                         "ext=[0x%llx,0x%llx,0x%llx,0x%llx]\n",
                         i, events[i].filter,
                         (unsigned long long)events[i].ident,
-                        events[i].flags, events[i].fflags, events[i].qos,
+                        events[i].flags, events[i].fflags,
+                        (long long)events[i].data, events[i].qos,
                         (unsigned long long)events[i].udata,
                         (unsigned long long)events[i].ext[0],
                         (unsigned long long)events[i].ext[1],
@@ -2689,6 +3997,7 @@ static void deliver_workloop_events_to_thread(uint64_t workloop_id,
 
     /* No parked workloop thread — create a new one */
     if (!saved_wqthread || !workq_monitor_parent_env) {
+        clear_workloop_active(workloop_id);
         return;
     }
 
@@ -2705,6 +4014,7 @@ static void deliver_workloop_events_to_thread(uint64_t workloop_id,
     mmap_unlock();
 
     if (stackaddr == (abi_ulong)-1) {
+        clear_workloop_active(workloop_id);
         return;
     }
 
@@ -2729,7 +4039,10 @@ static void deliver_workloop_events_to_thread(uint64_t workloop_id,
      *   [kevent_qos_s]
      *   ...
      */
-    size_t events_sz = nevents * sizeof(struct kevent_qos_s);
+#define DISPATCH_DEFERRED_ITEMS_MAX 16
+    int workloop_slots = nevents > DISPATCH_DEFERRED_ITEMS_MAX
+                       ? nevents : DISPATCH_DEFERRED_ITEMS_MAX;
+    size_t events_sz = workloop_slots * sizeof(struct kevent_qos_s);
     abi_ulong sp = stack_top;
     /* Reserve space for kqueue_id_t + events */
     sp -= sizeof(uint64_t) + events_sz;
@@ -2739,9 +4052,12 @@ static void deliver_workloop_events_to_thread(uint64_t workloop_id,
     abi_ulong kqid_addr = sp;
     abi_ulong keventlist = sp + sizeof(uint64_t);
     *(uint64_t *)g2h_untagged(kqid_addr) = workloop_id;
-    if (events && events_sz > 0) {
-        memcpy(g2h_untagged(keventlist), events, events_sz);
+    memset(g2h_untagged(keventlist), 0, events_sz);
+    if (events && nevents > 0) {
+        memcpy(g2h_untagged(keventlist), events,
+               nevents * sizeof(struct kevent_qos_s));
     }
+#undef DISPATCH_DEFERRED_ITEMS_MAX
 
     sp -= 256;  /* headroom */
     sp &= ~(abi_ulong)0xF;
@@ -2762,11 +4078,12 @@ static void deliver_workloop_events_to_thread(uint64_t workloop_id,
                 (unsigned long long)workloop_id, nevents, flags);
         for (int i = 0; events && i < nevents; i++) {
             fprintf(stderr, "    deliver kev[%d]: filter=%d ident=0x%llx "
-                    "flags=0x%x fflags=0x%x qos=0x%x udata=0x%llx "
+                    "flags=0x%x fflags=0x%x data=%lld qos=0x%x udata=0x%llx "
                     "ext=[0x%llx,0x%llx,0x%llx,0x%llx]\n",
                     i, events[i].filter,
                     (unsigned long long)events[i].ident,
-                    events[i].flags, events[i].fflags, events[i].qos,
+                    events[i].flags, events[i].fflags,
+                    (long long)events[i].data, events[i].qos,
                     (unsigned long long)events[i].udata,
                     (unsigned long long)events[i].ext[0],
                     (unsigned long long)events[i].ext[1],
@@ -2775,7 +4092,7 @@ static void deliver_workloop_events_to_thread(uint64_t workloop_id,
         }
     }
 
-    create_guest_thread(
+    int rc = create_guest_thread(
         workq_monitor_parent_env,
         saved_wqthread,
         sp,
@@ -2788,7 +4105,15 @@ static void deliver_workloop_events_to_thread(uint64_t workloop_id,
         tsd_base,
         workq_monitor_parent_ts,
         true, self_addr, stack_top,
-        stack_bottom, tsd_base);
+        stack_bottom, tsd_base, workloop_id);
+    if (do_strace) {
+        fprintf(stderr, "  workq_monitor: workloop thread create rc=%d "
+                "self=0x%lx wl=0x%llx\n", rc, (unsigned long)self_addr,
+                (unsigned long long)workloop_id);
+    }
+    if (rc < 0) {
+        clear_workloop_active(workloop_id);
+    }
 }
 
 static void ensure_workq_monitor(CPUArchState *env, TaskState *ts)
@@ -2950,8 +4275,23 @@ static void *guest_thread_func(void *arg)
     pthread_cond_broadcast(&shared_info->cond);
     pthread_mutex_unlock(&shared_info->mutex);
 
+    if (do_strace && info->is_workqueue) {
+        fprintf(stderr, "  guest_thread_stage: after-start-signal "
+                "self=0x%lx pc=0x%lx\n",
+                (unsigned long)info->wq_self_addr,
+                (unsigned long)info->env->pc);
+    }
+
     rcu_register_thread();
+    if (do_strace && info->is_workqueue) {
+        fprintf(stderr, "  guest_thread_stage: after-rcu self=0x%lx\n",
+                (unsigned long)info->wq_self_addr);
+    }
     tcg_register_thread();
+    if (do_strace && info->is_workqueue) {
+        fprintf(stderr, "  guest_thread_stage: after-tcg self=0x%lx\n",
+                (unsigned long)info->wq_self_addr);
+    }
 
     env = info->env;
     cpu = env_cpu(env);
@@ -2971,6 +4311,8 @@ static void *guest_thread_func(void *arg)
         ts->wq_stack_top = info->wq_stack_top;
         ts->wq_stack_bottom = info->wq_stack_bottom;
         ts->wq_tsd_base = info->wq_tsd_base;
+        ts->wq_event_manager =
+            info->wq_flags & WQ_FLAG_THREAD_EVENT_MANAGER;
     }
 
     /*
@@ -2981,10 +4323,28 @@ static void *guest_thread_func(void *arg)
      * main thread's port and falsely detects recursion.
      */
     self_port = mach_thread_self();
+    if (do_strace && info->is_workqueue) {
+        fprintf(stderr, "  guest_thread_stage: after-mach-self "
+                "self=0x%lx port=0x%x\n",
+                (unsigned long)info->wq_self_addr, self_port);
+    }
     env->xregs[1] = (abi_ulong)self_port;
     write_mach_thread_self_tsd_slot(
         info->is_workqueue ? info->wq_tsd_base : info->tsd_base,
         self_port);
+
+    if (do_strace && info->is_workqueue) {
+        fprintf(stderr,
+                "  guest_thread_start: pc=0x%lx self=0x%lx "
+                "sp=0x%lx x2=0x%lx x3=0x%lx flags=0x%lx nevents=%lu\n",
+                (unsigned long)env->pc,
+                (unsigned long)env->xregs[0],
+                (unsigned long)env->xregs[31],
+                (unsigned long)env->xregs[2],
+                (unsigned long)env->xregs[3],
+                (unsigned long)env->xregs[4],
+                (unsigned long)env->xregs[5]);
+    }
 
     /* Wait for parent to finish setup */
     pthread_mutex_lock(&clone_lock);
@@ -3009,7 +4369,8 @@ static int create_guest_thread(CPUArchState *parent_env,
                                TaskState *parent_ts,
                                bool is_workqueue,
                                abi_ulong wq_self, abi_ulong wq_stop,
-                               abi_ulong wq_sbot, abi_ulong wq_tsd)
+                               abi_ulong wq_sbot, abi_ulong wq_tsd,
+                               uint64_t active_workloop_id)
 {
     CPUState *parent_cpu = env_cpu(parent_env);
     CPUArchState *new_env;
@@ -3035,6 +4396,7 @@ static int create_guest_thread(CPUArchState *parent_env,
     ts->bprm = parent_ts->bprm;
     ts->info = parent_ts->info;
     ts->signal_mask = parent_ts->signal_mask;
+    ts->active_workloop_id = active_workloop_id;
     new_cpu->opaque = ts;
 
     /* Set up the new thread's registers */
@@ -3052,11 +4414,10 @@ static int create_guest_thread(CPUArchState *parent_env,
     }
 
     /*
-     * Set up TPIDRRO_EL0 for the new thread.
-     * For workqueue threads, tsd_base = self + tsd_offset.
-     * The kernel sets this via thread_set_tsd_base().
+     * Set up TPIDRRO_EL0 for the new thread.  TPIDR_EL0 is libplatform's
+     * cthread slot and is inherited from the parent CPU state; pthread_self()
+     * is reached through TPIDRRO_EL0/TSD, not by overwriting TPIDR_EL0.
      */
-    new_env->cp15.tpidr_el[0] = is_workqueue ? wq_self : 0;
     new_env->cp15.tpidrro_el[0] = tsd_base;
 
     /* Prepare thread info for synchronization */
@@ -3072,6 +4433,7 @@ static int create_guest_thread(CPUArchState *parent_env,
     info.wq_stack_top = wq_stop;
     info.wq_stack_bottom = wq_sbot;
     info.wq_tsd_base = wq_tsd;
+    info.wq_flags = (int)arg4;
 
     /* Create host thread */
     pthread_t thread_id;
@@ -3149,8 +4511,8 @@ static void apply_slide_info_v5(CPUARMState *env,
                                 uint64_t region_size,
                                 uint32_t slide)
 {
-    /* dyld_cache_slide_info5 header (20 bytes) */
-    if (slide_len < 20) {
+    /* dyld_cache_slide_info5 header (24 bytes including value_add). */
+    if (slide_len < 24) {
         return;
     }
     uint32_t version, page_size, page_starts_count;
@@ -3161,7 +4523,8 @@ static void apply_slide_info_v5(CPUARMState *env,
     /* 4 bytes padding at offset 12 */
     memcpy(&value_add, slide_buf + 16, 8);
 
-    if (version != 5 || page_size == 0 || page_starts_count == 0) {
+    if (version != 5 || page_size == 0 || (page_size & 7) ||
+        page_starts_count == 0) {
         if (do_strace) {
             fprintf(stderr, "qemu: slide info version %u (expected 5), skipping\n",
                     version);
@@ -3184,20 +4547,32 @@ static void apply_slide_info_v5(CPUARMState *env,
         }
 
         uint64_t page_off = (uint64_t)pi * page_size;
-        if (page_off + start >= region_size) {
+        if (page_off >= region_size) {
             break;
         }
+        uint64_t page_available = MIN((uint64_t)page_size,
+                                      region_size - page_off);
+        if ((start & 7) || start + sizeof(uint64_t) > page_available) {
+            if (do_strace) {
+                fprintf(stderr, "qemu: invalid slide chain start page=%u "
+                        "start=0x%x page_available=0x%llx\n",
+                        pi, start, (unsigned long long)page_available);
+            }
+            continue;
+        }
 
-        uint8_t *loc = (uint8_t *)mapped_host + page_off;
-        uint64_t delta = start;
+        uint8_t *page_base = (uint8_t *)mapped_host + page_off;
+        uint8_t *page_end = page_base + page_available;
+        uint8_t *loc = page_base + start;
+        uint32_t max_chain_entries = page_available / sizeof(uint64_t);
 
-        do {
-            loc += delta;
+        for (uint32_t chain = 0; chain < max_chain_entries; chain++) {
             uint64_t raw;
             memcpy(&raw, loc, 8);
 
             /* Extract chain-next delta (bits 62:52, in 8-byte units) */
-            delta = ((raw & 0x7FF0000000000000ULL) >> 52) * 8;
+            uint64_t delta =
+                ((raw & 0x7FF0000000000000ULL) >> 52) * 8;
 
             bool is_auth = (raw & (1ULL << 63)) != 0;
             uint64_t runtime_offset = raw & 0x3FFFFFFFFULL;
@@ -3211,7 +4586,7 @@ static void apply_slide_info_v5(CPUARMState *env,
                 uint64_t modifier;
                 if (addr_div) {
                     uint64_t slot_addr = guest_addr +
-                        (uint64_t)((uint8_t *)loc - (uint8_t *)mapped_host);
+                        (uint64_t)(loc - (uint8_t *)mapped_host);
                     modifier = ((uint64_t)diversity << 48) |
                                (slot_addr & 0x0000FFFFFFFFFFFFULL);
                 } else {
@@ -3230,7 +4605,23 @@ static void apply_slide_info_v5(CPUARMState *env,
             }
 
             memcpy(loc, &target, 8);
-        } while (delta != 0);
+            if (delta == 0) {
+                break;
+            }
+
+            uint64_t remaining =
+                (uint64_t)(page_end - (loc + sizeof(uint64_t)));
+            if (delta > remaining) {
+                if (do_strace) {
+                    fprintf(stderr, "qemu: slide chain page=%u escaped page "
+                            "at offset=0x%llx delta=0x%llx\n",
+                            pi, (unsigned long long)(loc - page_base),
+                            (unsigned long long)delta);
+                }
+                break;
+            }
+            loc += delta;
+        }
     }
 }
 
@@ -3239,12 +4630,103 @@ static void apply_slide_info_v5(CPUARMState *env,
 /* Guest address of the mapped shared cache (0 = not yet mapped) */
 static uint64_t guest_shared_cache_addr;
 
+#define TARGET_ULF_NO_ERRNO 0x01000000u
+#define WORKLOOP_BLOCKING_POLL_SLICE_MS 50
+
+static void service_blocking_workloop_events(void)
+{
+    service_workloop_machport_events();
+    service_pending_workloop_reqs();
+    service_workq_notification_events();
+}
+
+static bool ulock_syscall_error(long host_ret, uint32_t op, int *host_errno)
+{
+    if (op & TARGET_ULF_NO_ERRNO) {
+        if (host_ret < 0) {
+            *host_errno = (int)-host_ret;
+            return true;
+        }
+        return false;
+    }
+
+    if (host_ret == -1) {
+        *host_errno = errno;
+        return true;
+    }
+    return false;
+}
+
+static bool macos_signal_pending(CPUARMState *env)
+{
+    TaskState *ts = get_task_state(env_cpu(env));
+
+    return qatomic_read(&ts->signal_pending) != 0;
+}
+
+static bool consume_workloop_sync_wake_for_ulock(uint64_t wl_id,
+                                                 abi_ulong wait_addr,
+                                                 uint64_t value,
+                                                 const char *where)
+{
+    if (!consume_workloop_sync_wake(wl_id)) {
+        return false;
+    }
+
+    if (guest_range_valid_untagged(wait_addr, sizeof(uint32_t))) {
+        *(uint32_t *)g2h_untagged(wait_addr) = 0;
+    }
+    if (do_strace) {
+        fprintf(stderr, "  ulock_wait: consuming workloop sync wake%s%s "
+                "wl=0x%llx addr=0x%llx value=0x%llx\n",
+                where && where[0] ? " " : "",
+                where && where[0] ? where : "",
+                (unsigned long long)wl_id,
+                (unsigned long long)wait_addr,
+                (unsigned long long)value);
+    }
+    return true;
+}
+
+static long interrupted_ulock_ret(uint32_t op)
+{
+    if (op & TARGET_ULF_NO_ERRNO) {
+        return -(long)EINTR;
+    }
+    errno = EINTR;
+    return -1;
+}
+
+static abi_long finish_ulock_syscall(CPUARMState *env, long host_ret,
+                                     uint32_t op)
+{
+    if ((op & TARGET_ULF_NO_ERRNO) && host_ret < 0) {
+        env->CF = 0;
+        env->xregs[0] = (uint64_t)(int64_t)host_ret;
+        return -TARGET_EJUSTRETURN;
+    }
+
+    if (host_ret == -1) {
+        int host_errno = errno;
+
+        if (op & TARGET_ULF_NO_ERRNO) {
+            env->CF = 0;
+            env->xregs[0] = (uint64_t)(int64_t)-host_errno;
+            return -TARGET_EJUSTRETURN;
+        }
+        return -host_errno;
+    }
+
+    return host_ret;
+}
+
 abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                           abi_long arg2, abi_long arg3, abi_long arg4,
                           abi_long arg5, abi_long arg6, abi_long arg7,
                           abi_long arg8)
 {
     CPUState *cpu = env_cpu(cpu_env);
+    CPUARMState *env = cpu_env;
     abi_long ret;
 
     if (do_strace) {
@@ -4390,6 +5872,95 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
         }
         break;
 
+    case TARGET_MACOS_NR_psynch_rw_longrdlock:
+        ret = get_errno(syscall(SYS_psynch_rw_longrdlock,
+                                g2h_untagged(arg1), (uint32_t)arg2,
+                                (uint32_t)arg3, (uint32_t)arg4, (int)arg5));
+        break;
+
+    case TARGET_MACOS_NR_psynch_rw_yieldwrlock:
+        ret = get_errno(syscall(SYS_psynch_rw_yieldwrlock,
+                                g2h_untagged(arg1), (uint32_t)arg2,
+                                (uint32_t)arg3, (uint32_t)arg4, (int)arg5));
+        break;
+
+    case TARGET_MACOS_NR_psynch_rw_downgrade:
+        ret = get_errno(syscall(SYS_psynch_rw_downgrade,
+                                g2h_untagged(arg1), (uint32_t)arg2,
+                                (uint32_t)arg3, (uint32_t)arg4, (int)arg5));
+        break;
+
+    case TARGET_MACOS_NR_psynch_rw_upgrade:
+        ret = get_errno(syscall(SYS_psynch_rw_upgrade,
+                                g2h_untagged(arg1), (uint32_t)arg2,
+                                (uint32_t)arg3, (uint32_t)arg4, (int)arg5));
+        break;
+
+    case TARGET_MACOS_NR_psynch_mutexwait:
+        ret = get_errno(syscall(SYS_psynch_mutexwait, g2h_untagged(arg1),
+                                (uint32_t)arg2, (uint32_t)arg3,
+                                (uint64_t)arg4, (uint32_t)arg5));
+        break;
+
+    case TARGET_MACOS_NR_psynch_mutexdrop:
+        ret = get_errno(syscall(SYS_psynch_mutexdrop, g2h_untagged(arg1),
+                                (uint32_t)arg2, (uint32_t)arg3,
+                                (uint64_t)arg4, (uint32_t)arg5));
+        break;
+
+    case TARGET_MACOS_NR_psynch_cvbroad:
+        ret = get_errno(syscall(SYS_psynch_cvbroad, g2h_untagged(arg1),
+                                (uint64_t)arg2, (uint64_t)arg3,
+                                (uint32_t)arg4, g2h_untagged(arg5),
+                                (uint64_t)arg6, (uint64_t)arg7));
+        break;
+
+    case TARGET_MACOS_NR_psynch_cvsignal:
+        ret = get_errno(syscall(SYS_psynch_cvsignal, g2h_untagged(arg1),
+                                (uint64_t)arg2, (uint32_t)arg3, (int)arg4,
+                                g2h_untagged(arg5), (uint64_t)arg6,
+                                (uint64_t)arg7, (uint32_t)arg8));
+        break;
+
+    case TARGET_MACOS_NR_psynch_cvwait:
+        ret = get_errno(syscall(SYS_psynch_cvwait, g2h_untagged(arg1),
+                                (uint64_t)arg2, (uint32_t)arg3,
+                                g2h_untagged(arg4), (uint64_t)arg5,
+                                (uint32_t)arg6, (int64_t)arg7,
+                                (uint32_t)arg8));
+        break;
+
+    case TARGET_MACOS_NR_psynch_rw_rdlock:
+        ret = get_errno(syscall(SYS_psynch_rw_rdlock, g2h_untagged(arg1),
+                                (uint32_t)arg2, (uint32_t)arg3,
+                                (uint32_t)arg4, (int)arg5));
+        break;
+
+    case TARGET_MACOS_NR_psynch_rw_wrlock:
+        ret = get_errno(syscall(SYS_psynch_rw_wrlock, g2h_untagged(arg1),
+                                (uint32_t)arg2, (uint32_t)arg3,
+                                (uint32_t)arg4, (int)arg5));
+        break;
+
+    case TARGET_MACOS_NR_psynch_rw_unlock:
+        ret = get_errno(syscall(SYS_psynch_rw_unlock, g2h_untagged(arg1),
+                                (uint32_t)arg2, (uint32_t)arg3,
+                                (uint32_t)arg4, (int)arg5));
+        break;
+
+    case TARGET_MACOS_NR_psynch_rw_unlock2:
+        ret = get_errno(syscall(SYS_psynch_rw_unlock2, g2h_untagged(arg1),
+                                (uint32_t)arg2, (uint32_t)arg3,
+                                (uint32_t)arg4, (int)arg5));
+        break;
+
+    case TARGET_MACOS_NR_psynch_cvclrprepost:
+        ret = get_errno(syscall(SYS_psynch_cvclrprepost, g2h_untagged(arg1),
+                                (uint32_t)arg2, (uint32_t)arg3,
+                                (uint32_t)arg4, (uint32_t)arg5,
+                                (uint32_t)arg6, (uint32_t)arg7));
+        break;
+
     /*
      * ulock_wait / ulock_wake / ulock_wait2
      *
@@ -4399,32 +5970,128 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
      * kernel so the futex-like wait/wake mechanism works correctly.
      */
     case TARGET_MACOS_NR_ulock_wait:
-        /* __ulock_wait(uint32_t op, void *addr, uint64_t value,
-         *              uint32_t timeout_us) */
-        ret = get_errno(syscall(SYS_ulock_wait,
-                                (uint32_t)arg1,
-                                g2h_untagged(arg2),
-                                (uint64_t)arg3,
-                                (uint32_t)arg4));
+        /*
+         * __ulock_wait(uint32_t op, void *addr, uint64_t value,
+         *              uint32_t timeout_us)
+         *
+         * libdispatch waits for queue/thread-event handoffs here.  Mirror the
+         * semwait path by periodically servicing emulated workloop events while
+         * a guest thread is blocked in an indefinite host ulock wait.
+         */
+        {
+            uint32_t op = (uint32_t)arg1;
+            void *addr = g2h_untagged(arg2);
+            uint64_t value = (uint64_t)arg3;
+            uint32_t remaining_us = (uint32_t)arg4;
+            bool indefinite = remaining_us == 0;
+            long rv;
+            int host_errno = 0;
+
+            do {
+                uint32_t slice_us = indefinite
+                    ? WORKLOOP_BLOCKING_POLL_SLICE_MS * 1000
+                    : MIN(remaining_us,
+                          WORKLOOP_BLOCKING_POLL_SLICE_MS * 1000);
+                uint64_t wait_workloop = (uint64_t)arg5;
+
+                if (indefinite && wait_workloop &&
+                    consume_workloop_sync_wake_for_ulock(wait_workloop,
+                                                         (abi_ulong)arg2,
+                                                         value, "")) {
+                    rv = 0;
+                    break;
+                }
+
+                service_blocking_workloop_events();
+                if (indefinite && wait_workloop &&
+                    consume_workloop_sync_wake_for_ulock(wait_workloop,
+                                                         (abi_ulong)arg2,
+                                                         value,
+                                                         "after service")) {
+                    rv = 0;
+                    break;
+                }
+                rv = syscall(SYS_ulock_wait, op, addr, value, slice_us);
+                if (!ulock_syscall_error(rv, op, &host_errno) ||
+                    host_errno != ETIMEDOUT) {
+                    break;
+                }
+                service_blocking_workloop_events();
+                if (indefinite && wait_workloop &&
+                    consume_workloop_sync_wake_for_ulock(wait_workloop,
+                                                         (abi_ulong)arg2,
+                                                         value,
+                                                         "after timeout")) {
+                    rv = 0;
+                    break;
+                }
+                if (macos_signal_pending(env)) {
+                    rv = interrupted_ulock_ret(op);
+                    break;
+                }
+                if (!indefinite) {
+                    if (remaining_us <= slice_us) {
+                        break;
+                    }
+                    remaining_us -= slice_us;
+                }
+            } while (indefinite || remaining_us > 0);
+
+            ret = finish_ulock_syscall(env, rv, op);
+        }
         break;
 
     case TARGET_MACOS_NR_ulock_wake:
         /* __ulock_wake(uint32_t op, void *addr, uint64_t wake_value) */
-        ret = get_errno(syscall(SYS_ulock_wake,
-                                (uint32_t)arg1,
-                                g2h_untagged(arg2),
-                                (uint64_t)arg3));
+        ret = finish_ulock_syscall(env,
+                                   syscall(SYS_ulock_wake,
+                                           (uint32_t)arg1,
+                                           g2h_untagged(arg2),
+                                           (uint64_t)arg3),
+                                   (uint32_t)arg1);
         break;
 
     case TARGET_MACOS_NR_ulock_wait2:
         /* __ulock_wait2(uint32_t op, void *addr, uint64_t value,
          *               uint64_t timeout_ns, uint64_t value2) */
-        ret = get_errno(syscall(SYS_ulock_wait2,
-                                (uint32_t)arg1,
-                                g2h_untagged(arg2),
-                                (uint64_t)arg3,
-                                (uint64_t)arg4,
-                                (uint64_t)arg5));
+        {
+            uint32_t op = (uint32_t)arg1;
+            void *addr = g2h_untagged(arg2);
+            uint64_t value = (uint64_t)arg3;
+            uint64_t remaining_ns = (uint64_t)arg4;
+            uint64_t value2 = (uint64_t)arg5;
+            bool indefinite = remaining_ns == 0;
+            uint64_t slice_ns = (uint64_t)WORKLOOP_BLOCKING_POLL_SLICE_MS *
+                                1000000ULL;
+            long rv;
+            int host_errno = 0;
+
+            do {
+                uint64_t this_ns = indefinite ? slice_ns
+                    : MIN(remaining_ns, slice_ns);
+
+                service_blocking_workloop_events();
+                rv = syscall(SYS_ulock_wait2, op, addr, value, this_ns,
+                             value2);
+                if (!ulock_syscall_error(rv, op, &host_errno) ||
+                    host_errno != ETIMEDOUT) {
+                    break;
+                }
+                service_blocking_workloop_events();
+                if (macos_signal_pending(env)) {
+                    rv = interrupted_ulock_ret(op);
+                    break;
+                }
+                if (!indefinite) {
+                    if (remaining_ns <= this_ns) {
+                        break;
+                    }
+                    remaining_ns -= this_ns;
+                }
+            } while (indefinite || remaining_ns > 0);
+
+            ret = finish_ulock_syscall(env, rv, op);
+        }
         break;
 
     case TARGET_MACOS_NR_bsdthread_ctl:
@@ -4501,7 +6168,7 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                 arg5 | PTHREAD_START_TSD_BASE_SET, /* x5 = flags */
                 tsd_base,
                 parent_ts,
-                false, 0, 0, 0, 0);        /* not a wq thread */
+                false, 0, 0, 0, 0, 0);     /* not a wq thread */
 
             if (rc < 0) {
                 ret = rc;
@@ -4528,6 +6195,8 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                 mmap_unlock();
             }
             /* Exit this thread (not the whole process) */
+            thread_cpu = NULL;
+            rcu_unregister_thread();
             pthread_exit(NULL);
         }
         break;
@@ -4816,7 +6485,7 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                         tsd_base,        /* TPIDRRO_EL0 */
                         parent_ts,
                         true, self_addr, stack_top,
-                        stack_bottom, tsd_base);
+                        stack_bottom, tsd_base, 0);
 
                     if (do_strace) {
                         fprintf(stderr, "  create_guest_thread: rc=%d\n", rc);
@@ -4843,6 +6512,21 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                     strace_dump_guest_backtrace((CPUArchState *)cpu_env,
                                                 "WQOPS_THREAD_RETURN");
                 }
+                TaskState *ts = get_task_state(env_cpu((CPUArchState *)cpu_env));
+                if (ts && ts->active_workloop_id) {
+                    if (do_strace) {
+                        fprintf(stderr, "  WQOPS_THREAD_RETURN: clearing "
+                                "active workloop wl=0x%llx\n",
+                                (unsigned long long)ts->active_workloop_id);
+                    }
+                    clear_workloop_active(ts->active_workloop_id);
+                    set_workloop_sync_wake_inflight(ts->active_workloop_id,
+                                                    false);
+                    clear_workloop_readiness_inflight(ts->active_workloop_id);
+                    ts->active_workloop_id = 0;
+                }
+                thread_cpu = NULL;
+                rcu_unregister_thread();
                 pthread_exit(NULL);
             }
 
@@ -4858,10 +6542,17 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                     ? (struct kevent_qos_s *)g2h_untagged(arg2) : NULL;
                 int nchanges = (int)arg3;
                 uint64_t current_wl_id = 0;
+                bool ended_ownership = false;
+                bool sync_end_changelist = false;
+                bool sync_wait_changelist = false;
 
                 if (arg2) {
                     abi_ulong kqid_addr = arg2 - sizeof(uint64_t);
                     current_wl_id = *(uint64_t *)g2h_untagged(kqid_addr);
+                }
+                TaskState *ts = get_task_state(env_cpu((CPUArchState *)cpu_env));
+                if (!current_wl_id && ts) {
+                    current_wl_id = ts->active_workloop_id;
                 }
 
                 if (do_strace) {
@@ -4885,6 +6576,21 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                 }
 
                 for (int i = 0; cl && i < nchanges; i++) {
+                    if (cl[i].filter == EVFILT_WORKLOOP_PRIVATE &&
+                        (cl[i].fflags & NOTE_WL_END_OWNERSHIP)) {
+                        ended_ownership = true;
+                    }
+                    if (cl[i].filter == EVFILT_WORKLOOP_PRIVATE &&
+                        (cl[i].fflags & NOTE_WL_END_OWNERSHIP)) {
+                        sync_end_changelist = true;
+                    }
+                    if (cl[i].filter == EVFILT_WORKLOOP_PRIVATE &&
+                        (cl[i].fflags & NOTE_WL_SYNC_WAIT)) {
+                        sync_wait_changelist = true;
+                    }
+                }
+
+                for (int i = 0; cl && i < nchanges; i++) {
                     if (cl[i].filter == EVFILT_MACHPORT) {
                         if (cl[i].flags & EV_DELETE) {
                             remove_workloop_port((mach_port_t)cl[i].ident);
@@ -4893,9 +6599,36 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                         }
                     } else if (cl[i].filter == EVFILT_WORKLOOP_PRIVATE &&
                                (cl[i].fflags & NOTE_WL_THREAD_REQUEST)) {
-                        store_pending_workloop_req(current_wl_id, &cl[i],
-                                                   true);
+                        if (cl[i].flags & EV_DELETE) {
+                            clear_pending_workloop_req(current_wl_id);
+                        } else if (sync_end_changelist &&
+                                   !sync_wait_changelist) {
+                            cache_workloop_req_template(current_wl_id, &cl[i]);
+                            store_pending_workloop_req(current_wl_id, &cl[i],
+                                                       true);
+                            if (do_strace) {
+                            fprintf(stderr,
+                                    "  WQOPS_THREAD_WORKLOOP_RETURN: "
+                                    "THREAD_REQUEST sync-end state "
+                                    "update stored zero-wake wl=0x%llx\n",
+                                    (unsigned long long)current_wl_id);
+                            }
+                        } else {
+                            if (cl[i].fflags == NOTE_WL_THREAD_REQUEST &&
+                                (cl[i].ext[EV_EXTIDX_WL_VALUE] >> 56) == 0xff) {
+                                record_workloop_sync_wake(
+                                    current_wl_id, "workloop-return");
+                            }
+                            store_pending_workloop_req(current_wl_id, &cl[i],
+                                                       true);
+                        }
                     }
+                }
+
+                if (ended_ownership) {
+                    clear_workloop_active(current_wl_id);
+                    set_workloop_sync_wake_inflight(current_wl_id, false);
+                    clear_workloop_readiness_inflight(current_wl_id);
                 }
 
                 if (cl && nchanges > 0) {
@@ -4915,47 +6648,70 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                 pw.env = (CPUArchState *)cpu_env;
                 pw.has_work = false;
 
-                TaskState *ts = get_task_state(
-                    env_cpu((CPUArchState *)cpu_env));
                 pw.self_addr = ts->wq_self_addr;
                 pw.stack_top = ts->wq_stack_top;
                 pw.stack_bottom = ts->wq_stack_bottom;
                 pw.tsd_base = ts->wq_tsd_base;
                 pw.workloop_id = current_wl_id;
 
-                pthread_mutex_lock(&parked_workloop_lock);
-                pw.next = parked_workloop_list;
-                parked_workloop_list = &pw;
-                pthread_mutex_unlock(&parked_workloop_lock);
-                set_workloop_sync_wake_inflight(current_wl_id, false);
-
+                /*
+                 * Check for ready work before publishing this stack-local
+                 * parked record.  Otherwise the monitor can race in, remove
+                 * the parked thread, and deliver a later reply while the
+                 * return path is still holding an earlier prereceived reply.
+                 */
                 if (current_wl_id) {
                     struct kevent_qos_s events[16];
                     int nevents = prepare_workloop_events(current_wl_id, false,
                                                           NULL, events,
-                                                          ARRAY_SIZE(events));
+                                                          ARRAY_SIZE(events),
+                                                          true);
                     if (nevents > 0) {
                         if (do_strace) {
                             fprintf(stderr, "  WQOPS_THREAD_WORKLOOP_RETURN: "
-                                    "self-waking wl=0x%llx with %d event(s)\n",
+                                    "immediate reuse wl=0x%llx with %d event(s)\n",
                                     (unsigned long long)current_wl_id,
                                     nevents);
                         }
-                        deliver_workloop_events_to_thread(current_wl_id,
-                                                          events, nevents);
+                        pw.delivered_events = g_malloc(
+                            nevents * sizeof(struct kevent_qos_s));
+                        memcpy(pw.delivered_events, events,
+                               nevents * sizeof(struct kevent_qos_s));
+                        pw.delivered_nevents = nevents;
+                        mark_workloop_active(current_wl_id);
+                        ts->active_workloop_id = current_wl_id;
                     }
                 }
 
-                /* Wait for events from monitor thread */
-                pthread_mutex_lock(&pw.mutex);
-                while (!pw.has_work) {
-                    pthread_cond_wait(&pw.cond, &pw.mutex);
+                if (pw.delivered_nevents == 0) {
+                    pthread_mutex_lock(&parked_workloop_lock);
+                    pw.next = parked_workloop_list;
+                    parked_workloop_list = &pw;
+                    pthread_mutex_unlock(&parked_workloop_lock);
+                    clear_workloop_active(current_wl_id);
+                    if (ts && ts->active_workloop_id == current_wl_id) {
+                        ts->active_workloop_id = 0;
+                    }
+                    set_workloop_sync_wake_inflight(current_wl_id, false);
+
+                    /* Wait for events from monitor thread */
+                    pthread_mutex_lock(&pw.mutex);
+                    while (!pw.has_work) {
+                        pthread_cond_wait(&pw.cond, &pw.mutex);
+                    }
+                    pthread_mutex_unlock(&pw.mutex);
                 }
-                pthread_mutex_unlock(&pw.mutex);
+                if (ts) {
+                    ts->active_workloop_id = pw.workloop_id;
+                }
 
                 /* Copy delivered events to guest stack with wl ID */
                 CPUArchState *env = (CPUArchState *)cpu_env;
-                size_t ev_sz = pw.delivered_nevents
+#define DISPATCH_DEFERRED_ITEMS_MAX 16
+                int workloop_slots = pw.delivered_nevents
+                    > DISPATCH_DEFERRED_ITEMS_MAX
+                    ? pw.delivered_nevents : DISPATCH_DEFERRED_ITEMS_MAX;
+                size_t ev_sz = workloop_slots
                              * sizeof(struct kevent_qos_s);
                 abi_ulong sp = pw.stack_top;
                 sp -= sizeof(uint64_t) + ev_sz;
@@ -4964,8 +6720,11 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                 abi_ulong kqid_addr = sp;
                 abi_ulong keventlist = sp + sizeof(uint64_t);
                 *(uint64_t *)g2h_untagged(kqid_addr) = pw.workloop_id;
+                memset(g2h_untagged(keventlist), 0, ev_sz);
                 memcpy(g2h_untagged(keventlist),
-                       pw.delivered_events, ev_sz);
+                       pw.delivered_events,
+                       pw.delivered_nevents * sizeof(struct kevent_qos_s));
+#undef DISPATCH_DEFERRED_ITEMS_MAX
                 sp -= 256;
                 sp &= ~(abi_ulong)0xF;
 
@@ -4974,6 +6733,7 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                     | WQ_FLAG_THREAD_NEWSPI
                     | WQ_FLAG_THREAD_KEVENT
                     | WQ_FLAG_THREAD_PRIO_QOS | 4;
+                ts->wq_event_manager = false;
 
                 mach_port_t self_port = mach_thread_self();
 
@@ -4987,7 +6747,7 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                 env->xregs[5] = pw.delivered_nevents;
                 env->xregs[29] = 0;
                 env->xregs[30] = 0;
-                env->cp15.tpidr_el[0] = pw.self_addr;
+                env->cp15.tpidrro_el[0] = pw.tsd_base;
                 write_mach_thread_self_tsd_slot(pw.tsd_base, self_port);
 
                 g_free(pw.delivered_events);
@@ -5009,6 +6769,26 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                 struct kevent_qos_s *cl = arg2
                     ? (struct kevent_qos_s *)g2h_untagged(arg2) : NULL;
                 int nchanges = (int)arg3;
+
+                if (do_strace) {
+                    fprintf(stderr, "  WQOPS_THREAD_KEVENT_RETURN: "
+                            "nchanges=%d\n", nchanges);
+                    for (int i = 0; cl && i < nchanges; i++) {
+                        fprintf(stderr,
+                                "    kevent return kev[%d]: filter=%d "
+                                "ident=0x%llx flags=0x%x fflags=0x%x "
+                                "qos=0x%x udata=0x%llx "
+                                "ext=[0x%llx,0x%llx,0x%llx,0x%llx]\n",
+                                i, cl[i].filter,
+                                (unsigned long long)cl[i].ident,
+                                cl[i].flags, cl[i].fflags, cl[i].qos,
+                                (unsigned long long)cl[i].udata,
+                                (unsigned long long)cl[i].ext[0],
+                                (unsigned long long)cl[i].ext[1],
+                                (unsigned long long)cl[i].ext[2],
+                                (unsigned long long)cl[i].ext[3]);
+                    }
+                }
 
                 if (cl && nchanges > 0) {
                     int rc = workq_kqueue_register(cl, nchanges);
@@ -5034,6 +6814,27 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                 pk.stack_bottom = ts->wq_stack_bottom;
                 pk.tsd_base = ts->wq_tsd_base;
 
+                if (ts->wq_event_manager) {
+                    struct kevent_qos_s pending_events[16];
+                    int pending_nevents =
+                        finish_event_manager_turn(pending_events,
+                                                  ARRAY_SIZE(pending_events));
+
+                    if (pending_nevents > 0) {
+                        pk.delivered_events = g_memdup2(
+                            pending_events,
+                            pending_nevents * sizeof(pending_events[0]));
+                        pk.delivered_nevents = pending_nevents;
+                        if (do_strace) {
+                            fprintf(stderr, "  WQOPS_THREAD_KEVENT_RETURN: "
+                                    "reusing event manager for %d deferred "
+                                    "kevent(s)\n", pending_nevents);
+                        }
+                        goto redispatch_kevent_thread;
+                    }
+                    ts->wq_event_manager = false;
+                }
+
                 pthread_mutex_lock(&parked_kevent_lock);
                 pk.next = parked_kevent_list;
                 parked_kevent_list = &pk;
@@ -5046,6 +6847,8 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                 }
                 pthread_mutex_unlock(&pk.mutex);
 
+redispatch_kevent_thread:
+                ;
                 /* Copy delivered events to guest stack.
                  * Allocate at least 16 slots because libdispatch
                  * reuses this buffer for deferred items.
@@ -5075,12 +6878,13 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
 
                 /* Check if delivered events need event manager flag.
                  * EVENT_MANAGER and PRIO_QOS are mutually exclusive. */
-#define _PTHREAD_PRIORITY_EVENT_MANAGER_FLAG 0x02000000
                 bool reuse_is_mgr = false;
                 for (int ei = 0; ei < pk.delivered_nevents; ei++) {
                     if ((pk.delivered_events[ei].filter == EVFILT_USER ||
                          pk.delivered_events[ei].filter == EVFILT_TIMER) &&
-                        (saved_evfilt_user_qos &
+                        ((pk.delivered_events[ei].qos
+                          ? pk.delivered_events[ei].qos
+                          : saved_evfilt_user_qos) &
                          _PTHREAD_PRIORITY_EVENT_MANAGER_FLAG)) {
                         reuse_is_mgr = true;
                         break;
@@ -5091,7 +6895,7 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                 } else {
                     reuse_flags |= WQ_FLAG_THREAD_PRIO_QOS | 4;
                 }
-#undef _PTHREAD_PRIORITY_EVENT_MANAGER_FLAG
+                ts->wq_event_manager = reuse_is_mgr;
 
                 mach_port_t self_port = mach_thread_self();
 
@@ -5105,7 +6909,7 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                 env->xregs[5] = pk.delivered_nevents;
                 env->xregs[29] = 0;
                 env->xregs[30] = 0;
-                env->cp15.tpidr_el[0] = pk.self_addr;
+                env->cp15.tpidrro_el[0] = pk.tsd_base;
                 write_mach_thread_self_tsd_slot(pk.tsd_base, self_port);
 
                 g_free(pk.delivered_events);
@@ -5268,8 +7072,6 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
              * prevents the monitor from stealing messages when
              * the guest has a direct mach_msg receive in flight.
              */
-#define EVFILT_USER_PRIVATE (-10)
-#define EVFILT_TIMER_PRIVATE (-7)
             if (cl && nchanges > 0 && saved_wqthread) {
                 TaskState *ts = get_task_state(
                     env_cpu((CPUArchState *)cpu_env));
@@ -5278,10 +7080,18 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                 int wkq = get_workq_kqueue();
                 for (int i = 0; i < nchanges; i++) {
                     int f = cl[i].filter;
-                    if (f == EVFILT_USER_PRIVATE
-                        || f == EVFILT_TIMER_PRIVATE) {
+                    if (f == EVFILT_TIMER_PRIVATE) {
+                        int rc = register_workq_timer(&cl[i]);
+                        if (do_strace) {
+                            fprintf(stderr, "    registered TIMER "
+                                    "ident=0x%llx on workq timer rc=%d%s\n",
+                                    (unsigned long long)cl[i].ident, rc,
+                                    rc < 0 ? " (FAILED)" : "");
+                        }
+                    } else if (f == EVFILT_USER_PRIVATE) {
                         struct kevent64_s k64;
                         kqos_to_k64(&cl[i], &k64);
+                        remember_workq_knote_qos(&cl[i]);
                         /* Save udata/qos for EVFILT_USER re-triggers.
                          * Only save from the initial EV_ADD registration,
                          * not from NOTE_TRIGGER pokes which have qos=0. */
@@ -5330,8 +7140,6 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                     }
                 }
             }
-#undef EVFILT_USER_PRIVATE
-#undef EVFILT_TIMER_PRIVATE
 
             ret = 0;
             if (do_strace) {
@@ -5426,10 +7234,87 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
         if (cl && nchanges > 0) {
             TaskState *ts = get_task_state(
                 env_cpu((CPUArchState *)cpu_env));
+            struct kevent_qos_s latest_thread_req;
+            bool have_latest_thread_req = false;
+            bool sync_end_changelist = false;
+            bool sync_wait_changelist = false;
+            bool sync_wait_thread_req_handled = false;
+            bool *skip_change = g_new0(bool, nchanges);
+            struct kevent_qos_s *eventlist = arg4
+                ? (struct kevent_qos_s *)g2h_untagged(arg4) : NULL;
+            int maxevents = (int)arg5;
+            int error_events = 0;
+
             /* Ensure monitor is initialized for thread creation */
             ensure_workq_monitor((CPUArchState *)cpu_env, ts);
 
             for (int i = 0; i < nchanges; i++) {
+                int wl_error = refresh_workloop_state_update(&cl[i]);
+
+                if (wl_error == 0) {
+                    continue;
+                }
+                if (wl_error == ESTALE &&
+                    (cl[i].fflags & NOTE_WL_IGNORE_ESTALE)) {
+                    skip_change[i] = true;
+                    if (do_strace) {
+                        fprintf(stderr, "    WORKLOOP state stale ignored "
+                                "wl=0x%llx ident=0x%llx value=0x%llx\n",
+                                (unsigned long long)arg1,
+                                (unsigned long long)cl[i].ident,
+                                (unsigned long long)cl[i].ext[EV_EXTIDX_WL_VALUE]);
+                    }
+                    continue;
+                }
+                if (eventlist && error_events < maxevents) {
+                    eventlist[error_events] = cl[i];
+                    eventlist[error_events].flags |= EV_ERROR;
+                    eventlist[error_events].data = wl_error;
+                    error_events++;
+                }
+            }
+
+            if (error_events > 0) {
+                ret = error_events;
+                if (do_strace) {
+                    fprintf(stderr, "    kevent_id -> %d workloop error "
+                            "event(s)\n", error_events);
+                }
+                g_free(skip_change);
+                break;
+            }
+
+            for (int i = 0; i < nchanges; i++) {
+                if (skip_change[i]) {
+                    continue;
+                }
+                if (cl[i].filter == EVFILT_WORKLOOP_PRIVATE &&
+                    (cl[i].fflags & NOTE_WL_THREAD_REQUEST)) {
+                    latest_thread_req = cl[i];
+                    refresh_workloop_req_value(&latest_thread_req);
+                    have_latest_thread_req = true;
+                }
+                if (cl[i].filter == EVFILT_WORKLOOP_PRIVATE &&
+                    (cl[i].fflags & NOTE_WL_END_OWNERSHIP)) {
+                    sync_end_changelist = true;
+                }
+                if (cl[i].filter == EVFILT_WORKLOOP_PRIVATE &&
+                    (cl[i].fflags & NOTE_WL_SYNC_WAIT)) {
+                    sync_wait_changelist = true;
+                }
+            }
+
+            for (int i = 0; i < nchanges; i++) {
+                bool ended_ownership =
+                    cl[i].filter == EVFILT_WORKLOOP_PRIVATE &&
+                    (cl[i].fflags & NOTE_WL_END_OWNERSHIP);
+
+                if (skip_change[i]) {
+                    continue;
+                }
+                if (ended_ownership) {
+                    clear_workloop_active(arg1);
+                }
                 if (cl[i].filter == EVFILT_MACHPORT) {
                     mach_port_t mp = (mach_port_t)cl[i].ident;
                     if (cl[i].flags & EV_DELETE) {
@@ -5474,11 +7359,19 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                     struct kevent_qos_s wl_ev = cl[i];
                     struct kevent_qos_s events[16];
                     int nevents;
-                    bool sync_wait = (wl_ev.fflags & NOTE_WL_SYNC_WAIT) != 0;
+                    bool sync_wait = (wl_ev.fflags & NOTE_WL_SYNC_WAIT) != 0 ||
+                        sync_wait_changelist;
 
                     /* Read current dq_state if WL_ADDR is set */
                     refresh_workloop_req_value(&wl_ev);
                     cache_workloop_req_template(arg1, &wl_ev);
+                    if (sync_end_changelist && !sync_wait) {
+                        if (do_strace) {
+                            fprintf(stderr, "    WORKLOOP THREAD_REQ "
+                                    "wl=0x%llx -> sync-end, evaluating wake\n",
+                                    (unsigned long long)arg1);
+                        }
+                    }
                     if (has_parked_workloop_thread(arg1)) {
                         if (do_strace) {
                             fprintf(stderr, "    WORKLOOP THREAD_REQ "
@@ -5487,7 +7380,8 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                         }
                         nevents = prepare_workloop_events(arg1, false, NULL,
                                                           events,
-                                                          ARRAY_SIZE(events));
+                                                          ARRAY_SIZE(events),
+                                                          false);
                         if (nevents > 0) {
                             /*
                              * Real work found — clear the persistent thread
@@ -5500,32 +7394,30 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                                                               nevents);
                         } else if (sync_wait) {
                             /*
-                             * Sync IPC: a caller is synchronously waiting
-                             * for this workloop to service its item
-                             * (NOTE_WL_SYNC_WAIT / NOTE_WL_SYNC_IPC).
-                             * The work is a dispatch block execution, not
-                             * a received message, so no MACHPORT events
-                             * need to be present.  Deliver the THREAD_REQ
-                             * event itself to the parked servicer — just
-                             * as XNU would immediately provide a thread
-                             * for sync-wait requests.
+                             * SYNC_WAIT transfers ownership to the blocked
+                             * caller; it must not provision the parked
+                             * servicer with a bare THREAD_REQUEST.  Keep the
+                             * persistent request until a real knote fires.
                              */
                             if (do_strace) {
                                 fprintf(stderr, "    WORKLOOP THREAD_REQ "
-                                        "wl=0x%llx -> sync-waking parked "
-                                        "thread\n",
+                                        "wl=0x%llx -> keeping parked thread "
+                                        "parked (sync wait, no real work)\n",
                                         (unsigned long long)arg1);
                             }
-                            set_workloop_sync_wake_inflight(arg1, true);
-                            nevents = prepare_workloop_events(arg1, true,
-                                                              &wl_ev,
-                                                              events,
-                                                              ARRAY_SIZE(events));
-                            clear_pending_workloop_req(arg1);
-                            if (nevents > 0) {
-                                deliver_workloop_events_to_thread(arg1, events,
-                                                                  nevents);
+                            store_pending_workloop_req(arg1, &wl_ev, true);
+                        } else if (sync_end_changelist && !sync_wait) {
+                            struct kevent_qos_s zero_wake = wl_ev;
+
+                            if (do_strace) {
+                                fprintf(stderr, "    WORKLOOP THREAD_REQ "
+                                        "wl=0x%llx -> delivering sync-end "
+                                        "zero wake\n",
+                                        (unsigned long long)arg1);
                             }
+                            clear_pending_workloop_req(arg1);
+                            deliver_workloop_events_to_thread(arg1,
+                                                              &zero_wake, 1);
                         } else {
                             /*
                              * No MACHPORT data available yet.  In XNU the
@@ -5540,27 +7432,88 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                                         "parked (no real work yet)\n",
                                         (unsigned long long)arg1);
                             }
+                            store_pending_workloop_req(arg1, &wl_ev, true);
                         }
                     } else if (sync_wait) {
                         if (do_strace) {
                             fprintf(stderr, "    WORKLOOP THREAD_REQ "
                                     "wl=0x%llx -> immediate sync wake\n",
-                                    (unsigned long long)arg1);
+                                        (unsigned long long)arg1);
                         }
-                        set_workloop_sync_wake_inflight(arg1, true);
-                        nevents = prepare_workloop_events(arg1, true, &wl_ev,
+                        nevents = prepare_workloop_events(arg1, false, NULL,
                                                           events,
-                                                          ARRAY_SIZE(events));
-                        clear_pending_workloop_req(arg1);
+                                                          ARRAY_SIZE(events),
+                                                          false);
+                        sync_wait_thread_req_handled = true;
                         if (nevents > 0) {
+                            set_workloop_sync_wake_inflight(arg1, true);
+                            clear_pending_workloop_req(arg1);
                             deliver_workloop_events_to_thread(arg1, events,
                                                               nevents);
+                        } else {
+                            store_pending_workloop_req(arg1, &wl_ev, true);
                         }
                     } else {
                         add_pending_workloop_req(arg1, &wl_ev);
                         /* strace is printed inside add_pending_workloop_req
                          * for the repeat case, or here for the first defer */
                     }
+                } else if (cl[i].filter == EVFILT_WORKLOOP_PRIVATE &&
+                           (cl[i].fflags & NOTE_WL_SYNC_WAIT)) {
+                    struct kevent_qos_s wl_ev;
+                    struct kevent_qos_s events[16];
+                    int nevents = 0;
+                    bool have_wl_ev = have_latest_thread_req;
+
+                    if (have_wl_ev) {
+                        wl_ev = latest_thread_req;
+                    } else {
+                        have_wl_ev = lookup_workloop_req_template(arg1,
+                                                                  &wl_ev);
+                    }
+
+                    if (do_strace) {
+                        fprintf(stderr, "    WORKLOOP SYNC_WAIT "
+                                "wl=0x%llx ident=0x%llx%s\n",
+                                (unsigned long long)arg1,
+                                 (unsigned long long)cl[i].ident,
+                                 have_wl_ev ? "" : " (no thread request)");
+                    }
+
+                    if (sync_wait_thread_req_handled) {
+                        continue;
+                    }
+
+                    if (have_wl_ev) {
+                        cache_workloop_req_template(arg1, &wl_ev);
+                        nevents = prepare_workloop_events(arg1, true, NULL,
+                                                          events,
+                                                          ARRAY_SIZE(events),
+                                                          false);
+                        if (nevents > 0) {
+                            set_workloop_sync_wake_inflight(arg1, true);
+                            clear_pending_workloop_req(arg1);
+                            deliver_workloop_events_to_thread(arg1, events,
+                                                              nevents);
+                        } else {
+                            store_pending_workloop_req(arg1, &wl_ev, true);
+                        }
+                    }
+                } else if (cl[i].filter == EVFILT_WORKLOOP_PRIVATE &&
+                           (cl[i].fflags & (NOTE_WL_SYNC_WAKE |
+                                              NOTE_WL_END_OWNERSHIP))) {
+                    if (do_strace) {
+                        fprintf(stderr, "    WORKLOOP SYNC_WAKE/END "
+                                "wl=0x%llx ident=0x%llx fflags=0x%x\n",
+                                (unsigned long long)arg1,
+                                 (unsigned long long)cl[i].ident,
+                                  cl[i].fflags);
+                    }
+                    if (cl[i].fflags & NOTE_WL_SYNC_WAKE) {
+                        record_workloop_sync_wake(arg1, "sync-wake");
+                    }
+                    set_workloop_sync_wake_inflight(arg1, false);
+                    clear_workloop_readiness_inflight(arg1);
                 } else {
                     if (do_strace) {
                         fprintf(stderr,
@@ -5569,6 +7522,7 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                     }
                 }
             }
+            g_free(skip_change);
         }
         ret = 0;
         if (do_strace) {
@@ -5653,9 +7607,20 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
          */
         {
             void *useraddr = NULL;
-            if (arg3) useraddr = g2h_untagged(arg3);
-            ret = get_errno(csops((pid_t)arg1, (unsigned int)arg2,
-                                  useraddr, (size_t)arg4));
+            if (arg3) {
+                useraddr = g2h_untagged(arg3);
+            }
+            if ((pid_t)arg1 == getpid() &&
+                (unsigned int)arg2 == CS_OPS_DER_ENTITLEMENTS_BLOB &&
+                useraddr && (size_t)arg4 >=
+                sizeof(qemu_macos_user_der_entitlements)) {
+                memcpy(useraddr, qemu_macos_user_der_entitlements,
+                       sizeof(qemu_macos_user_der_entitlements));
+                ret = 0;
+            } else {
+                ret = get_errno(csops((pid_t)arg1, (unsigned int)arg2,
+                                      useraddr, (size_t)arg4));
+            }
         }
         break;
 
@@ -5685,6 +7650,16 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
          * Used for cross-architecture traps. Returns ENOTSUP in XNU.
          */
         ret = -TARGET_ENOSYS;
+        break;
+
+    case TARGET_MACOS_NR_audit_session_self:
+        /*
+         * audit_session_self(void)
+         *
+         * LaunchServices uses the current audit session while checking in
+         * GUI apps and constructing its per-session XPC service connection.
+         */
+        ret = get_errno(syscall(SYS_audit_session_self));
         break;
 
     case TARGET_MACOS_NR___mac_syscall:
@@ -6177,9 +8152,36 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
         {
             const char *reason = arg5
                 ? (const char *)g2h_untagged(arg5) : "(null)";
+            CPUArchState *env = (CPUArchState *)cpu_env;
+            abi_ulong tsd_base = env->cp15.tpidrro_el[0];
+            uint64_t pthread_self_slot = 0;
+            uint64_t mach_self_slot = 0;
+            uint64_t ptr_munge_slot = 0;
+            uint64_t pthread_sig = 0;
+
+            if (tsd_base &&
+                guest_range_valid_untagged(tsd_base, 8 * sizeof(uint64_t))) {
+                uint64_t *tsd = g2h_untagged(tsd_base);
+                pthread_self_slot = tsd[0];
+                mach_self_slot = tsd[3];
+                ptr_munge_slot = tsd[7];
+                if (pthread_self_slot &&
+                    guest_range_valid_untagged(pthread_self_slot,
+                                               sizeof(uint64_t))) {
+                    pthread_sig = *(uint64_t *)g2h_untagged(pthread_self_slot);
+                }
+            }
             fprintf(stderr, "abort_with_payload: ns=%lu code=0x%lx "
-                    "reason=\"%s\"\n",
-                    (unsigned long)arg1, (unsigned long)arg2, reason);
+                    "reason=\"%s\" tpidr=0x%llx tpidrro=0x%llx "
+                    "pthread_self=0x%llx sig=0x%llx mach_self=0x%llx "
+                    "ptr_munge=0x%llx\n",
+                    (unsigned long)arg1, (unsigned long)arg2, reason,
+                    (unsigned long long)env->cp15.tpidr_el[0],
+                    (unsigned long long)tsd_base,
+                    (unsigned long long)pthread_self_slot,
+                    (unsigned long long)pthread_sig,
+                    (unsigned long long)mach_self_slot,
+                    (unsigned long long)ptr_munge_slot);
         }
         _exit(arg1 ? (int)arg1 : 1);
         break;

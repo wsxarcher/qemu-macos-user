@@ -111,6 +111,9 @@ static inline abi_long do_bsd_fcntl(int fd, int cmd, abi_ulong arg)
 #ifdef F_ADDFILESIGS_INFO
     case F_ADDFILESIGS_INFO:
 #endif
+#ifdef F_CHECK_LV
+    case F_CHECK_LV:
+#endif
     case F_ADDSIGS:
     case F_FINDSIGS:
     case F_GETLK:

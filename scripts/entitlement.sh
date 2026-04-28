@@ -22,7 +22,12 @@ else
 fi
 
 if test -n "$ENTITLEMENT"; then
-  codesign --entitlements "$ENTITLEMENT" --force -s - "$SRC"
+  if command -v xattr >/dev/null 2>&1; then
+    xattr -cr "$SRC" 2>/dev/null || :
+  fi
+  codesign --remove-signature "$SRC" 2>/dev/null || :
+  codesign --entitlements "$ENTITLEMENT" --force --timestamp=none \
+    --options=runtime -s - "$SRC"
 fi
 
 # Add the QEMU icon to the binary on Mac OS (optional, skip if tools missing)

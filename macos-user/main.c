@@ -216,6 +216,20 @@ static void handle_arg_stack_size(const char *arg)
     target_maxssiz = target_dflssiz;
 }
 
+static void handle_arg_set_env(const char *arg)
+{
+    if (envlist_setenv(envlist, arg) != 0) {
+        usage();
+    }
+}
+
+static void handle_arg_unset_env(const char *arg)
+{
+    if (envlist_unsetenv(envlist, arg) != 0) {
+        usage();
+    }
+}
+
 struct qemu_argument {
     const char *argv;
     const char *env;
@@ -239,6 +253,10 @@ static const struct qemu_argument arg_table[] = {
      "size",       "set the stack size to 'size' bytes"},
     {"cpu",        "QEMU_CPU",         true,  handle_arg_cpu,
      "model",      "select CPU model (-cpu help for list)"},
+    {"E",          "",                 true,  handle_arg_set_env,
+     "var=value",  "sets/modifies target environment variable(s)"},
+    {"U",          "",                 true,  handle_arg_unset_env,
+     "var",        "unsets target environment variable(s)"},
     {NULL, NULL, false, NULL, NULL, NULL}
 };
 
@@ -253,6 +271,7 @@ void init_task_state(TaskState *ts)
     ts->next = NULL;
     ts->bprm = NULL;
     ts->info = NULL;
+    ts->active_workloop_id = 0;
     sigemptyset(&ts->signal_mask);
 }
 
@@ -558,20 +577,13 @@ int main(int argc, char **argv, char **envp)
     }
 
     /*
-     * Disable Pointer Authentication (PAC) for arm64 guest processes.
-     *
-     * The macOS kernel disables PAC for arm64 (non-arm64e) processes by
-     * clearing SCTLR_EL1.{EnIA, EnIB, EnDA, EnDB}.  This makes AUTIA,
-     * AUTIB, AUTDA, AUTDB behave as NOPs, which is correct for arm64
-     * binaries that use BLR directly without authentication.
-     *
-     * The arm64e shared cache contains some PAC-signed data pointers,
-     * but dlsym and the dynamic linker strip PAC bits before returning
-     * pointers to arm64 callers.  With PAC disabled, those pointers
-     * are already clean.
+     * Disable Pointer Authentication for arm64 guest ABI state, as XNU does
+     * for non-arm64e processes.  The TCG AUT/BRAA helpers still strip PAC bits
+     * from arm64e shared-cache pointers so host-signed cache constants can be
+     * consumed safely by the guest.
      */
     env->cp15.sctlr_el[1] &= ~(SCTLR_EnIA | SCTLR_EnIB |
-                                 SCTLR_EnDA | SCTLR_EnDB);
+                               SCTLR_EnDA | SCTLR_EnDB);
 
     /*
      * Enable non-aligned atomics (SCTLR_EL1.nAA).

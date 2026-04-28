@@ -1588,6 +1588,44 @@ int main(void) {
             # the alarm.  Both are acceptable: neither hangs.
             self.assertIn(rc, (99, -6), f"unexpected exit code: {rc}")
 
+    # -- HIToolbox input-source cache: workloop sync-end wake -----------------
+    _HITOOLBOX_TIS_SRC = r'''
+#include <Carbon/Carbon.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+static void bail(int sig) { _exit(99); }
+
+int main(void) {
+    signal(SIGALRM, bail);
+    alarm(20);
+
+    CFArrayRef list = TISCreateInputSourceList(NULL, true);
+    if (!list) {
+        printf("tis=null\n");
+        return 2;
+    }
+
+    printf("tis_count=%ld\n", CFArrayGetCount(list));
+    CFRelease(list);
+    printf("tis_done\n");
+    return 0;
+}
+'''
+
+    def test_hitoolbox_input_sources_no_hang(self):
+        """HIToolbox input-source cache initialization returns."""
+        exe = _compile_framework_test("hitoolbox_tis",
+                                      self._HITOOLBOX_TIS_SRC,
+                                      ["Carbon"], language="c")
+        cmd = [str(QEMU_BINARY), "-E", "__CFPREFERENCES_AVOID_DAEMON=1",
+               str(exe)]
+        rc, out, _ = _run(cmd, timeout=25)
+        self.assertEqual(rc, 0)
+        self.assertIn(b"tis_done", out)
+
     # -- IOKit property access test -------------------------------------------
 
     _IOKIT_PROPS_SRC = r'''
