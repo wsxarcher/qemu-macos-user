@@ -1400,6 +1400,42 @@ static void remove_workq_machport_template(mach_port_t port)
     }
 }
 
+static bool lookup_workq_machport_template(mach_port_t port,
+                                           struct kevent_qos_s *out)
+{
+    bool found = false;
+
+    pthread_mutex_lock(&workq_machport_lock);
+    for (int i = 0; i < workq_machport_count; i++) {
+        if (workq_machports[i].port == port &&
+            workq_machports[i].has_template) {
+            *out = workq_machports[i].template_kev;
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&workq_machport_lock);
+    return found;
+}
+
+static bool lookup_workloop_port_template(mach_port_t port,
+                                          struct kevent_qos_s *out)
+{
+    bool found = false;
+
+    pthread_mutex_lock(&workloop_port_lock);
+    for (int i = 0; i < workloop_port_count; i++) {
+        if (workloop_ports[i].port == port &&
+            workloop_ports[i].has_template) {
+            *out = workloop_ports[i].template_kev;
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&workloop_port_lock);
+    return found;
+}
+
 static void unregister_workq_notification_port(mach_port_t port)
 {
     bool removed = false;
@@ -3488,9 +3524,22 @@ static void *workq_kqueue_monitor_func(void *arg)
             if (events_qos[i].filter == EVFILT_MACHPORT) {
                 struct kevent_qos_s drained[16];
                 mach_port_t event_port = (mach_port_t)events_qos[i].ident;
+                struct kevent_qos_s template_kev = events_qos[i];
                 uint64_t wl_id = find_workloop_for_port(event_port);
+
+                /*
+                 * Fired EVFILT_MACHPORT events contain runtime result state
+                 * such as MACH_RCV_TOO_LARGE in fflags.  The manual
+                 * prereceive path must use the guest's original registration
+                 * template so libdispatch's requested trailer and identity
+                 * options are preserved.
+                 */
+                if (!lookup_workloop_port_template(event_port, &template_kev)) {
+                    lookup_workq_machport_template(event_port, &template_kev);
+                }
+
                 bool parked = wl_id &&
-                    (workloop_template_is_readiness_only(&events_qos[i])
+                    (workloop_template_is_readiness_only(&template_kev)
                      ? has_exact_parked_workloop_thread(wl_id)
                      : has_parked_workloop_thread(wl_id));
                 bool workq_notification_port =
@@ -3502,14 +3551,14 @@ static void *workq_kqueue_monitor_func(void *arg)
                     goto rearm_machport_event;
                 }
                 if (wl_id &&
-                    suppress_workloop_readiness_delivery(&events_qos[i])) {
+                    suppress_workloop_readiness_delivery(&template_kev)) {
                     rearm_machport = false;
                     goto rearm_machport_event;
                 }
                 if (notification_port && !parked) {
-                    bool wants_msg = template_needs_prereceived_msg(&events_qos[i]);
+                    bool wants_msg = template_needs_prereceived_msg(&template_kev);
                     int got = drain_notification_machport_events(
-                        &events_qos[i], drained, ARRAY_SIZE(drained), 100);
+                        &template_kev, drained, ARRAY_SIZE(drained), 100);
 
                     if (wants_msg) {
                         if (got > 0) {
@@ -3560,7 +3609,7 @@ static void *workq_kqueue_monitor_func(void *arg)
                     goto rearm_machport_event;
                 }
 
-                int got = prereceive_machport_drain(&events_qos[i],
+                int got = prereceive_machport_drain(&template_kev,
                                                     drained,
                                                     ARRAY_SIZE(drained));
                 if (got == 0) {
@@ -3598,7 +3647,7 @@ static void *workq_kqueue_monitor_func(void *arg)
                         got = filter_workloop_notification_events(drained, got);
                     }
                     if (got > 0 &&
-                        mark_workloop_readiness_delivered(&events_qos[i])) {
+                        mark_workloop_readiness_delivered(&template_kev)) {
                         rearm_machport = false;
                     }
                     if (got > 0 && !parked) {

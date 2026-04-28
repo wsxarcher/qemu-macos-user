@@ -1720,6 +1720,51 @@ int main(void) {
         self.assertIn("ioresources: kr=0", decoded)
         self.assertIn("done", decoded)
 
+    # -- AppKit application termination --------------------------------------
+
+    _APPKIT_TERMINATE_SRC = r'''
+#import <AppKit/AppKit.h>
+#include <signal.h>
+#include <stdio.h>
+
+@interface TerminateDelegate : NSObject <NSApplicationDelegate>
+@end
+
+@implementation TerminateDelegate
+- (void)applicationDidFinishLaunching:(NSNotification *)notification {
+    (void)notification;
+    fprintf(stderr, "terminate:didFinishLaunching\n");
+    [NSApp terminate:nil];
+}
+@end
+
+int main(void) {
+    alarm(20);
+
+    @autoreleasepool {
+        fprintf(stderr, "terminate:main\n");
+        NSApplication *app = [NSApplication sharedApplication];
+        fprintf(stderr, "terminate:sharedApplication\n");
+        [app setActivationPolicy:NSApplicationActivationPolicyAccessory];
+        TerminateDelegate *delegate = [[TerminateDelegate alloc] init];
+        [app setDelegate:delegate];
+        fprintf(stderr, "terminate:beforeRun\n");
+        [app run];
+    }
+    return 0;
+}
+'''
+
+    def test_appkit_application_terminate(self):
+        """NSApplication terminate exits cleanly after launch."""
+        exe = _compile_framework_test("appkit_terminate",
+                                      self._APPKIT_TERMINATE_SRC,
+                                      ["AppKit"])
+        rc, _, err = _run_emulated(exe, timeout=25)
+        decoded = err.decode(errors="replace")
+        self.assertEqual(rc, 0, f"appkit_terminate failed: {decoded}")
+        self.assertIn("terminate:didFinishLaunching", decoded)
+
     # -- WindowServer query test (SkyLight framework) -----------------------
 
     _WS_QUERY_SRC = r'''
