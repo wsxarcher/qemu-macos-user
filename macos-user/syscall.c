@@ -327,6 +327,13 @@ static workloop_port_entry workloop_ports[MAX_WORKLOOP_PORTS];
 static int workloop_port_count = 0;
 static pthread_mutex_t workloop_port_lock = PTHREAD_MUTEX_INITIALIZER;
 
+#define MAX_PENDING_CGS_WINDOW_PORTS 32
+#define CGS_WINDOW_SERVICE_ATTEMPTS 2000
+static mach_port_t pending_cgs_window_ports[MAX_PENDING_CGS_WINDOW_PORTS];
+static int pending_cgs_window_port_count;
+
+static pthread_mutex_t pending_cgs_window_port_lock = PTHREAD_MUTEX_INITIALIZER;
+
 #define MAX_NOTIFICATION_PORTS 64
 static mach_port_t notification_ports[MAX_NOTIFICATION_PORTS];
 static mach_port_t notification_watched_ports[MAX_NOTIFICATION_PORTS];
@@ -560,6 +567,19 @@ static int drain_notification_machport_events(
     struct kevent_qos_s *out_events,
     int max_events,
     mach_msg_timeout_t timeout_ms);
+static uint64_t find_workloop_for_port(mach_port_t port);
+static bool lookup_workloop_port_template(mach_port_t port,
+                                          struct kevent_qos_s *out);
+static bool lookup_workq_machport_template(mach_port_t port,
+                                           struct kevent_qos_s *out);
+static bool workloop_template_is_readiness_only(
+    const struct kevent_qos_s *template_kev);
+static bool suppress_workloop_readiness_delivery(
+    const struct kevent_qos_s *template_kev);
+static bool mark_workloop_readiness_delivered(
+    const struct kevent_qos_s *template_kev);
+static int filter_workloop_notification_events(struct kevent_qos_s *events,
+                                               int nevents);
 static int stash_workloop_port_events(mach_port_t port,
                                       const struct kevent_qos_s *events,
                                       int nevents);
@@ -600,7 +620,8 @@ static abi_ulong prereceive_one_msg_timeout(mach_port_t port,
  */
 #define MAX_PENDING_WL 128
 #define WORKLOOP_ACTIVE_STALE_NS (100ULL * 1000 * 1000)
-#define WORKLOOP_SYNC_WAKE_STALE_NS (2ULL * 1000 * 1000 * 1000)
+#define WORKLOOP_SYNC_HANDOFF_STALE_NS (10ULL * 1000 * 1000)
+#define WORKLOOP_SYNC_WILDCARD_HANDOFF_STALE_NS (5ULL * 1000 * 1000 * 1000)
 typedef struct {
     uint64_t workloop_id;
     mach_port_t waiter;
@@ -614,8 +635,9 @@ typedef struct {
     uint64_t workloop_id;
     mach_port_t waiter;
     uint64_t created_ns;
-    bool active;
-} pending_sync_wake;
+    bool wait_armed;
+    bool wake_pending;
+} pending_sync_handoff;
 
 typedef struct {
     uint64_t workloop_id;
@@ -634,7 +656,7 @@ static uint64_t active_workloop_since_ns[MAX_PENDING_WL];
 static int active_workloop_count = 0;
 static pthread_mutex_t active_workloop_lock = PTHREAD_MUTEX_INITIALIZER;
 static active_ulock_sync_wait active_ulock_sync_waits[MAX_PENDING_WL];
-static pending_sync_wake pending_sync_wakes[MAX_PENDING_WL];
+static pending_sync_handoff pending_sync_handoffs[MAX_PENDING_WL];
 static pthread_mutex_t active_ulock_sync_wait_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static uint64_t workloop_monotonic_time_ns(void)
@@ -817,61 +839,104 @@ static void end_active_ulock_sync_wait(uint64_t wl_id, mach_port_t waiter,
             break;
         }
     }
+    for (int i = 0; i < MAX_PENDING_WL; i++) {
+        pending_sync_handoff *handoff = &pending_sync_handoffs[i];
+
+        if ((handoff->wait_armed || handoff->wake_pending) &&
+            handoff->workloop_id == wl_id && handoff->waiter == waiter) {
+            *handoff = (pending_sync_handoff) { 0 };
+        }
+    }
     pthread_mutex_unlock(&active_ulock_sync_wait_lock);
 }
 
-static void prune_pending_sync_wakes_locked(uint64_t now_ns)
+static void prune_pending_sync_handoffs_locked(uint64_t now_ns)
 {
     for (int i = 0; i < MAX_PENDING_WL; i++) {
-        pending_sync_wake *wake = &pending_sync_wakes[i];
+        pending_sync_handoff *handoff = &pending_sync_handoffs[i];
+        uint64_t stale_ns = handoff->waiter == MACH_PORT_NULL
+            ? WORKLOOP_SYNC_WILDCARD_HANDOFF_STALE_NS
+            : WORKLOOP_SYNC_HANDOFF_STALE_NS;
 
-        if (wake->active &&
-            now_ns - wake->created_ns >= WORKLOOP_SYNC_WAKE_STALE_NS) {
-            wake->active = false;
+        if ((handoff->wait_armed || handoff->wake_pending) &&
+            now_ns - handoff->created_ns >= stale_ns) {
+            *handoff = (pending_sync_handoff) { 0 };
         }
     }
 }
 
-static void queue_pending_sync_wake_locked(uint64_t wl_id, mach_port_t waiter,
-                                           uint64_t now_ns)
+static pending_sync_handoff *ensure_pending_sync_handoff_locked(
+    uint64_t wl_id, mach_port_t waiter, uint64_t now_ns)
 {
-    int free_slot = -1;
+    pending_sync_handoff *free_entry = NULL;
 
-    prune_pending_sync_wakes_locked(now_ns);
+    prune_pending_sync_handoffs_locked(now_ns);
     for (int i = 0; i < MAX_PENDING_WL; i++) {
-        pending_sync_wake *wake = &pending_sync_wakes[i];
+        pending_sync_handoff *handoff = &pending_sync_handoffs[i];
 
-        if (!wake->active) {
-            if (free_slot < 0) {
-                free_slot = i;
+        if (!handoff->wait_armed && !handoff->wake_pending) {
+            if (!free_entry) {
+                free_entry = handoff;
             }
             continue;
         }
-        if (wake->workloop_id == wl_id && wake->waiter == waiter) {
-            wake->created_ns = now_ns;
-            return;
+        if (handoff->workloop_id == wl_id && handoff->waiter == waiter) {
+            return handoff;
         }
     }
-    if (free_slot >= 0) {
-        pending_sync_wakes[free_slot] = (pending_sync_wake) {
+
+    if (free_entry) {
+        *free_entry = (pending_sync_handoff) {
             .workloop_id = wl_id,
             .waiter = waiter,
-            .created_ns = now_ns,
-            .active = true,
         };
     }
+    return free_entry;
 }
 
-static bool take_pending_sync_wake_locked(uint64_t wl_id, mach_port_t waiter,
-                                          uint64_t now_ns)
+static bool queue_pending_sync_handoff_wake_locked(uint64_t wl_id,
+                                                   mach_port_t waiter,
+                                                   uint64_t now_ns)
 {
-    prune_pending_sync_wakes_locked(now_ns);
-    for (int i = 0; i < MAX_PENDING_WL; i++) {
-        pending_sync_wake *wake = &pending_sync_wakes[i];
+    pending_sync_handoff *handoff =
+        ensure_pending_sync_handoff_locked(wl_id, waiter, now_ns);
 
-        if (wake->active && wake->workloop_id == wl_id &&
-            (wake->waiter == waiter || wake->waiter == MACH_PORT_NULL)) {
-            wake->active = false;
+    if (!handoff) {
+        return false;
+    }
+    handoff->created_ns = now_ns;
+    handoff->wait_armed = false;
+    handoff->wake_pending = true;
+    return true;
+}
+
+static bool take_pending_sync_handoff_wake_locked(uint64_t wl_id,
+                                                  mach_port_t waiter,
+                                                  uint64_t now_ns,
+                                                  bool allow_wildcard,
+                                                  bool *from_handoff)
+{
+    prune_pending_sync_handoffs_locked(now_ns);
+    for (int i = 0; i < MAX_PENDING_WL; i++) {
+        pending_sync_handoff *handoff = &pending_sync_handoffs[i];
+
+        if (handoff->wake_pending && handoff->workloop_id == wl_id &&
+            handoff->waiter == waiter) {
+            *handoff = (pending_sync_handoff) { 0 };
+            *from_handoff = true;
+            return true;
+        }
+    }
+    if (!allow_wildcard) {
+        return false;
+    }
+    for (int i = 0; i < MAX_PENDING_WL; i++) {
+        pending_sync_handoff *handoff = &pending_sync_handoffs[i];
+
+        if (handoff->wake_pending && handoff->workloop_id == wl_id &&
+            handoff->waiter == MACH_PORT_NULL) {
+            *handoff = (pending_sync_handoff) { 0 };
+            *from_handoff = true;
             return true;
         }
     }
@@ -900,9 +965,8 @@ static void record_workloop_sync_wake(uint64_t wl_id, mach_port_t waiter,
             matched = true;
         }
     }
-    if (!matched && waiter != MACH_PORT_NULL) {
-        queue_pending_sync_wake_locked(wl_id, waiter, now_ns);
-        queued = true;
+    if (!matched) {
+        queued = queue_pending_sync_handoff_wake_locked(wl_id, waiter, now_ns);
     }
     pthread_mutex_unlock(&active_ulock_sync_wait_lock);
 
@@ -910,15 +974,17 @@ static void record_workloop_sync_wake(uint64_t wl_id, mach_port_t waiter,
         fprintf(stderr, "  workloop wl=0x%llx: sync wake waiter=0x%x from %s%s%s\n",
                 (unsigned long long)wl_id, (unsigned)waiter, where,
                 matched ? "" : " (no active ulock waiter)",
-                queued ? " queued" : "");
+                queued ? " queued handoff" : "");
     }
 }
 
 static bool consume_active_ulock_sync_wake(uint64_t wl_id, mach_port_t waiter,
                                            abi_ulong wait_addr, uint64_t value,
+                                           bool allow_wildcard_handoff,
                                            const char *where)
 {
     bool consume = false;
+    bool from_handoff = false;
 
     if (!wl_id || waiter == MACH_PORT_NULL) {
         return false;
@@ -937,8 +1003,9 @@ static bool consume_active_ulock_sync_wake(uint64_t wl_id, mach_port_t waiter,
         }
     }
     if (!consume) {
-        consume = take_pending_sync_wake_locked(
-            wl_id, waiter, workloop_monotonic_time_ns());
+        consume = take_pending_sync_handoff_wake_locked(
+            wl_id, waiter, workloop_monotonic_time_ns(),
+            allow_wildcard_handoff, &from_handoff);
     }
     pthread_mutex_unlock(&active_ulock_sync_wait_lock);
 
@@ -949,9 +1016,10 @@ static bool consume_active_ulock_sync_wake(uint64_t wl_id, mach_port_t waiter,
     if (guest_range_valid_untagged(wait_addr, sizeof(uint32_t))) {
         *(uint32_t *)g2h_untagged(wait_addr) = 0;
     }
-    if (do_strace) {
-        fprintf(stderr, "  ulock_wait: consuming active workloop sync wake%s%s "
+    if (do_strace || getenv("QEMU_DEBUG_CGS")) {
+        fprintf(stderr, "  ulock_wait: consuming %sworkloop sync wake%s%s "
                 "wl=0x%llx waiter=0x%x addr=0x%llx value=0x%llx\n",
+                from_handoff ? "queued " : "active ",
                 where && where[0] ? " " : "",
                 where && where[0] ? where : "",
                 (unsigned long long)wl_id, (unsigned)waiter,
@@ -1165,6 +1233,51 @@ static bool take_zero_wake_workloop_req(uint64_t wl_id,
     return found;
 }
 
+static bool has_zero_wake_workloop_req(uint64_t wl_id)
+{
+    bool found = false;
+
+    pthread_mutex_lock(&pending_wl_lock);
+    for (int i = pending_wl_count - 1; i >= 0; i--) {
+        if (pending_wl_reqs[i].workloop_id == wl_id &&
+            pending_wl_reqs[i].zero_wake) {
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&pending_wl_lock);
+    return found;
+}
+
+static bool take_sync_handoff_zero_wake_workloop_req(
+    uint64_t wl_id, struct kevent_qos_s *out_ev)
+{
+    bool found = false;
+
+    pthread_mutex_lock(&pending_wl_lock);
+    for (int i = pending_wl_count - 1; i >= 0; i--) {
+        struct kevent_qos_s *ev = &pending_wl_reqs[i].event;
+
+        if (pending_wl_reqs[i].workloop_id == wl_id &&
+            pending_wl_reqs[i].zero_wake &&
+            ev->filter == EVFILT_WORKLOOP_PRIVATE &&
+            (ev->fflags & NOTE_WL_THREAD_REQUEST) &&
+            (ev->ext[EV_EXTIDX_WL_VALUE] >> 56) == 0xff) {
+            *out_ev = *ev;
+            pending_wl_reqs[i].zero_wake = false;
+            pending_wl_reqs[i].active = false;
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&pending_wl_lock);
+
+    if (found) {
+        refresh_workloop_req_value(out_ev);
+    }
+    return found;
+}
+
 static bool template_needs_prereceived_msg(const struct kevent_qos_s *template_kev)
 {
     abi_ulong du_addr = (abi_ulong)template_kev->udata;
@@ -1233,8 +1346,130 @@ static bool machport_get_receive_status(mach_port_t port,
 
     return mach_port_get_attributes(mach_task_self(), port,
                                     MACH_PORT_RECEIVE_STATUS,
-                                    (mach_port_info_t)status,
-                                    &count) == KERN_SUCCESS;
+                                     (mach_port_info_t)status,
+                                     &count) == KERN_SUCCESS;
+}
+
+static bool debug_cgs_window(void)
+{
+    return do_strace || getenv("QEMU_DEBUG_CGS");
+}
+
+static bool pending_cgs_window_port_contains(mach_port_t port);
+static bool service_pending_cgs_window_port(mach_port_t port);
+
+void note_pending_cgs_window_port(mach_port_t port)
+{
+    mach_port_type_t ptype = 0;
+
+    if (!MACH_PORT_VALID(port) ||
+        mach_port_type(mach_task_self(), port, &ptype) != KERN_SUCCESS ||
+        !(ptype & MACH_PORT_TYPE_RECEIVE)) {
+        return;
+    }
+
+    pthread_mutex_lock(&pending_cgs_window_port_lock);
+    for (int i = 0; i < pending_cgs_window_port_count; i++) {
+        if (pending_cgs_window_ports[i] == port) {
+            pthread_mutex_unlock(&pending_cgs_window_port_lock);
+            return;
+        }
+    }
+    if (pending_cgs_window_port_count < MAX_PENDING_CGS_WINDOW_PORTS) {
+        pending_cgs_window_ports[pending_cgs_window_port_count++] = port;
+        if (debug_cgs_window()) {
+            fprintf(stderr, "  pending CGS window MACHPORT ident=0x%x\n",
+                    (unsigned)port);
+        }
+    }
+    pthread_mutex_unlock(&pending_cgs_window_port_lock);
+
+    service_pending_cgs_window_port(port);
+    if (debug_cgs_window() && pending_cgs_window_port_contains(port)) {
+        fprintf(stderr, "  pending CGS window MACHPORT ident=0x%x still "
+                "unserviced at note time\n", (unsigned)port);
+    }
+}
+
+static bool pending_cgs_window_port_contains(mach_port_t port)
+{
+    bool found = false;
+
+    pthread_mutex_lock(&pending_cgs_window_port_lock);
+    for (int i = 0; i < pending_cgs_window_port_count; i++) {
+        if (pending_cgs_window_ports[i] == port) {
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&pending_cgs_window_port_lock);
+    return found;
+}
+
+static void remove_pending_cgs_window_port(mach_port_t port)
+{
+    pthread_mutex_lock(&pending_cgs_window_port_lock);
+    for (int i = 0; i < pending_cgs_window_port_count; i++) {
+        if (pending_cgs_window_ports[i] == port) {
+            pending_cgs_window_ports[i] =
+                pending_cgs_window_ports[--pending_cgs_window_port_count];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&pending_cgs_window_port_lock);
+}
+
+static bool service_pending_cgs_window_port(mach_port_t port)
+{
+    mach_port_status_t status = {0};
+
+    if (!pending_cgs_window_port_contains(port)) {
+        return false;
+    }
+    if (!machport_get_receive_status(port, &status)) {
+        remove_pending_cgs_window_port(port);
+        return false;
+    }
+    if (status.mps_msgcount == 0) {
+        return false;
+    }
+    if (!service_workloop_machport_event_for_port(port, 0)) {
+        return false;
+    }
+    remove_pending_cgs_window_port(port);
+    if (debug_cgs_window()) {
+        fprintf(stderr, "  serviced pending CGS window MACHPORT ident=0x%x\n",
+                (unsigned)port);
+    }
+    return true;
+}
+
+bool service_pending_cgs_window_ports(void)
+{
+    mach_port_t snapshot[MAX_PENDING_CGS_WINDOW_PORTS];
+    int count;
+    bool serviced = false;
+
+    pthread_mutex_lock(&pending_cgs_window_port_lock);
+    count = pending_cgs_window_port_count;
+    memcpy(snapshot, pending_cgs_window_ports, count * sizeof(snapshot[0]));
+    pthread_mutex_unlock(&pending_cgs_window_port_lock);
+
+    for (int i = 0; i < count; i++) {
+        serviced |= service_pending_cgs_window_port(snapshot[i]);
+    }
+
+    return serviced;
+}
+
+bool has_pending_cgs_window_ports(void)
+{
+    bool pending;
+
+    pthread_mutex_lock(&pending_cgs_window_port_lock);
+    pending = pending_cgs_window_port_count > 0;
+    pthread_mutex_unlock(&pending_cgs_window_port_lock);
+    return pending;
 }
 
 static void release_prereceived_workloop_event(struct kevent_qos_s *event)
@@ -1361,13 +1596,16 @@ static void store_pending_workloop_req(uint64_t wl_id,
     entry = ensure_pending_workloop_req_locked(wl_id);
     if (entry) {
         was_zero_wake = entry->zero_wake;
-        entry->event = *ev;
         if (!zero_wake) {
+            entry->event = *ev;
             entry->template_event = *ev;
             entry->has_template = true;
             entry->active = true;
             entry->zero_wake = false;
         } else {
+            if (!entry->zero_wake) {
+                entry->event = *ev;
+            }
             entry->zero_wake = true;
             entry->active = false;
         }
@@ -1450,6 +1688,7 @@ static void clear_pending_workloop_req(uint64_t wl_id)
     for (int i = 0; i < pending_wl_count; i++) {
         if (pending_wl_reqs[i].workloop_id == wl_id) {
             pending_wl_reqs[i].active = false;
+            pending_wl_reqs[i].zero_wake = false;
         }
     }
     pthread_mutex_unlock(&pending_wl_lock);
@@ -1526,6 +1765,7 @@ static void add_workloop_port(uint64_t wl_id,
 {
     mach_port_t port = (mach_port_t)kev->ident;
     bool drop_synthetic = false;
+    bool was_pending_cgs;
 
     pthread_mutex_lock(&workloop_port_lock);
     /* Update existing entry for this port */
@@ -1576,6 +1816,16 @@ done:
         }
     }
     pthread_mutex_unlock(&workq_machport_lock);
+
+    was_pending_cgs = pending_cgs_window_port_contains(port);
+    if (was_pending_cgs && !service_pending_cgs_window_port(port)) {
+        remove_pending_cgs_window_port(port);
+        if (debug_cgs_window()) {
+            fprintf(stderr, "  armed pending CGS window MACHPORT ident=0x%x "
+                    "without initial message\n", (unsigned)port);
+        }
+    }
+    service_pending_cgs_window_ports();
 }
 
 static void remove_workq_machport_template(mach_port_t port)
@@ -1617,7 +1867,7 @@ static bool lookup_workq_machport_template(mach_port_t port,
 }
 
 static bool lookup_workloop_port_template(mach_port_t port,
-                                          struct kevent_qos_s *out)
+                                           struct kevent_qos_s *out)
 {
     bool found = false;
 
@@ -1632,6 +1882,84 @@ static bool lookup_workloop_port_template(mach_port_t port,
     }
     pthread_mutex_unlock(&workloop_port_lock);
     return found;
+}
+
+bool service_workloop_machport_event_for_port(mach_port_t port,
+                                              mach_msg_timeout_t timeout_ms)
+{
+    struct kevent_qos_s template_kev;
+    struct kevent_qos_s events[16];
+    uint64_t wl_id = find_workloop_for_port(port);
+    bool notification_port;
+    bool parked;
+    int got = 0;
+
+    if (!wl_id || !lookup_workloop_port_template(port, &template_kev) ||
+        is_port_active_rcv(port) ||
+        suppress_workloop_readiness_delivery(&template_kev)) {
+        return false;
+    }
+    if (is_workloop_active(wl_id) &&
+        !clear_stale_workloop_active(wl_id, "direct-machport")) {
+        if (do_strace) {
+            fprintf(stderr, "  workloop wl=0x%llx: active owner present, "
+                    "deferring direct MACHPORT service on 0x%x\n",
+                    (unsigned long long)wl_id, (unsigned)port);
+        }
+        return false;
+    }
+
+    notification_port = is_workq_notification_port(port);
+    parked = workloop_template_is_readiness_only(&template_kev)
+        ? has_exact_parked_workloop_thread(wl_id)
+        : has_parked_workloop_thread(wl_id);
+
+    for (mach_msg_timeout_t waited = 0; ; waited++) {
+        if (notification_port) {
+            got = drain_notification_machport_events(&template_kev, events,
+                                                     ARRAY_SIZE(events), 0);
+        } else {
+            got = prereceive_machport_drain_port_timeout(&template_kev, port,
+                                                         events,
+                                                         ARRAY_SIZE(events),
+                                                         0);
+        }
+        if (got > 0 || waited >= timeout_ms) {
+            break;
+        }
+        usleep(1000);
+    }
+    if (got <= 0) {
+        return false;
+    }
+
+    if (!notification_port) {
+        got = filter_workloop_notification_events(events, got);
+    }
+    if (got <= 0) {
+        return false;
+    }
+    mark_workloop_readiness_delivered(&template_kev);
+
+    if (!parked) {
+        got = prepend_workloop_req_event(wl_id, NULL, events, got,
+                                         ARRAY_SIZE(events));
+    } else {
+        struct kevent_qos_s zero_wake_ev;
+        if (take_zero_wake_workloop_req(wl_id, &zero_wake_ev) && do_strace) {
+            fprintf(stderr, "  workloop wl=0x%llx: consumed returned "
+                    "THREAD_REQUEST while servicing MACHPORT 0x%x\n",
+                    (unsigned long long)wl_id, (unsigned)port);
+        }
+    }
+
+    if (do_strace) {
+        fprintf(stderr, "  workloop wl=0x%llx: direct-servicing %d "
+                "MACHPORT event(s) on 0x%x\n",
+                (unsigned long long)wl_id, got, (unsigned)port);
+    }
+    deliver_workloop_events_to_thread(wl_id, events, got);
+    return true;
 }
 
 static void unregister_workq_notification_port(mach_port_t port)
@@ -1713,6 +2041,7 @@ static void remove_workloop_port(mach_port_t port)
     }
     remove_workq_machport_template(port);
     unregister_workq_notification_port(port);
+    remove_pending_cgs_window_port(port);
 }
 
 static int stash_workloop_port_events(mach_port_t port,
@@ -6225,6 +6554,15 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
             int host_errno = 0;
 
             if (active_sync_wait) {
+                if (do_strace || getenv("QEMU_DEBUG_CGS")) {
+                    fprintf(stderr, "  ulock_wait: active sync wait "
+                            "wl=0x%llx waiter=0x%x addr=0x%llx "
+                            "value=0x%llx\n",
+                            (unsigned long long)wait_workloop,
+                            (unsigned)wait_thread,
+                            (unsigned long long)arg2,
+                            (unsigned long long)value);
+                }
                 begin_active_ulock_sync_wait(wait_workloop, wait_thread,
                                              (abi_ulong)arg2, value);
             }
@@ -6236,16 +6574,46 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
 
                 if (active_sync_wait &&
                     consume_active_ulock_sync_wake(wait_workloop, wait_thread,
+                                                    (abi_ulong)arg2, value,
+                                                    false,
+                                                    "")) {
+                    rv = 0;
+                    break;
+                }
+                if (active_sync_wait) {
+                    struct kevent_qos_s zero_wake_ev;
+
+                    if (take_sync_handoff_zero_wake_workloop_req(
+                            wait_workloop, &zero_wake_ev)) {
+                        if (do_strace || getenv("QEMU_DEBUG_CGS")) {
+                            fprintf(stderr, "  ulock_wait: consuming "
+                                    "zero-wake sync handoff "
+                                    "wl=0x%llx waiter=0x%x\n",
+                                    (unsigned long long)wait_workloop,
+                                    (unsigned)wait_thread);
+                        }
+                        if (guest_range_valid_untagged(arg2,
+                                                       sizeof(uint32_t))) {
+                            *(uint32_t *)g2h_untagged(arg2) = 0;
+                        }
+                        rv = 0;
+                        break;
+                    }
+                }
+                if (active_sync_wait &&
+                    consume_active_ulock_sync_wake(wait_workloop, wait_thread,
                                                    (abi_ulong)arg2, value,
-                                                   "")) {
+                                                   true,
+                                                   "after zero-wake")) {
                     rv = 0;
                     break;
                 }
                 service_blocking_workloop_events();
                 if (active_sync_wait &&
                     consume_active_ulock_sync_wake(wait_workloop, wait_thread,
-                                                   (abi_ulong)arg2, value,
-                                                   "after service")) {
+                                                    (abi_ulong)arg2, value,
+                                                    true,
+                                                    "after service")) {
                     rv = 0;
                     break;
                 }
@@ -6257,8 +6625,9 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                 service_blocking_workloop_events();
                 if (active_sync_wait &&
                     consume_active_ulock_sync_wake(wait_workloop, wait_thread,
-                                                   (abi_ulong)arg2, value,
-                                                   "after timeout")) {
+                                                    (abi_ulong)arg2, value,
+                                                    true,
+                                                    "after timeout")) {
                     rv = 0;
                     break;
                 }
@@ -6313,7 +6682,7 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
 
                 service_blocking_workloop_events();
                 rv = syscall(SYS_ulock_wait2, op, addr, value, this_ns,
-                             value2);
+                              value2);
                 if (!ulock_syscall_error(rv, op, &host_errno) ||
                     host_errno != ETIMEDOUT) {
                     break;
@@ -6786,6 +7155,8 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                 bool ended_ownership = false;
                 bool sync_end_changelist = false;
                 bool sync_wait_changelist = false;
+                bool rearm_pair_thread_req = false;
+                mach_port_t rearm_pair_port = MACH_PORT_NULL;
 
                 if (arg2) {
                     abi_ulong kqid_addr = arg2 - sizeof(uint64_t);
@@ -6831,6 +7202,23 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                     }
                 }
 
+                if (cl && nchanges == 2 && current_wl_id &&
+                    !ended_ownership && !sync_end_changelist &&
+                    !sync_wait_changelist) {
+                    for (int i = 0; i < nchanges; i++) {
+                        if (cl[i].filter == EVFILT_MACHPORT &&
+                            (cl[i].flags & EV_ENABLE) &&
+                            !(cl[i].flags & (EV_ADD | EV_DELETE))) {
+                            rearm_pair_port = (mach_port_t)cl[i].ident;
+                        } else if (cl[i].filter == EVFILT_WORKLOOP_PRIVATE &&
+                                   cl[i].fflags == NOTE_WL_THREAD_REQUEST &&
+                                   (cl[i].flags & EV_ADD) &&
+                                   (cl[i].flags & EV_DELETE)) {
+                            rearm_pair_thread_req = true;
+                        }
+                    }
+                }
+
                 for (int i = 0; cl && i < nchanges; i++) {
                     if (cl[i].filter == EVFILT_MACHPORT) {
                         if (cl[i].flags & EV_DELETE) {
@@ -6840,7 +7228,10 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                         }
                     } else if (cl[i].filter == EVFILT_WORKLOOP_PRIVATE &&
                                (cl[i].fflags & NOTE_WL_THREAD_REQUEST)) {
-                        if (cl[i].flags & EV_DELETE) {
+                        bool is_pure_delete = (cl[i].flags & EV_DELETE) &&
+                                              !(cl[i].flags & EV_ADD);
+
+                        if (is_pure_delete) {
                             clear_pending_workloop_req(current_wl_id);
                         } else if (sync_end_changelist &&
                                    !sync_wait_changelist) {
@@ -6871,6 +7262,7 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                     clear_workloop_active(current_wl_id);
                     set_workloop_sync_wake_inflight(current_wl_id, false);
                     clear_workloop_readiness_inflight(current_wl_id);
+                    service_pending_cgs_window_ports();
                 }
 
                 if (do_strace && cl && nchanges > 0) {
@@ -6918,6 +7310,54 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                         pw.delivered_nevents = nevents;
                         mark_workloop_active(current_wl_id);
                         ts->active_workloop_id = current_wl_id;
+                    } else if (rearm_pair_thread_req &&
+                               MACH_PORT_VALID(rearm_pair_port) &&
+                               !is_port_active_rcv(rearm_pair_port) &&
+                               has_zero_wake_workloop_req(current_wl_id) &&
+                               find_workloop_for_port(rearm_pair_port) ==
+                               current_wl_id) {
+                        struct kevent_qos_s template_kev;
+
+                        if (lookup_workloop_port_template(rearm_pair_port,
+                                                          &template_kev) &&
+                            workloop_template_is_readiness_only(&template_kev)) {
+                            struct kevent_qos_s drained[8];
+                            struct kevent_qos_s zero_wake_ev;
+                            int got;
+
+                            if (do_strace) {
+                                fprintf(stderr, "  WQOPS_THREAD_WORKLOOP_RETURN: "
+                                        "rearm-pair drain on 0x%x\n",
+                                        (unsigned)rearm_pair_port);
+                            }
+                            got = prereceive_machport_drain_timeout(
+                                &template_kev, drained, ARRAY_SIZE(drained),
+                                20);
+                            if (got > 0) {
+                                got = filter_workloop_notification_events(
+                                    drained, got);
+                            }
+                            if (got > 0 &&
+                                take_zero_wake_workloop_req(current_wl_id,
+                                                            &zero_wake_ev)) {
+                                mark_workloop_readiness_delivered(
+                                    &template_kev);
+                                pw.delivered_events = g_memdup2(
+                                    drained,
+                                    got * sizeof(struct kevent_qos_s));
+                                pw.delivered_nevents = got;
+                                mark_workloop_active(current_wl_id);
+                                ts->active_workloop_id = current_wl_id;
+                                if (do_strace) {
+                                    fprintf(stderr,
+                                            "  WQOPS_THREAD_WORKLOOP_RETURN: "
+                                            "immediate rearm-pair reuse "
+                                            "wl=0x%llx with %d event(s)\n",
+                                            (unsigned long long)current_wl_id,
+                                            got);
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -7552,6 +7992,7 @@ redispatch_kevent_thread:
                 }
                 if (ended_ownership) {
                     clear_workloop_active(arg1);
+                    service_pending_cgs_window_ports();
                 }
                 if (cl[i].filter == EVFILT_MACHPORT) {
                     mach_port_t mp = (mach_port_t)cl[i].ident;
@@ -7641,10 +8082,12 @@ redispatch_kevent_thread:
                                 fprintf(stderr, "    WORKLOOP THREAD_REQ "
                                         "wl=0x%llx -> keeping parked thread "
                                         "parked (sync wait, no real work)\n",
-                                        (unsigned long long)arg1);
+                                         (unsigned long long)arg1);
                             }
                             store_pending_workloop_req(arg1, &wl_ev, true);
-                        } else if (sync_end_changelist && !sync_wait) {
+                        } else if (sync_end_changelist && !sync_wait &&
+                                   !workloop_has_machport_template(arg1) &&
+                                   !has_pending_cgs_window_ports()) {
                             struct kevent_qos_s zero_wake = wl_ev;
 
                             if (do_strace) {
@@ -7656,6 +8099,33 @@ redispatch_kevent_thread:
                             clear_pending_workloop_req(arg1);
                             deliver_workloop_events_to_thread(arg1,
                                                               &zero_wake, 1);
+                        } else if (!workloop_has_machport_template(arg1) &&
+                                   (!has_pending_cgs_window_ports() ||
+                                    !sync_end_changelist)) {
+                            refresh_workloop_req_value(&wl_ev);
+                            if (do_strace) {
+                                fprintf(stderr, "    WORKLOOP THREAD_REQ "
+                                        "wl=0x%llx -> waking dispatch-only "
+                                        "parked thread\n",
+                                        (unsigned long long)arg1);
+                            }
+                            clear_pending_workloop_req(arg1);
+                            deliver_workloop_events_to_thread(arg1, &wl_ev, 1);
+                        } else if (!workloop_has_machport_template(arg1)) {
+                            /*
+                             * Pure dispatch workloops have no MACHPORT event
+                             * to pair with this THREAD_REQUEST. Keep it
+                             * pending until libdispatch produces real work;
+                             * delivering the bare request corrupts sync handoff
+                             * ordering on AppKit modal setup.
+                             */
+                            if (do_strace) {
+                                fprintf(stderr, "    WORKLOOP THREAD_REQ "
+                                        "wl=0x%llx -> keeping dispatch-only "
+                                        "thread request pending\n",
+                                        (unsigned long long)arg1);
+                            }
+                            store_pending_workloop_req(arg1, &wl_ev, true);
                         } else {
                             /*
                              * No MACHPORT data available yet.  In XNU the
