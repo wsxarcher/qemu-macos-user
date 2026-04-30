@@ -178,6 +178,11 @@ CPUArchState *cpu_copy(CPUArchState *env);
 void cpu_loop(CPUArchState *env);
 void service_pending_workloop_reqs(void);
 void service_workloop_machport_events(void);
+bool service_workloop_machport_event_for_port(mach_port_t port,
+                                              mach_msg_timeout_t timeout_ms);
+void note_pending_cgs_window_port(mach_port_t port);
+bool has_pending_cgs_window_ports(void);
+bool service_pending_cgs_window_ports(void);
 void mark_active_rcv_port(mach_port_t port);
 void unmark_active_rcv_port(mach_port_t port);
 bool is_port_active_rcv(mach_port_t port);

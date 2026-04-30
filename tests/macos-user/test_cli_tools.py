@@ -1822,6 +1822,77 @@ int main(void) {
         self.assertIn("nsalert:auto-close", decoded)
         self.assertIn("nsalert:done", decoded)
 
+    _APPKIT_REGULAR_NSALERT_SRC = r'''
+#import <AppKit/AppKit.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+@interface RegularModalDelegate : NSObject <NSApplicationDelegate>
+@end
+
+@implementation RegularModalDelegate
+- (void)applicationDidFinishLaunching:(NSNotification *)notification
+{
+    (void)notification;
+    fprintf(stderr, "regular-modal:didFinishLaunching\n");
+
+    NSAlert *alert = [[NSAlert alloc] init];
+    [alert setMessageText:@"qemu-macos-user Regular NSAlert"];
+    [alert setInformativeText:@"unbundled app-run modal alert"];
+    [alert addButtonWithTitle:@"OK"];
+    fprintf(stderr, "regular-modal:afterButton\n");
+
+    NSTimer *timer = [NSTimer timerWithTimeInterval:0.5 repeats:NO block:
+        ^(NSTimer *timer) {
+            (void)timer;
+            fprintf(stderr, "regular-modal:auto-close\n");
+            [NSApp stopModalWithCode:NSModalResponseOK];
+        }];
+    [[NSRunLoop mainRunLoop] addTimer:timer
+                              forMode:NSModalPanelRunLoopMode];
+    fprintf(stderr, "regular-modal:afterTimerAdd\n");
+
+    fprintf(stderr, "regular-modal:runModal\n");
+    NSInteger result = [alert runModal];
+    printf("regular-modal=result:%ld\n", (long)result);
+    fprintf(stderr, "regular-modal:done\n");
+    fflush(stdout);
+    exit(0);
+}
+@end
+
+int main(void) {
+    alarm(40);
+
+    @autoreleasepool {
+        fprintf(stderr, "regular-modal:main\n");
+        NSApplication *app = [NSApplication sharedApplication];
+        fprintf(stderr, "regular-modal:sharedApplication\n");
+        [app setActivationPolicy:NSApplicationActivationPolicyRegular];
+        fprintf(stderr, "regular-modal:policy\n");
+        RegularModalDelegate *delegate = [[RegularModalDelegate alloc] init];
+        [app setDelegate:delegate];
+        fprintf(stderr, "regular-modal:beforeRun\n");
+        [app run];
+    }
+    return 0;
+}
+'''
+
+    def test_appkit_regular_nsalert_modal(self):
+        """Unbundled Regular NSApplication NSAlert modal auto-closes."""
+        exe = _compile_framework_test("appkit_regular_nsalert",
+                                      self._APPKIT_REGULAR_NSALERT_SRC,
+                                      ["AppKit"])
+        rc, out, err = _run_emulated(exe, timeout=50)
+        decoded = err.decode(errors="replace")
+        self.assertEqual(rc, 0, f"appkit_regular_nsalert failed: {decoded}")
+        self.assertIn(b"regular-modal=result:1", out)
+        self.assertIn("regular-modal:runModal", decoded)
+        self.assertIn("regular-modal:auto-close", decoded)
+        self.assertIn("regular-modal:done", decoded)
+
     # -- WindowServer query test (SkyLight framework) -----------------------
 
     _WS_QUERY_SRC = r'''

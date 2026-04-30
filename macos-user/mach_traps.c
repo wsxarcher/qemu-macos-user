@@ -86,12 +86,12 @@ static pthread_mutex_t special_reply_port_lock = PTHREAD_MUTEX_INITIALIZER;
 static mach_port_name_t analyticsd_service_ports[MAX_ANALYTICSD_SERVICE_PORTS];
 static int analyticsd_service_port_count;
 static pthread_mutex_t analyticsd_service_port_lock = PTHREAD_MUTEX_INITIALIZER;
-static mach_port_name_t cgs_window_memory_object_port;
 
 #define MAX_EXTERNAL_OOL_IDENTITY_MAPPINGS 64
 typedef struct ExternalOolIdentityMapping {
     abi_ulong start;
     abi_ulong size;
+    bool shared;
 } ExternalOolIdentityMapping;
 
 static ExternalOolIdentityMapping
@@ -345,13 +345,6 @@ static void remember_analyticsd_service_port(mach_port_name_t port,
     }
 }
 
-static void remember_cgs_window_memory_object_port(mach_port_name_t port)
-{
-    if (MACH_PORT_VALID(port)) {
-        cgs_window_memory_object_port = port;
-    }
-}
-
 static abi_long copy_external_mach_mapping_to_guest(mach_vm_address_t host_addr,
                                                     mach_vm_size_t size,
                                                     abi_ulong preferred_guest,
@@ -410,8 +403,35 @@ static bool external_ool_identity_mapping_contains(abi_ulong start,
     return false;
 }
 
+static bool host_region_contains(uintptr_t host_addr, size_t size,
+                                 vm_prot_t required_prot)
+{
+    mach_vm_address_t region_addr = host_addr;
+    mach_vm_size_t region_size = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object_name = MACH_PORT_NULL;
+    kern_return_t kr;
+
+    if (size == 0 || host_addr > UINTPTR_MAX - size + 1) {
+        return false;
+    }
+
+    kr = mach_vm_region(mach_task_self(), &region_addr, &region_size,
+                        VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info,
+                        &count, &object_name);
+    if (object_name != MACH_PORT_NULL) {
+        mach_port_deallocate(mach_task_self(), object_name);
+    }
+    return kr == KERN_SUCCESS &&
+           region_addr <= host_addr &&
+           host_addr + size <= region_addr + region_size &&
+           (info.protection & required_prot) == required_prot;
+}
+
 static void remember_external_ool_identity_mapping(abi_ulong start,
-                                                  abi_ulong size)
+                                                   abi_ulong size,
+                                                   bool shared)
 {
     if (external_ool_identity_mapping_count >=
         MAX_EXTERNAL_OOL_IDENTITY_MAPPINGS) {
@@ -421,7 +441,58 @@ static void remember_external_ool_identity_mapping(abi_ulong start,
         (ExternalOolIdentityMapping) {
             .start = start,
             .size = size,
+            .shared = shared,
         };
+}
+
+static void sync_external_ool_identity_mappings_to_host(void)
+{
+    for (int i = 0; i < external_ool_identity_mapping_count; i++) {
+        abi_ulong start = external_ool_identity_mappings[i].start;
+        abi_ulong size = external_ool_identity_mappings[i].size;
+
+        if (external_ool_identity_mappings[i].shared) {
+            continue;
+        }
+        if (start >= guest_base ||
+            !guest_range_valid_untagged(start, size) ||
+            !host_region_contains((uintptr_t)start, size, VM_PROT_WRITE)) {
+            continue;
+        }
+        memcpy((void *)(uintptr_t)start, g2h_untagged(start), size);
+        if (do_strace) {
+            fprintf(stderr,
+                    "    OOL identity sync guest 0x%llx -> host %p "
+                    "size=0x%llx\n",
+                    (unsigned long long)start, (void *)(uintptr_t)start,
+                    (unsigned long long)size);
+        }
+    }
+}
+
+static void refresh_external_ool_identity_mappings_from_host(void)
+{
+    for (int i = 0; i < external_ool_identity_mapping_count; i++) {
+        abi_ulong start = external_ool_identity_mappings[i].start;
+        abi_ulong size = external_ool_identity_mappings[i].size;
+
+        if (external_ool_identity_mappings[i].shared) {
+            continue;
+        }
+        if (start >= guest_base ||
+            !guest_range_valid_untagged(start, size) ||
+            !host_region_contains((uintptr_t)start, size, VM_PROT_READ)) {
+            continue;
+        }
+        memcpy(g2h_untagged(start), (void *)(uintptr_t)start, size);
+        if (do_strace) {
+            fprintf(stderr,
+                    "    OOL identity refresh host %p -> guest 0x%llx "
+                    "size=0x%llx\n",
+                    (void *)(uintptr_t)start, (unsigned long long)start,
+                    (unsigned long long)size);
+        }
+    }
 }
 
 static bool guest_range_pages_unmapped(abi_ulong start, abi_ulong size)
@@ -491,7 +562,7 @@ static bool copy_external_ool_identity_to_guest(void *host_addr,
             }
             return false;
         }
-        remember_external_ool_identity_mapping(page_start, map_size);
+        remember_external_ool_identity_mapping(page_start, map_size, false);
     }
 
     memcpy(g2h_untagged(guest_addr), host_addr, size);
@@ -503,6 +574,147 @@ static bool copy_external_ool_identity_to_guest(void *host_addr,
                 already_mapped ? " update" : "");
     }
     return true;
+}
+
+static bool remap_external_identity_to_guest(void *host_addr,
+                                             mach_msg_size_t size)
+{
+    uintptr_t host_start = (uintptr_t)host_addr;
+    abi_ulong guest_addr = (abi_ulong)host_start;
+    unsigned long page_size = qemu_real_host_page_size();
+    abi_ulong page_start;
+    abi_ulong page_offset;
+    abi_ulong map_size;
+    mach_vm_address_t target_addr;
+    mach_vm_address_t source_addr;
+    vm_prot_t cur_prot = VM_PROT_NONE;
+    vm_prot_t max_prot = VM_PROT_NONE;
+    kern_return_t kr;
+    bool already_mapped;
+
+    if (!guest_base || host_start >= guest_base ||
+        guest_addr < 0x100000000ULL ||
+        !guest_range_valid_untagged(guest_addr, size)) {
+        return false;
+    }
+    page_start = guest_addr & ~(abi_ulong)(page_size - 1);
+    page_offset = guest_addr - page_start;
+    if (size > (abi_ulong)-1 - page_offset ||
+        page_offset + size > (abi_ulong)-1 - (page_size - 1)) {
+        return false;
+    }
+    map_size = (page_offset + size + page_size - 1) &
+               ~(abi_ulong)(page_size - 1);
+    already_mapped = external_ool_identity_mapping_contains(page_start,
+                                                            map_size);
+    if (already_mapped) {
+        return true;
+    }
+    if (!guest_range_pages_unmapped(page_start, map_size)) {
+        return false;
+    }
+
+    target_addr = (mach_vm_address_t)(uintptr_t)g2h_untagged(page_start);
+    source_addr = (mach_vm_address_t)(uintptr_t)page_start;
+    kr = mach_vm_remap(mach_task_self(), &target_addr, map_size, 0,
+                       VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+                       mach_task_self(), source_addr, false,
+                       &cur_prot, &max_prot, VM_INHERIT_NONE);
+    if (kr != KERN_SUCCESS ||
+        target_addr != (mach_vm_address_t)(uintptr_t)g2h_untagged(page_start)) {
+        return false;
+    }
+
+    mmap_lock();
+    page_set_flags(page_start, page_start + map_size - 1,
+                   PAGE_VALID |
+                   ((cur_prot & VM_PROT_READ) ? PAGE_READ : 0) |
+                   ((cur_prot & VM_PROT_WRITE) ? PAGE_WRITE : 0) |
+                   ((cur_prot & VM_PROT_EXECUTE) ? PAGE_EXEC : 0),
+                   ~0);
+    mmap_unlock();
+    remember_external_ool_identity_mapping(page_start, map_size, true);
+    if (do_strace) {
+        fprintf(stderr,
+                "    OOL identity remap: host %p -> guest 0x%llx "
+                "size=0x%llx prot=0x%x\n",
+                host_addr, (unsigned long long)page_start,
+                (unsigned long long)map_size, cur_prot);
+    }
+    return true;
+}
+
+static bool copy_external_identity_page_to_guest(uint64_t value)
+{
+    unsigned long page_size = qemu_real_host_page_size();
+    mach_vm_address_t region_addr;
+    mach_vm_size_t region_size = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object_name = MACH_PORT_NULL;
+    kern_return_t kr;
+    abi_ulong page_start;
+    abi_ulong copy_size;
+    abi_long guest_addr;
+
+    if (!guest_base || value >= guest_base || value < 0x100000000ULL ||
+        value > UINT64_MAX - page_size) {
+        return false;
+    }
+    page_start = (abi_ulong)value & ~(abi_ulong)(page_size - 1);
+    region_addr = page_start;
+    kr = mach_vm_region(mach_task_self(), &region_addr, &region_size,
+                        VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info,
+                        &count, &object_name);
+    if (object_name != MACH_PORT_NULL) {
+        mach_port_deallocate(mach_task_self(), object_name);
+    }
+    if (kr != KERN_SUCCESS || region_addr > page_start ||
+        !(info.protection & VM_PROT_READ)) {
+        return false;
+    }
+    copy_size = MIN((abi_ulong)(region_addr + region_size - page_start),
+                    (abi_ulong)0x40000);
+    copy_size &= ~(abi_ulong)(page_size - 1);
+    if (copy_size == 0) {
+        copy_size = page_size;
+    }
+    if (remap_external_identity_to_guest((void *)(uintptr_t)page_start,
+                                         (mach_msg_size_t)copy_size)) {
+        return true;
+    }
+    return copy_external_ool_identity_to_guest(
+        (void *)(uintptr_t)page_start, (mach_msg_size_t)copy_size,
+        &guest_addr);
+}
+
+static void fixup_iokit_scalar_reply_identity_pointers(void *reply_buf,
+                                                       mach_msg_size_t size)
+{
+    mach_msg_header_t *hdr = (mach_msg_header_t *)reply_buf;
+    uint8_t *buf = reply_buf;
+    int copied = 0;
+
+    if (!guest_base || !reply_buf || hdr->msgh_id != 2965 ||
+        size < sizeof(*hdr) || hdr->msgh_size < sizeof(*hdr) ||
+        hdr->msgh_size > size) {
+        return;
+    }
+
+    for (mach_msg_size_t off = sizeof(*hdr);
+         off + sizeof(uint64_t) <= hdr->msgh_size; off += sizeof(uint64_t)) {
+        uint64_t value;
+
+        memcpy(&value, buf + off, sizeof(value));
+        if (copy_external_identity_page_to_guest(value)) {
+            copied++;
+        }
+    }
+    if (do_strace && copied > 0) {
+        fprintf(stderr,
+                "  IOKit scalar reply: copied %d external identity page%s\n",
+                copied, copied == 1 ? "" : "s");
+    }
 }
 
 static void relocate_external_ool_pointers(void *guest_buf,
@@ -653,6 +865,16 @@ static bool should_shadow_external_ool_identity(mach_msg_id_t msg_id)
     return msg_id == 32154 || msg_id == 40309 || msg_id == 1919706727;
 }
 
+static bool should_relocate_external_ool_pointers(mach_msg_id_t msg_id)
+{
+    /*
+     * CGS/SkyLight replies contain small opaque tokens and IDs in OOL payloads.
+     * Those are not process-local pointers, even when their bit patterns happen
+     * to fall inside the kernel-chosen OOL mapping range.
+     */
+    return msg_id != 30363 && msg_id != 40309;
+}
+
 typedef kern_return_t (*IOConnectTrap6Func)(mach_port_t, uint32_t,
                                             uintptr_t, uintptr_t, uintptr_t,
                                             uintptr_t, uintptr_t, uintptr_t);
@@ -729,9 +951,66 @@ static bool mach_port_name_is_port_set(mach_port_name_t port)
            (ptype & MACH_PORT_TYPE_PORT_SET);
 }
 
+static bool receive_target_has_queued_message(mach_port_name_t rcv_name,
+                                              bool *known)
+{
+    mach_port_type_t ptype = 0;
+    mach_port_name_array_t members = NULL;
+    mach_msg_type_number_t member_count = 0;
+    kern_return_t kr;
+
+    *known = false;
+    if (rcv_name == MACH_PORT_NULL ||
+        mach_port_type(mach_task_self(), rcv_name, &ptype) != KERN_SUCCESS) {
+        return false;
+    }
+
+    if (ptype & MACH_PORT_TYPE_PORT_SET) {
+        kr = mach_port_get_set_status(mach_task_self(), rcv_name, &members,
+                                      &member_count);
+        if (kr != KERN_SUCCESS) {
+            return false;
+        }
+        *known = true;
+        for (mach_msg_type_number_t i = 0; i < member_count; i++) {
+            mach_port_status_t status = {0};
+            mach_msg_type_number_t count = MACH_PORT_RECEIVE_STATUS_COUNT;
+
+            kr = mach_port_get_attributes(mach_task_self(), members[i],
+                                          MACH_PORT_RECEIVE_STATUS,
+                                          (mach_port_info_t)&status, &count);
+            if (kr == KERN_SUCCESS && status.mps_msgcount > 0) {
+                vm_deallocate(mach_task_self(), (vm_address_t)members,
+                              member_count * sizeof(*members));
+                return true;
+            }
+        }
+        if (members) {
+            vm_deallocate(mach_task_self(), (vm_address_t)members,
+                          member_count * sizeof(*members));
+        }
+        return false;
+    }
+
+    if (ptype & MACH_PORT_TYPE_RECEIVE) {
+        mach_port_status_t status = {0};
+        mach_msg_type_number_t count = MACH_PORT_RECEIVE_STATUS_COUNT;
+
+        kr = mach_port_get_attributes(mach_task_self(), rcv_name,
+                                      MACH_PORT_RECEIVE_STATUS,
+                                      (mach_port_info_t)&status, &count);
+        if (kr == KERN_SUCCESS) {
+            *known = true;
+            return status.mps_msgcount > 0;
+        }
+    }
+
+    return false;
+}
+
 static void trace_port_set_receive_status(mach_port_name_t port_set,
-                                          const char *where,
-                                          uint32_t iteration)
+                                           const char *where,
+                                           uint32_t iteration)
 {
     mach_port_name_array_t members = NULL;
     mach_msg_type_number_t member_count = 0;
@@ -1455,6 +1734,7 @@ static bool handle_mig_message(void *buf, void *reply_buf,
                     host_addr = (mach_vm_address_t)(uintptr_t)
                         g2h_untagged(guest_start);
                 }
+                map_flags = (flags & ~VM_FLAGS_ANYWHERE) | VM_FLAGS_OVERWRITE;
             }
 
             kr = mach_vm_map(mach_task_self(), &host_addr, size,
@@ -1473,70 +1753,6 @@ static bool handle_mig_message(void *buf, void *reply_buf,
                     if (reserved_start) {
                         target_munmap(reserved_start, size);
                         reserved_start = 0;
-                    }
-                }
-                if (result == (abi_long)-1 &&
-                    size == 0xb0 && (flags & VM_FLAGS_ANYWHERE) &&
-                    MACH_PORT_VALID(cgs_window_memory_object_port) &&
-                    cgs_window_memory_object_port != object) {
-                    mach_port_name_t retry_object =
-                        cgs_window_memory_object_port;
-                    abi_long retry_reserve =
-                        target_mmap_mach_anywhere_aligned(
-                            size, req->mask, PROT_NONE,
-                            MAP_PRIVATE | MAP_ANONYMOUS, anon_fd, 0);
-                    if (retry_reserve >= 0) {
-                        kern_return_t retry_kr;
-
-                        host_addr = (mach_vm_address_t)(uintptr_t)
-                            g2h_untagged(retry_reserve);
-                        map_flags =
-                            (flags & ~VM_FLAGS_ANYWHERE) | VM_FLAGS_OVERWRITE;
-                        retry_kr = mach_vm_map(
-                            mach_task_self(), &host_addr, size, req->mask,
-                            map_flags, retry_object, offset, copy,
-                            cur_prot, max_prot, inheritance);
-                        if (do_strace) {
-                            fprintf(stderr,
-                                "  MIG mach_vm_map: retry 0xb0 CGS object "
-                                "inline=0x%x saved=0x%x kr=0x%x\n",
-                                object, retry_object, retry_kr);
-                        }
-                        if (retry_kr == KERN_SUCCESS &&
-                            h2g_valid(host_addr)) {
-                            result = h2g(host_addr);
-                            mach_port_deallocate(mach_task_self(),
-                                                 retry_object);
-                            cgs_window_memory_object_port = MACH_PORT_NULL;
-                            object_map_kr = retry_kr;
-                        } else if (retry_kr == KERN_SUCCESS) {
-                            result = copy_external_mach_mapping_to_guest(
-                                host_addr, size, retry_reserve,
-                                "CGS object");
-                            if (result != (abi_long)-1) {
-                                mach_port_deallocate(mach_task_self(),
-                                                     retry_object);
-                                cgs_window_memory_object_port =
-                                    MACH_PORT_NULL;
-                                object_map_kr = retry_kr;
-                            } else {
-                                target_munmap(retry_reserve, size);
-                            }
-                        } else {
-                            target_munmap(retry_reserve, size);
-                        }
-                    }
-                }
-                if (result == (abi_long)-1 && size == 0xb0 &&
-                    (flags & VM_FLAGS_ANYWHERE)) {
-                    result = target_mmap_mach_anywhere_aligned(
-                        size, req->mask, PROT_READ | PROT_WRITE,
-                        MAP_PRIVATE | MAP_ANONYMOUS, anon_fd, 0);
-                    if (do_strace) {
-                        fprintf(stderr,
-                                "  MIG mach_vm_map: fallback anonymous "
-                                "window state map -> 0x%llx\n",
-                                (unsigned long long)result);
                     }
                 }
             }
@@ -2596,6 +2812,7 @@ static void debug_log_send_descriptors(void *msg_buf, uint32_t send_size)
         hdr->msgh_id != 1073742031 &&
         hdr->msgh_id != 1073742125 &&
         hdr->msgh_id != 1073742628 &&
+        hdr->msgh_id != 30567 &&
         hdr->msgh_id != 40209) {
         return;
     }
@@ -2646,7 +2863,8 @@ static void debug_log_send_descriptors(void *msg_buf, uint32_t send_size)
             fprintf(stderr,
                     "    SEND OOL desc[%u]: addr=%p size=%u copy=%u\n",
                     i, ool->address, ool->size, ool->copy);
-            if (hdr->msgh_id == 40209 && ool->address && ool->size <= 64) {
+            if ((hdr->msgh_id == 40209 || hdr->msgh_id == 30567) &&
+                ool->address && ool->size <= 256) {
                 const uint8_t *bytes = ool->address;
                 fprintf(stderr, "      SEND OOL data:");
                 for (mach_msg_size_t bi = 0; bi < ool->size; bi++) {
@@ -2663,7 +2881,8 @@ static void debug_log_send_descriptors(void *msg_buf, uint32_t send_size)
             fprintf(stderr,
                     "    SEND OOL_PORTS desc[%u]: addr=%p count=%u disp=%u\n",
                     i, op->address, op->count, op->disposition);
-            if (hdr->msgh_id == 40209 && op->address && op->count <= 16) {
+            if ((hdr->msgh_id == 40209 || hdr->msgh_id == 30567) &&
+                op->address && op->count <= 32) {
                 const mach_port_t *ports = op->address;
                 for (mach_msg_size_t pi = 0; pi < op->count; pi++) {
                     mach_port_type_t ptype = 0;
@@ -2699,6 +2918,124 @@ static void debug_log_send_descriptors(void *msg_buf, uint32_t send_size)
             fprintf(stderr, "    SEND desc[%u]: type=%u\n", i, td->type);
             dp += desc_size;
             break;
+        }
+    }
+}
+
+static void service_pending_cgs_reply_port(const mach_msg_header_t *hdr,
+                                           uint32_t send_size,
+                                           uint64_t options,
+                                           const char *tag)
+{
+    mach_port_t reply_port;
+    bool debug_cgs = do_strace || getenv("QEMU_DEBUG_CGS");
+
+    if (!hdr || !(options & MACH_SEND_MSG) || (options & MACH_RCV_MSG) ||
+        send_size < sizeof(*hdr) || !has_pending_cgs_window_ports()) {
+        return;
+    }
+
+    reply_port = hdr->msgh_local_port;
+    if (!MACH_PORT_VALID(reply_port)) {
+        if (debug_cgs) {
+            fprintf(stderr, "  %s: CGS pending, no reply MACHPORT in "
+                    "msg_id=%d\n", tag, hdr->msgh_id);
+        }
+        if (hdr->msgh_id == 30567) {
+            for (int i = 0; i < 20 && has_pending_cgs_window_ports(); i++) {
+                if (service_pending_cgs_window_ports()) {
+                    break;
+                }
+                usleep(1000);
+            }
+        }
+        return;
+    }
+
+    if (service_workloop_machport_event_for_port(reply_port, 0)) {
+        if (debug_cgs) {
+            fprintf(stderr, "  %s: serviced CGS-related reply MACHPORT "
+                    "0x%x\n", tag, (unsigned)reply_port);
+        }
+    } else if (debug_cgs) {
+        fprintf(stderr, "  %s: CGS-related reply MACHPORT 0x%x not ready "
+                "for msg_id=%d\n", tag, (unsigned)reply_port, hdr->msgh_id);
+    }
+    if (hdr->msgh_id == 30567) {
+        for (int i = 0; i < 20 && has_pending_cgs_window_ports(); i++) {
+            if (service_pending_cgs_window_ports()) {
+                return;
+            }
+            usleep(1000);
+        }
+    }
+    service_pending_cgs_window_ports();
+}
+
+static void service_cgs_send_descriptor_ports(const mach_msg_header_t *hdr,
+                                              uint32_t send_size,
+                                              uint64_t options,
+                                              const char *tag)
+{
+    mach_msg_body_t *body;
+    uint8_t *dp;
+    uint8_t *end;
+    bool serviced = false;
+    bool debug_cgs = do_strace || getenv("QEMU_DEBUG_CGS");
+
+    if (!hdr || !(options & MACH_SEND_MSG) ||
+        send_size < sizeof(*hdr) || !has_pending_cgs_window_ports() ||
+        hdr->msgh_id != 30567 ||
+        !(hdr->msgh_bits & MACH_MSGH_BITS_COMPLEX) ||
+        hdr->msgh_size < sizeof(*hdr) + sizeof(*body) ||
+        hdr->msgh_size > send_size) {
+        return;
+    }
+
+    body = (mach_msg_body_t *)(hdr + 1);
+    dp = (uint8_t *)(body + 1);
+    end = (uint8_t *)hdr + hdr->msgh_size;
+
+    for (uint32_t i = 0; i < body->msgh_descriptor_count; i++) {
+        mach_msg_type_descriptor_t *td;
+        size_t desc_size;
+
+        if (dp + sizeof(*td) > end) {
+            break;
+        }
+        td = (mach_msg_type_descriptor_t *)dp;
+        desc_size = mach_msg_descriptor_size(td->type);
+        if (dp + desc_size > end) {
+            break;
+        }
+
+        if (td->type == MACH_MSG_PORT_DESCRIPTOR) {
+            mach_msg_port_descriptor_t *pd =
+                (mach_msg_port_descriptor_t *)dp;
+            mach_port_type_t ptype = 0;
+
+            if (MACH_PORT_VALID(pd->name) &&
+                mach_port_type(mach_task_self(), pd->name,
+                               &ptype) == KERN_SUCCESS &&
+                (ptype & MACH_PORT_TYPE_RECEIVE) &&
+                service_workloop_machport_event_for_port(pd->name, 100)) {
+                serviced = true;
+                if (debug_cgs) {
+                    fprintf(stderr, "  %s: serviced CGS send descriptor "
+                            "MACHPORT 0x%x\n", tag, (unsigned)pd->name);
+                }
+            }
+        }
+
+        dp += desc_size;
+    }
+
+    if (serviced) {
+        for (int i = 0; i < 100 && has_pending_cgs_window_ports(); i++) {
+            if (service_pending_cgs_window_ports()) {
+                break;
+            }
+            usleep(1000);
         }
     }
 }
@@ -2824,7 +3161,19 @@ static bool normalize_launchservices_lookup(void *msg_buf, uint32_t send_size)
  *   3. Releasing the kernel's original mapping
  *   4. Patching the descriptor to hold the guest address
  */
-static void fixup_mig_reply_port(mach_port_name_t name,
+static bool should_preserve_reply_port_attributes(mach_msg_id_t msg_id)
+{
+    /*
+     * CGS/SkyLight window replies hand receive rights to AppKit/QuartzCore.
+     * Leave those rights' queue limits and set membership to the host/kernel
+     * defaults so WindowServer can deliver the follow-up window/context traffic
+     * through the path the guest framework expects.
+     */
+    return msg_id == 30363 || msg_id == 40309;
+}
+
+static void fixup_mig_reply_port(mach_msg_id_t msg_id,
+                                 mach_port_name_t name,
                                  mach_msg_type_name_t disposition,
                                  mach_port_name_t receive_set,
                                  uint32_t index,
@@ -2835,8 +3184,9 @@ static void fixup_mig_reply_port(mach_port_name_t name,
     kern_return_t ptype_ret =
         mach_port_type(mach_task_self(), name, &ptype);
     bool moved_receive = disposition == MACH_MSG_TYPE_MOVE_RECEIVE;
+    bool preserve_port_attrs = should_preserve_reply_port_attributes(msg_id);
 
-    if (!notification_msg &&
+    if (!notification_msg && !preserve_port_attrs &&
         moved_receive &&
         ptype_ret == KERN_SUCCESS && (ptype & MACH_PORT_TYPE_RECEIVE)) {
         mach_port_limits_t limits = {
@@ -2853,7 +3203,11 @@ static void fixup_mig_reply_port(mach_port_name_t name,
                 name, limits.mpl_qlimit, lret);
         }
     }
-    if (!notification_msg &&
+    if (msg_id == 40309 && index == 2 && moved_receive &&
+        ptype_ret == KERN_SUCCESS && (ptype & MACH_PORT_TYPE_RECEIVE)) {
+        note_pending_cgs_window_port(name);
+    }
+    if (!notification_msg && !preserve_port_attrs &&
         moved_receive &&
         ptype_ret == KERN_SUCCESS &&
         (ptype & MACH_PORT_TYPE_RECEIVE) &&
@@ -2874,9 +3228,10 @@ static void fixup_mig_reply_port(mach_port_name_t name,
     }
     if (do_strace) {
         fprintf(stderr,
-            "  %s desc[%u]: name=0x%x disp=%u type=0x%x%s\n",
+            "  %s desc[%u]: name=0x%x disp=%u type=0x%x%s%s\n",
             kind, index, name, disposition, ptype,
-            notification_msg ? " notification" : "");
+            notification_msg ? " notification" : "",
+            preserve_port_attrs ? " preserve-attrs" : "");
     }
 }
 
@@ -3021,8 +3376,10 @@ kern_return_t fixup_mig_reply_ool(void *reply_buf,
                                                              host_addr,
                                                              guest_addr);
                     }
-                    relocate_external_ool_pointers(guest_buf, size, host_addr,
-                                                   guest_addr);
+                    if (should_relocate_external_ool_pointers(hdr->msgh_id)) {
+                        relocate_external_ool_pointers(guest_buf, size,
+                                                       host_addr, guest_addr);
+                    }
                     dealloc_ret = release_host_ool_mapping(host_addr, size);
                     if (dealloc_ret != KERN_SUCCESS && do_strace) {
                         fprintf(stderr,
@@ -3119,16 +3476,9 @@ kern_return_t fixup_mig_reply_ool(void *reply_buf,
         case MACH_MSG_PORT_DESCRIPTOR: {
             mach_msg_port_descriptor_t *pd =
                 (mach_msg_port_descriptor_t *)dp;
-            if (hdr->msgh_id == 30363 && i == 0) {
-                remember_cgs_window_memory_object_port(pd->name);
-                if (do_strace) {
-                    fprintf(stderr,
-                        "    CGSWindowConstruct memory object port=0x%x\n",
-                        pd->name);
-                }
-            }
             fixup_mig_reply_port(
-                pd->name, pd->disposition, receive_set, i, "PORT",
+                hdr->msgh_id, pd->name, pd->disposition, receive_set, i,
+                "PORT",
                 hdr->msgh_id >= MACH_NOTIFY_FIRST &&
                 hdr->msgh_id <= MACH_NOTIFY_LAST);
             dp += sizeof(mach_msg_port_descriptor_t);
@@ -3139,7 +3489,8 @@ kern_return_t fixup_mig_reply_ool(void *reply_buf,
             mach_msg_guarded_port_descriptor_t *gpd =
                 (mach_msg_guarded_port_descriptor_t *)dp;
             fixup_mig_reply_port(
-                gpd->name, gpd->disposition, receive_set, i, "GUARDED_PORT",
+                hdr->msgh_id, gpd->name, gpd->disposition, receive_set, i,
+                "GUARDED_PORT",
                 hdr->msgh_id >= MACH_NOTIFY_FIRST &&
                 hdr->msgh_id <= MACH_NOTIFY_LAST);
             dp += sizeof(mach_msg_guarded_port_descriptor_t);
@@ -3322,12 +3673,21 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
             uintptr_t p5 = translate_iokit_trap_arg((uintptr_t)arg7);
             uintptr_t p6 = translate_iokit_trap_arg((uintptr_t)arg8);
 
+            sync_external_ool_identity_mappings_to_host();
             if (!fn) {
                 ret = KERN_NOT_SUPPORTED;
             } else {
                 ret = fn((mach_port_t)arg1, (uint32_t)arg2,
                          p1, p2, p3, p4, p5, p6);
             }
+            if (ret == KERN_SUCCESS &&
+                ((uint32_t)arg2 <= 3 || (uint32_t)arg2 == 257 ||
+                 (uint32_t)arg2 == 260)) {
+                service_workloop_machport_events();
+                service_workq_notification_events();
+                refresh_external_ool_identity_mappings_from_host();
+            }
+            refresh_external_ool_identity_mappings_from_host();
             if (do_strace) {
                 fprintf(stderr,
                         "  iokit_user_client_trap: conn=0x%x index=%u "
@@ -4070,6 +4430,7 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                             remember_cfpreferences_reply_port(
                                 hdr->msgh_local_port, do_strace);
                         }
+                        sync_external_ool_identity_mappings_to_host();
                     }
 
                     uint64_t vec_opts = options;
@@ -4177,6 +4538,11 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                             if (remaining <= slice) {
                                 uint32_t rcv_name =
                                     (uint32_t)((uint64_t)arg6 >> 32);
+                                if (mach_port_name_is_port_set(rcv_name)) {
+                                    ret = ipc_timeout_result(rcv_name,
+                                                             do_strace);
+                                    break;
+                                }
                                 if (has_deferred_active_rcv_port_op(rcv_name)) {
                                     if (do_strace) {
                                         fprintf(stderr,
@@ -4188,11 +4554,6 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                                     break;
                                 }
                                 if (vec_added_tmout) {
-                                    if (mach_port_name_is_port_set(rcv_name)) {
-                                        ret = ipc_timeout_result(rcv_name,
-                                                                 do_strace);
-                                        break;
-                                    }
                                     ret = ipc_timeout_result(rcv_name,
                                                              do_strace);
                                 } else {
@@ -4209,12 +4570,12 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                             service_workq_notification_events();
                         }
                         ret = host_mach_msg2_trap(host_data, vec_opts,
-                                                  (uint64_t)arg3,
-                                                  (uint64_t)arg4,
-                                                  (uint64_t)arg5,
-                                                  (uint64_t)arg6,
-                                                  (uint64_t)arg7,
-                                                  vec_tmout);
+                                                   (uint64_t)arg3,
+                                                   (uint64_t)arg4,
+                                                   (uint64_t)arg5,
+                                                   (uint64_t)arg6,
+                                                   (uint64_t)arg7,
+                                                   vec_tmout);
                     }
 vec_after_receive:
                     if (ret == KERN_SUCCESS && (vec_opts & 0x2) &&
@@ -4400,8 +4761,17 @@ vec_after_receive:
                                            retry_hdr->msgh_remote_port);
                                }
                                 }
-                          }
+                       }
                       }
+                    }
+
+                    if (ret == KERN_SUCCESS) {
+                        service_cgs_send_descriptor_ports(msg_buf,
+                            vec[0].msgv_send_size, vec_opts,
+                            "mach_msg2[vec]");
+                        service_pending_cgs_reply_port(msg_buf,
+                            vec[0].msgv_send_size, vec_opts,
+                            "mach_msg2[vec]");
                     }
 
                     if (do_strace && ret != KERN_SUCCESS) {
@@ -4458,6 +4828,11 @@ vec_after_receive:
                                 (mach_port_name_t)((uint64_t)arg6 >> 32));
                             if (fix_ret != KERN_SUCCESS) {
                                 ret = fix_ret;
+                            }
+                            if (ret == KERN_SUCCESS) {
+                                fixup_iokit_scalar_reply_identity_pointers(
+                                    vec_reply_buf, vec_reply_size);
+                                refresh_external_ool_identity_mappings_from_host();
                             }
                         }
                         if (ret == KERN_SUCCESS && vec_analyticsd_lookup &&
@@ -4572,12 +4947,14 @@ vec_after_receive:
                             remember_cfpreferences_reply_port(
                                 shdr->msgh_local_port, do_strace);
                         }
+                        sync_external_ool_identity_mappings_to_host();
                     }
 
                     uint64_t trap_options = options;
                     uint64_t trap_timeout = (uint64_t)arg8;
                     bool added_timeout = false;
                     bool poll_receive = false;
+                    bool zero_timeout_receive = false;
                     mach_port_name_t direct_rcv_port = MACH_PORT_NULL;
 
 #define OPT_SEND   0x1
@@ -4609,6 +4986,11 @@ vec_after_receive:
                         }
                         poll_receive = added_timeout ||
                             trap_timeout >= WORKLOOP_POLL_SLICE_MS;
+                        if (!added_timeout && trap_timeout == 0) {
+                            zero_timeout_receive = true;
+                            trap_timeout = 1;
+                            poll_receive = true;
+                        }
                     }
 #undef OPT_SEND
 #undef OPT_RCV
@@ -4639,6 +5021,15 @@ vec_after_receive:
                         while (1) {
                             uint64_t slice = remaining > WORKLOOP_POLL_SLICE_MS
                                 ? WORKLOOP_POLL_SLICE_MS : remaining;
+                            bool receive_status_known = false;
+
+                            if (zero_timeout_receive &&
+                                !receive_target_has_queued_message(
+                                    direct_rcv_port, &receive_status_known) &&
+                                receive_status_known) {
+                                ret = 0x10004003;
+                                break;
+                            }
 
                             service_workloop_machport_events();
                             service_workq_notification_events();
@@ -4655,6 +5046,11 @@ vec_after_receive:
                             if (remaining <= slice) {
                                 uint32_t rcv_name =
                                     (uint32_t)((uint64_t)arg6 >> 32);
+                                if (mach_port_name_is_port_set(rcv_name)) {
+                                    ret = ipc_timeout_result(rcv_name,
+                                                             do_strace);
+                                    break;
+                                }
                                 if (has_deferred_active_rcv_port_op(rcv_name)) {
                                     if (do_strace) {
                                         fprintf(stderr,
@@ -4665,11 +5061,6 @@ vec_after_receive:
                                     break;
                                 }
                                 if (added_timeout) {
-                                    if (mach_port_name_is_port_set(rcv_name)) {
-                                        ret = ipc_timeout_result(rcv_name,
-                                                                 do_strace);
-                                        break;
-                                    }
                                     ret = ipc_timeout_result(rcv_name,
                                                              do_strace);
                                 } else {
@@ -4851,8 +5242,15 @@ direct_after_receive:
                                           retry_hdr->msgh_remote_port);
                               }
                                 }
-                         }
+                        }
                      }
+                    }
+
+                    if (ret == KERN_SUCCESS) {
+                        service_cgs_send_descriptor_ports(direct_shdr,
+                            direct_send_size, trap_options, "mach_msg2");
+                        service_pending_cgs_reply_port(direct_shdr,
+                            direct_send_size, trap_options, "mach_msg2");
                     }
 
                     if (do_strace && ret == KERN_SUCCESS &&
@@ -4937,6 +5335,11 @@ direct_after_receive:
                             (mach_port_name_t)((uint64_t)arg6 >> 32));
                         if (fix_ret != KERN_SUCCESS) {
                             ret = fix_ret;
+                        }
+                        if (ret == KERN_SUCCESS) {
+                            fixup_iokit_scalar_reply_identity_pointers(
+                                host_data, direct_reply_size);
+                            refresh_external_ool_identity_mappings_from_host();
                         }
                         if (ret == KERN_SUCCESS && direct_analyticsd_lookup) {
                             remember_analyticsd_reply_ports(host_data,
@@ -5072,8 +5475,8 @@ direct_after_receive:
         }
         ret = host_mk_timer_arm_leeway((mach_port_name_t)arg1,
                                        (uint64_t)arg2,
-                                       (uint64_t)arg3,
-                                       (uint64_t)arg4);
+                                        (uint64_t)arg3,
+                                        (uint64_t)arg4);
         if (ret == KERN_SUCCESS) {
             record_mk_timer_arm((mach_port_name_t)arg1, (uint64_t)arg3);
         }
