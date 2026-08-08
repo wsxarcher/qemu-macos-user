@@ -175,6 +175,7 @@ void dump_core_and_abort(int sig);
 
 /* Thread support */
 CPUArchState *cpu_copy(CPUArchState *env);
+void macos_configure_cpu_cntfrq(CPUState *cpu);
 void cpu_loop(CPUArchState *env);
 void service_pending_workloop_reqs(void);
 void service_workloop_machport_events(void);

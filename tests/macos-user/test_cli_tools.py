@@ -944,6 +944,54 @@ int main(void) {
         self.assertIn(b"result=42", out)
         self.assertIn(b"nested=99", out)
 
+    _THREAD_TIMEBASE_SRC = r'''
+#include <mach/mach_time.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+
+/*
+ * Every guest thread must observe the same mach_absolute_time() timebase.
+ * QEMU's ARMCPU default counter frequency (1 GHz) differs from Apple
+ * Silicon's 24 MHz, and gt_cntfrq_hz lives outside CPUArchState, so a
+ * cloned CPU that does not re-apply it reads CNTVCT_EL0 ~41x too large.
+ * Timers armed on one thread then never come due on another.
+ */
+static void *child(void *arg) {
+    uint64_t *out = (uint64_t *)arg;
+    out[0] = mach_absolute_time();
+    return NULL;
+}
+
+int main(void) {
+    mach_timebase_info_data_t tb;
+    mach_timebase_info(&tb);
+    printf("timebase=%u/%u\n", tb.numer, tb.denom);
+
+    uint64_t before = mach_absolute_time();
+    uint64_t child_t = 0;
+    pthread_t t;
+    if (pthread_create(&t, NULL, child, &child_t) != 0) {
+        printf("pthread_create=FAILED\n");
+        return 1;
+    }
+    pthread_join(t, NULL);
+    uint64_t after = mach_absolute_time();
+
+    printf("before=%llu\n", (unsigned long long)before);
+    printf("child=%llu\n", (unsigned long long)child_t);
+    printf("after=%llu\n", (unsigned long long)after);
+    /*
+     * The child ran strictly between the two main-thread samples, so its
+     * timestamp must fall inside that window.  A skewed timebase lands far
+     * outside it.
+     */
+    printf("ordered=%s\n",
+           (before <= child_t && child_t <= after) ? "YES" : "NO");
+    return 0;
+}
+'''
+
     def test_pthread_create(self):
         """pthread_create with a real thread function."""
         exe = _compile_framework_test("pthread_create",
@@ -953,6 +1001,30 @@ int main(void) {
         self.assertEqual(rc, 0)
         self.assertIn(b"rc=0", out)
         self.assertIn(b"thread_result=42", out)
+
+    def test_thread_timebase_consistency(self):
+        """mach_absolute_time() shares one timebase across guest threads."""
+        exe = _compile_framework_test("thread_timebase",
+                                      self._THREAD_TIMEBASE_SRC,
+                                      [], "c")
+        rc, out, err = _run_emulated(exe, timeout=20)
+        decoded = out.decode(errors="replace")
+        self.assertEqual(rc, 0, f"thread_timebase failed: "
+                                f"{err.decode(errors='replace')}")
+
+        values = dict(
+            line.split("=", 1)
+            for line in decoded.strip().splitlines() if "=" in line
+        )
+        before = int(values["before"])
+        child = int(values["child"])
+        after = int(values["after"])
+
+        self.assertEqual(
+            values["ordered"], "YES",
+            f"secondary thread timebase is skewed: before={before} "
+            f"child={child} after={after} "
+            f"(ratio={child / before if before else 0:.3f})")
 
     def test_dispatch_async(self):
         """dispatch_async on a global concurrent queue (GCD workqueue)."""
