@@ -97,6 +97,7 @@ typedef struct ExternalOolIdentityMapping {
 static ExternalOolIdentityMapping
 external_ool_identity_mappings[MAX_EXTERNAL_OOL_IDENTITY_MAPPINGS];
 static int external_ool_identity_mapping_count;
+static pthread_mutex_t external_ool_identity_lock = PTHREAD_MUTEX_INITIALIZER;
 
 typedef enum DeferredActiveRcvPortOpKind {
     DEFER_ACTIVE_RCV_PORT_DEALLOCATE,
@@ -390,6 +391,9 @@ static abi_long copy_external_mach_mapping_to_guest(mach_vm_address_t host_addr,
 static bool external_ool_identity_mapping_contains(abi_ulong start,
                                                    abi_ulong size)
 {
+    bool found = false;
+
+    pthread_mutex_lock(&external_ool_identity_lock);
     for (int i = 0; i < external_ool_identity_mapping_count; i++) {
         abi_ulong map_start = external_ool_identity_mappings[i].start;
         abi_ulong map_size = external_ool_identity_mappings[i].size;
@@ -397,10 +401,12 @@ static bool external_ool_identity_mapping_contains(abi_ulong start,
         if (start >= map_start &&
             start - map_start <= map_size &&
             size <= map_size - (start - map_start)) {
-            return true;
+            found = true;
+            break;
         }
     }
-    return false;
+    pthread_mutex_unlock(&external_ool_identity_lock);
+    return found;
 }
 
 static bool host_region_contains(uintptr_t host_addr, size_t size,
@@ -433,25 +439,70 @@ static void remember_external_ool_identity_mapping(abi_ulong start,
                                                    abi_ulong size,
                                                    bool shared)
 {
-    if (external_ool_identity_mapping_count >=
+    pthread_mutex_lock(&external_ool_identity_lock);
+    if (external_ool_identity_mapping_count <
         MAX_EXTERNAL_OOL_IDENTITY_MAPPINGS) {
-        return;
+        external_ool_identity_mappings[external_ool_identity_mapping_count++] =
+            (ExternalOolIdentityMapping) {
+                .start = start,
+                .size = size,
+                .shared = shared,
+            };
     }
-    external_ool_identity_mappings[external_ool_identity_mapping_count++] =
-        (ExternalOolIdentityMapping) {
-            .start = start,
-            .size = size,
-            .shared = shared,
-        };
+    pthread_mutex_unlock(&external_ool_identity_lock);
+}
+
+/*
+ * Copy between an identity-mapped external OOL region and guest memory.
+ *
+ * host_region_contains() can only ever be a hint: the region belongs to a
+ * mapping the kernel handed us, and another thread (or the peer task) may
+ * re-protect or deallocate it at any moment.  A plain memcpy() therefore
+ * races and faults inside the emulator, which is unrecoverable -- the host
+ * SIGSEGV is not a guest fault and cannot be unwound.
+ *
+ * Let the kernel perform the copy instead: mach_vm_read_overwrite() and
+ * mach_vm_write() validate both ranges and report failure rather than
+ * raising an exception in our address space.
+ */
+static bool copy_ool_identity_region(mach_vm_address_t dst,
+                                     mach_vm_address_t src,
+                                     abi_ulong size,
+                                     bool to_host)
+{
+    kern_return_t kr;
+
+    if (to_host) {
+        kr = mach_vm_write(mach_task_self(), dst, (vm_offset_t)src,
+                           (mach_msg_type_number_t)size);
+    } else {
+        mach_vm_size_t copied = 0;
+
+        kr = mach_vm_read_overwrite(mach_task_self(), src,
+                                    (mach_vm_size_t)size, dst, &copied);
+        if (kr == KERN_SUCCESS && copied != size) {
+            kr = KERN_FAILURE;
+        }
+    }
+    return kr == KERN_SUCCESS;
 }
 
 static void sync_external_ool_identity_mappings_to_host(void)
 {
-    for (int i = 0; i < external_ool_identity_mapping_count; i++) {
-        abi_ulong start = external_ool_identity_mappings[i].start;
-        abi_ulong size = external_ool_identity_mappings[i].size;
+    ExternalOolIdentityMapping snapshot[MAX_EXTERNAL_OOL_IDENTITY_MAPPINGS];
+    int count;
 
-        if (external_ool_identity_mappings[i].shared) {
+    pthread_mutex_lock(&external_ool_identity_lock);
+    count = external_ool_identity_mapping_count;
+    memcpy(snapshot, external_ool_identity_mappings,
+           count * sizeof(snapshot[0]));
+    pthread_mutex_unlock(&external_ool_identity_lock);
+
+    for (int i = 0; i < count; i++) {
+        abi_ulong start = snapshot[i].start;
+        abi_ulong size = snapshot[i].size;
+
+        if (snapshot[i].shared) {
             continue;
         }
         if (start >= guest_base ||
@@ -459,7 +510,12 @@ static void sync_external_ool_identity_mappings_to_host(void)
             !host_region_contains((uintptr_t)start, size, VM_PROT_WRITE)) {
             continue;
         }
-        memcpy((void *)(uintptr_t)start, g2h_untagged(start), size);
+        if (!copy_ool_identity_region((mach_vm_address_t)start,
+                                      (mach_vm_address_t)(uintptr_t)
+                                          g2h_untagged(start),
+                                      size, true)) {
+            continue;
+        }
         if (do_strace) {
             fprintf(stderr,
                     "    OOL identity sync guest 0x%llx -> host %p "
@@ -472,11 +528,20 @@ static void sync_external_ool_identity_mappings_to_host(void)
 
 static void refresh_external_ool_identity_mappings_from_host(void)
 {
-    for (int i = 0; i < external_ool_identity_mapping_count; i++) {
-        abi_ulong start = external_ool_identity_mappings[i].start;
-        abi_ulong size = external_ool_identity_mappings[i].size;
+    ExternalOolIdentityMapping snapshot[MAX_EXTERNAL_OOL_IDENTITY_MAPPINGS];
+    int count;
 
-        if (external_ool_identity_mappings[i].shared) {
+    pthread_mutex_lock(&external_ool_identity_lock);
+    count = external_ool_identity_mapping_count;
+    memcpy(snapshot, external_ool_identity_mappings,
+           count * sizeof(snapshot[0]));
+    pthread_mutex_unlock(&external_ool_identity_lock);
+
+    for (int i = 0; i < count; i++) {
+        abi_ulong start = snapshot[i].start;
+        abi_ulong size = snapshot[i].size;
+
+        if (snapshot[i].shared) {
             continue;
         }
         if (start >= guest_base ||
@@ -484,7 +549,12 @@ static void refresh_external_ool_identity_mappings_from_host(void)
             !host_region_contains((uintptr_t)start, size, VM_PROT_READ)) {
             continue;
         }
-        memcpy(g2h_untagged(start), (void *)(uintptr_t)start, size);
+        if (!copy_ool_identity_region((mach_vm_address_t)(uintptr_t)
+                                          g2h_untagged(start),
+                                      (mach_vm_address_t)start,
+                                      size, false)) {
+            continue;
+        }
         if (do_strace) {
             fprintf(stderr,
                     "    OOL identity refresh host %p -> guest 0x%llx "

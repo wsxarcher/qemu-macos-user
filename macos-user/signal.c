@@ -29,6 +29,8 @@
 #include "user/guest-base.h"
 #include "user/page-protection.h"
 #include "gdbstub/user.h"
+#include "accel/tcg/helper-retaddr.h"
+#include "tcg/tcg.h"
 #include "exec/mmap-lock.h"
 #include "trace.h"
 
@@ -368,9 +370,10 @@ void host_signal_handler(int host_sig, siginfo_t *info, void *puc)
     if ((host_sig == SIGSEGV || host_sig == SIGBUS) && info->si_code > 0) {
         uintptr_t host_addr = (uintptr_t)info->si_addr;
         abi_ptr guest_addr = h2g_nocheck(host_addr);
+        uintptr_t host_pc = uc->uc_mcontext->__ss.__pc;
         bool is_write;
 
-        pc = uc->uc_mcontext->__ss.__pc;
+        pc = host_pc;
 
         /* On AArch64, ESR bit 6 (WnR) indicates write for data aborts */
         uint32_t esr = uc->uc_mcontext->__es.__esr;
@@ -450,6 +453,37 @@ void host_signal_handler(int host_sig, siginfo_t *info, void *puc)
         }
 
         host_fault_retry_reset();
+
+        /*
+         * A guest memory fault can only arise from translated code or from a
+         * helper called by it.  Anything else faulted inside the emulator
+         * itself and must not be unwound as a guest fault: cpu_loop_exit_*()
+         * longjmps out of arbitrary C code, abandoning locks and half-updated
+         * emulator state.  The process then typically spins in this handler
+         * forever at a wild host address instead of reporting anything, which
+         * is exactly how the AppKit modal tests hang.
+         *
+         * Report the emulator bug and let the default handler dump core.
+         */
+        if (helper_retaddr == 0 &&
+            !in_code_gen_buffer((const void *)(host_pc - tcg_splitwx_diff))) {
+            struct sigaction dfl;
+
+            fprintf(stderr,
+                    "qemu: fatal: emulator faulted on %s at host pc=0x%llx "
+                    "accessing %p (guest_addr=0x%llx code=%d write=%d)\n",
+                    host_sig == SIGSEGV ? "SIGSEGV" : "SIGBUS",
+                    (unsigned long long)host_pc, (void *)host_addr,
+                    (unsigned long long)guest_addr, info->si_code, is_write);
+            fflush(stderr);
+
+            memset(&dfl, 0, sizeof(dfl));
+            dfl.sa_handler = SIG_DFL;
+            sigemptyset(&dfl.sa_mask);
+            sigaction(host_sig, &dfl, NULL);
+            sigprocmask(SIG_SETMASK, &uc->uc_sigmask, NULL);
+            return; /* retry the access; now fatal */
+        }
 
         if (host_sig == SIGSEGV) {
             bool maperr = true;
