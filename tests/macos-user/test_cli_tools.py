@@ -1216,6 +1216,94 @@ int main(void) {
         self.assertIn("sync_ran=1", decoded)
         self.assertIn("after_fired=1", decoded)
 
+    _JIT_PAGES_SRC = r'''
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+/*
+ * Execute code from many freshly mapped pages on several threads at once.
+ *
+ * Translating a page the emulator has not seen before reads guest memory
+ * from inside tb_gen_code(), which runs with mmap_lock held because that is
+ * what serialises the single user-mode TCG context.  If such a read faults
+ * (lazily materialised reservation), the fault handler must not re-enter
+ * QEMU's page-table bookkeeping underneath it.
+ */
+#define NPAGES 64
+#define NTHREADS 4
+
+typedef int (*fn_t)(void);
+
+static int run_pages(void) {
+    size_t ps = (size_t)getpagesize();
+    size_t len = ps * NPAGES;
+    unsigned char *mem = mmap(NULL, len, PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
+    if (mem == MAP_FAILED) {
+        mem = mmap(NULL, len, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANON, -1, 0);
+    }
+    if (mem == MAP_FAILED) {
+        return -1;
+    }
+    /* mov w0, #42 ; ret */
+    const uint32_t code[2] = { 0x52800540, 0xd65f03c0 };
+    for (int i = 0; i < NPAGES; i++) {
+        memcpy(mem + (size_t)i * ps, code, sizeof(code));
+    }
+    if (mprotect(mem, len, PROT_READ | PROT_EXEC) != 0) {
+        munmap(mem, len);
+        return -1;
+    }
+    int ok = 0;
+    for (int i = 0; i < NPAGES; i++) {
+        fn_t f = (fn_t)(void *)(mem + (size_t)i * ps);
+        if (f() == 42) {
+            ok++;
+        }
+    }
+    munmap(mem, len);
+    return ok;
+}
+
+static void *worker(void *arg) {
+    *(int *)arg = run_pages();
+    return NULL;
+}
+
+int main(void) {
+    pthread_t t[NTHREADS];
+    int res[NTHREADS];
+    for (int i = 0; i < NTHREADS; i++) {
+        pthread_create(&t[i], NULL, worker, &res[i]);
+    }
+    for (int i = 0; i < NTHREADS; i++) {
+        pthread_join(t[i], NULL);
+    }
+    int total = 0;
+    for (int i = 0; i < NTHREADS; i++) {
+        total += res[i] > 0 ? res[i] : 0;
+    }
+    printf("executed=%d expected=%d\n", total, NPAGES * NTHREADS);
+    return 0;
+}
+'''
+
+    def test_concurrent_new_page_execution(self):
+        """Translate and run code from fresh pages on several threads."""
+        exe = _compile_framework_test("jit_pages", self._JIT_PAGES_SRC,
+                                      [], "c")
+        rc, out, err = _run_emulated(exe, timeout=40)
+        decoded = out.decode(errors="replace")
+        _assert_no_emulator_fault(self, err)
+        self.assertEqual(rc, 0, f"jit_pages failed: "
+                                f"{err.decode(errors='replace')}")
+        self.assertIn("executed=256 expected=256", decoded)
+
     def test_dispatch_async(self):
         """dispatch_async on a global concurrent queue (GCD workqueue)."""
         exe = _compile_framework_test("dispatch_async",

@@ -31,6 +31,7 @@
 #include "gdbstub/user.h"
 #include "accel/tcg/helper-retaddr.h"
 #include "tcg/tcg.h"
+#include <mach-o/dyld.h>
 #include "exec/mmap-lock.h"
 #include "trace.h"
 
@@ -422,10 +423,31 @@ void host_signal_handler(int host_sig, siginfo_t *info, void *puc)
                                   host_prot);
                 if (rc == 0 &&
                     !host_fault_retry_exhausted(host_addr, pc)) {
-                    mmap_lock();
-                    page_set_flags(page_start, page_start + page_size - 1,
-                                   new_flags, ~0);
-                    mmap_unlock();
+                    /*
+                     * Only touch QEMU's page table when this fault did not
+                     * interrupt emulator code that already holds mmap_lock.
+                     *
+                     * A translation read inside tb_gen_code() can fault on a
+                     * page of a PROT_NONE reservation, and tb_gen_code() runs
+                     * with mmap_lock held (that is what serialises the single
+                     * user-mode TCG context).  mmap_lock is recursive per
+                     * thread, so it does not block here -- it would let the
+                     * handler re-enter page_set_flags() and
+                     * tb_invalidate_phys_range() underneath a half-finished
+                     * mutation of the very same structures, corrupting the
+                     * page-flags interval tree and the TB hash tables.
+                     *
+                     * mprotect() above is all that is needed to let the access
+                     * complete; the bookkeeping is refreshed by the next fault
+                     * on this page taken from translated code.
+                     */
+                    if (!have_mmap_lock()) {
+                        mmap_lock();
+                        page_set_flags(page_start,
+                                       page_start + page_size - 1,
+                                       new_flags, ~0);
+                        mmap_unlock();
+                    }
                     return; /* retry the faulting instruction */
                 }
                 if (rc == 0) {
@@ -471,9 +493,12 @@ void host_signal_handler(int host_sig, siginfo_t *info, void *puc)
 
             fprintf(stderr,
                     "qemu: fatal: emulator faulted on %s at host pc=0x%llx "
-                    "accessing %p (guest_addr=0x%llx code=%d write=%d)\n",
+                    "(qemu-aarch64 base=%p) accessing %p "
+                    "(guest_addr=0x%llx code=%d write=%d)\n",
                     host_sig == SIGSEGV ? "SIGSEGV" : "SIGBUS",
-                    (unsigned long long)host_pc, (void *)host_addr,
+                    (unsigned long long)host_pc,
+                    (const void *)_dyld_get_image_header(0),
+                    (void *)host_addr,
                     (unsigned long long)guest_addr, info->si_code, is_write);
             fflush(stderr);
 
