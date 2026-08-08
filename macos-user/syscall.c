@@ -201,7 +201,7 @@ static int refresh_workloop_state_update(struct kevent_qos_s *kev)
     if (!addr) {
         return 0;
     }
-    if (!guest_range_valid_untagged(addr, sizeof(current))) {
+    if (!guest_range_readable(addr, sizeof(current))) {
         return EFAULT;
     }
 
@@ -770,7 +770,7 @@ static mach_port_t current_guest_thread_port(CPUARMState *env)
     if (tsd_base && saved_mach_thread_self_offset) {
         abi_ulong slot_addr = tsd_base + saved_mach_thread_self_offset;
 
-        if (guest_range_valid_untagged(slot_addr, sizeof(uint64_t))) {
+        if (guest_range_readable(slot_addr, sizeof(uint64_t))) {
             uint64_t self_name = *(uint64_t *)g2h_untagged(slot_addr);
 
             if (self_name != MACH_PORT_NULL && self_name <= UINT32_MAX) {
@@ -1013,7 +1013,7 @@ static bool consume_active_ulock_sync_wake(uint64_t wl_id, mach_port_t waiter,
         return false;
     }
 
-    if (guest_range_valid_untagged(wait_addr, sizeof(uint32_t))) {
+    if (guest_range_writable(wait_addr, sizeof(uint32_t))) {
         *(uint32_t *)g2h_untagged(wait_addr) = 0;
     }
     if (do_strace || getenv("QEMU_DEBUG_CGS")) {
@@ -1079,8 +1079,8 @@ static pending_workloop_req *ensure_pending_workloop_req_locked(uint64_t wl_id)
 static void refresh_workloop_req_value(struct kevent_qos_s *ev)
 {
     if (ev->ext[1]) {
-        if (!guest_range_valid_untagged((abi_ulong)ev->ext[1],
-                                        sizeof(uint64_t))) {
+        if (!guest_range_readable((abi_ulong)ev->ext[1],
+                                  sizeof(uint64_t))) {
             if (do_strace) {
                 fprintf(stderr, "  workloop THREAD_REQUEST WL_ADDR 0x%llx "
                         "is invalid; keeping WL_VALUE=0x%llx\n",
@@ -1285,13 +1285,13 @@ static bool template_needs_prereceived_msg(const struct kevent_qos_s *template_k
     const guest_dispatch_source_type *dst;
 
     if (!du_addr || (du_addr & 1) ||
-        !guest_range_valid_untagged(du_addr, sizeof(uint64_t))) {
+        !guest_range_readable(du_addr, sizeof(uint64_t))) {
         return false;
     }
 
     dst_addr = *(uint64_t *)g2h_untagged(du_addr);
     if (!dst_addr ||
-        !guest_range_valid_untagged(dst_addr, sizeof(*dst))) {
+        !guest_range_readable(dst_addr, sizeof(*dst))) {
         return false;
     }
 
@@ -1497,8 +1497,8 @@ static bool workloop_event_is_mach_notification(
         !event->ext[0]) {
         return false;
     }
-    if (!guest_range_valid_untagged((abi_ulong)event->ext[0],
-                                    sizeof(mach_msg_header_t))) {
+    if (!guest_range_readable((abi_ulong)event->ext[0],
+                              sizeof(mach_msg_header_t))) {
         if (do_strace) {
             fprintf(stderr, "  workloop MACHPORT 0x%llx: prereceived "
                     "message pointer 0x%llx is invalid\n",
@@ -4766,9 +4766,9 @@ static void strace_dump_guest_backtrace(CPUArchState *env, const char *tag)
     uint64_t mach_self_slot = 0;
 
     if (saved_mach_thread_self_offset &&
-        guest_range_valid_untagged(env->cp15.tpidrro_el[0] +
-                                   saved_mach_thread_self_offset,
-                                   sizeof(uint64_t))) {
+        guest_range_readable(env->cp15.tpidrro_el[0] +
+                             saved_mach_thread_self_offset,
+                             sizeof(uint64_t))) {
         mach_self_slot =
             *(uint64_t *)g2h_untagged(env->cp15.tpidrro_el[0] +
                                       saved_mach_thread_self_offset);
@@ -4787,7 +4787,7 @@ static void strace_dump_guest_backtrace(CPUArchState *env, const char *tag)
         uint64_t saved_fp;
         uint64_t saved_lr;
 
-        if (!guest_range_valid_untagged(fp, 2 * sizeof(uint64_t))) {
+        if (!guest_range_readable(fp, 2 * sizeof(uint64_t))) {
             fprintf(stderr, "    bt[%d] invalid fp=0x%lx\n", i,
                     (unsigned long)fp);
             break;
@@ -4813,7 +4813,7 @@ static void write_mach_thread_self_tsd_slot(abi_ulong tsd_base,
     }
 
     slot_addr = tsd_base + saved_mach_thread_self_offset;
-    if (!guest_range_valid_untagged(slot_addr, sizeof(uint64_t))) {
+    if (!guest_range_writable(slot_addr, sizeof(uint64_t))) {
         return;
     }
 
@@ -6592,8 +6592,8 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                                     (unsigned long long)wait_workloop,
                                     (unsigned)wait_thread);
                         }
-                        if (guest_range_valid_untagged(arg2,
-                                                       sizeof(uint32_t))) {
+                        if (guest_range_writable(arg2,
+                                                 sizeof(uint32_t))) {
                             *(uint32_t *)g2h_untagged(arg2) = 0;
                         }
                         rv = 0;
@@ -8870,14 +8870,14 @@ redispatch_kevent_thread:
             uint64_t pthread_sig = 0;
 
             if (tsd_base &&
-                guest_range_valid_untagged(tsd_base, 8 * sizeof(uint64_t))) {
+                guest_range_readable(tsd_base, 8 * sizeof(uint64_t))) {
                 uint64_t *tsd = g2h_untagged(tsd_base);
                 pthread_self_slot = tsd[0];
                 mach_self_slot = tsd[3];
                 ptr_munge_slot = tsd[7];
                 if (pthread_self_slot &&
-                    guest_range_valid_untagged(pthread_self_slot,
-                                               sizeof(uint64_t))) {
+                    guest_range_readable(pthread_self_slot,
+                                         sizeof(uint64_t))) {
                     pthread_sig = *(uint64_t *)g2h_untagged(pthread_self_slot);
                 }
             }

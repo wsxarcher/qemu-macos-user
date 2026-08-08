@@ -1026,6 +1026,108 @@ int main(void) {
             f"child={child} after={after} "
             f"(ratio={child / before if before else 0:.3f})")
 
+    _WORKLOOP_BAD_PTR_SRC = r'''
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+/*
+ * Hand the emulator a workloop kevent whose state address points at
+ * unmapped guest memory.
+ *
+ * guest_range_valid_untagged() alone cannot catch this: macos-user sets
+ * guest_addr_max to ~0, so the bounds check accepts every address.  Without
+ * a mapping check the emulator dereferences the pointer and faults inside
+ * its own C code; that host fault is then misread as a guest memory fault
+ * and unwound with a longjmp out of arbitrary emulator code.
+ *
+ * Correct behaviour: kevent_id reports EV_ERROR with EFAULT and the guest
+ * keeps running.
+ */
+#define SYS_KEVENT_ID           375
+#define EVFILT_WORKLOOP_PRIV    (-17)
+#define NOTE_WL_THREAD_REQUEST  0x00000001
+#define EV_ADD                  0x0001
+#define EV_ERROR                0x4000
+#define KEVENT_FLAG_WORKLOOP    0x00000400
+
+struct kev_qos {
+    uint64_t ident;
+    int16_t  filter;
+    uint16_t flags;
+    uint32_t qos;
+    uint64_t udata;
+    uint32_t fflags;
+    uint32_t xflags;
+    int64_t  data;
+    uint64_t ext[4];
+};
+
+static long raw_syscall8(long num, long a0, long a1, long a2, long a3,
+                         long a4, long a5, long a6, long a7, int *carry) {
+    register long x0 __asm__("x0") = a0;
+    register long x1 __asm__("x1") = a1;
+    register long x2 __asm__("x2") = a2;
+    register long x3 __asm__("x3") = a3;
+    register long x4 __asm__("x4") = a4;
+    register long x5 __asm__("x5") = a5;
+    register long x6 __asm__("x6") = a6;
+    register long x7 __asm__("x7") = a7;
+    register long x16 __asm__("x16") = num;
+    long cs;
+    __asm__ volatile(
+        "svc #0x80\n\t"
+        "cset %1, cs\n\t"
+        : "+r"(x0), "=r"(cs)
+        : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5), "r"(x6), "r"(x7),
+          "r"(x16)
+        : "memory", "cc");
+    *carry = (int)cs;
+    return x0;
+}
+
+int main(void) {
+    struct kev_qos kev, out[4];
+    int carry = 0;
+    long r;
+
+    memset(&kev, 0, sizeof(kev));
+    memset(out, 0, sizeof(out));
+    kev.ident = 0x1234;
+    kev.filter = EVFILT_WORKLOOP_PRIV;
+    kev.flags = EV_ADD;
+    kev.fflags = NOTE_WL_THREAD_REQUEST;
+    kev.ext[1] = 0x5353535353535353ULL;  /* EV_EXTIDX_WL_ADDR: unmapped */
+    kev.ext[2] = 0xffffffffffffffffULL;  /* EV_EXTIDX_WL_MASK */
+    kev.ext[3] = 0x1ULL;                 /* EV_EXTIDX_WL_VALUE */
+
+    r = raw_syscall8(SYS_KEVENT_ID, 0x9999L, (long)&kev, 1, (long)out, 4,
+                     0, 0, KEVENT_FLAG_WORKLOOP, &carry);
+    printf("kevent_id=%ld carry=%d\n", r, carry);
+    if (r == 1) {
+        printf("ev_error=%d\n", (out[0].flags & EV_ERROR) != 0);
+        printf("ev_data=%lld\n", (long long)out[0].data);
+    }
+    printf("survived=YES\n");
+    return 0;
+}
+'''
+
+    def test_workloop_unmapped_state_pointer(self):
+        """kevent_id rejects an unmapped workloop state pointer."""
+        exe = _compile_framework_test("workloop_bad_ptr",
+                                      self._WORKLOOP_BAD_PTR_SRC,
+                                      [], "c")
+        rc, out, err = _run_emulated(exe, timeout=20)
+        decoded = out.decode(errors="replace")
+        self.assertEqual(rc, 0, f"emulator did not survive an unmapped "
+                                f"workloop state pointer: "
+                                f"{err.decode(errors='replace')}")
+        self.assertIn("survived=YES", decoded)
+        self.assertIn("kevent_id=1", decoded)
+        self.assertIn("ev_error=1", decoded)
+        self.assertIn("ev_data=14", decoded)
+
     def test_dispatch_async(self):
         """dispatch_async on a global concurrent queue (GCD workqueue)."""
         exe = _compile_framework_test("dispatch_async",
