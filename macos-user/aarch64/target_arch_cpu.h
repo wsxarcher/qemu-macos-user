@@ -13,6 +13,7 @@
 #include "target_arch.h"
 #include "signal-common.h"
 #include "target/arm/syndrome.h"
+#include "accel/tcg/cpu-loop.h"
 
 #define TARGET_DEFAULT_CPU_MODEL "max"
 
