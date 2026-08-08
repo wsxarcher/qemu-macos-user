@@ -3189,6 +3189,121 @@ static bool has_parked_workloop_thread(uint64_t workloop_id)
 }
 
 /*
+ * Workloop deadlock diagnostics.
+ *
+ * Set QEMU_MACOS_WL_WATCHDOG_MS=<ms> to dump the emulator's workloop
+ * bookkeeping once a guest thread has been stuck in an indefinite
+ * __ulock_wait for that long.  A guest thread waiting forever on a ulock
+ * means some workloop never got a servicing thread, and this shows which
+ * one and why delivery was skipped.
+ */
+static unsigned wl_watchdog_ms(void)
+{
+    static int cached = -1;
+
+    if (cached < 0) {
+        const char *s = getenv("QEMU_MACOS_WL_WATCHDOG_MS");
+        cached = s ? atoi(s) : 0;
+    }
+    return (unsigned)cached;
+}
+
+static void dump_workloop_state(const char *why, uint64_t waited_ms)
+{
+    fprintf(stderr, "=== workloop state dump (%s after %llums) ===\n",
+            why, (unsigned long long)waited_ms);
+
+    pthread_mutex_lock(&active_workloop_lock);
+    fprintf(stderr, "active workloops: %d\n", active_workloop_count);
+    for (int i = 0; i < active_workloop_count; i++) {
+        fprintf(stderr, "  active wl=0x%llx since=%llums ago\n",
+                (unsigned long long)active_workloop_ids[i],
+                (unsigned long long)((workloop_monotonic_time_ns() -
+                                      active_workloop_since_ns[i]) / 1000000));
+    }
+    pthread_mutex_unlock(&active_workloop_lock);
+
+    pthread_mutex_lock(&pending_wl_lock);
+    fprintf(stderr, "pending workloop reqs: %d\n", pending_wl_count);
+    for (int i = 0; i < pending_wl_count; i++) {
+        if (!pending_wl_reqs[i].active) {
+            continue;
+        }
+        fprintf(stderr, "  pending wl=0x%llx zero_wake=%d has_template=%d\n",
+                (unsigned long long)pending_wl_reqs[i].workloop_id,
+                pending_wl_reqs[i].zero_wake,
+                pending_wl_reqs[i].has_template);
+    }
+    pthread_mutex_unlock(&pending_wl_lock);
+
+    pthread_mutex_lock(&workloop_port_lock);
+    fprintf(stderr, "workloop ports: %d\n", workloop_port_count);
+    for (int i = 0; i < workloop_port_count; i++) {
+        fprintf(stderr, "  port=0x%x wl=0x%llx tmpl=%d readiness_inflight=%d "
+                "sync_wake_inflight=%d stashed=%d\n",
+                (unsigned)workloop_ports[i].port,
+                (unsigned long long)workloop_ports[i].workloop_id,
+                workloop_ports[i].has_template,
+                workloop_ports[i].readiness_inflight,
+                workloop_ports[i].sync_wake_inflight,
+                workloop_ports[i].stashed_count);
+    }
+    pthread_mutex_unlock(&workloop_port_lock);
+
+    pthread_mutex_lock(&parked_workloop_lock);
+    {
+        int n = 0;
+
+        for (parked_workloop_wq *pw = parked_workloop_list; pw; pw = pw->next) {
+            n++;
+        }
+        fprintf(stderr, "parked workloop threads: %d\n", n);
+        for (parked_workloop_wq *pw = parked_workloop_list; pw; pw = pw->next) {
+            fprintf(stderr, "  parked wl=0x%llx has_work=%d\n",
+                    (unsigned long long)pw->workloop_id, pw->has_work);
+        }
+    }
+    pthread_mutex_unlock(&parked_workloop_lock);
+
+    pthread_mutex_lock(&active_rcv_lock);
+    fprintf(stderr, "active receive ports: %d (groups %d)\n",
+            active_rcv_count, active_rcv_group_count);
+    for (int i = 0; i < active_rcv_count; i++) {
+        fprintf(stderr, "  rcv port=0x%x refs=%u\n",
+                (unsigned)active_rcv_ports[i].port,
+                active_rcv_ports[i].refs);
+    }
+    pthread_mutex_unlock(&active_rcv_lock);
+
+    pthread_mutex_lock(&active_ulock_sync_wait_lock);
+    for (int i = 0; i < MAX_PENDING_WL; i++) {
+        if (active_ulock_sync_waits[i].active) {
+            fprintf(stderr, "  sync wait wl=0x%llx waiter=0x%x addr=0x%llx "
+                    "wake_pending=%d\n",
+                    (unsigned long long)
+                        active_ulock_sync_waits[i].workloop_id,
+                    (unsigned)active_ulock_sync_waits[i].waiter,
+                    (unsigned long long)active_ulock_sync_waits[i].wait_addr,
+                    active_ulock_sync_waits[i].wake_pending);
+        }
+        if (pending_sync_handoffs[i].wake_pending ||
+            pending_sync_handoffs[i].wait_armed) {
+            fprintf(stderr, "  handoff wl=0x%llx waiter=0x%x armed=%d "
+                    "wake_pending=%d age=%llums\n",
+                    (unsigned long long)pending_sync_handoffs[i].workloop_id,
+                    (unsigned)pending_sync_handoffs[i].waiter,
+                    pending_sync_handoffs[i].wait_armed,
+                    pending_sync_handoffs[i].wake_pending,
+                    (unsigned long long)((workloop_monotonic_time_ns() -
+                        pending_sync_handoffs[i].created_ns) / 1000000));
+        }
+    }
+    pthread_mutex_unlock(&active_ulock_sync_wait_lock);
+    fprintf(stderr, "=== end workloop state dump ===\n");
+    fflush(stderr);
+}
+
+/*
  * Workqueue kqueue monitor.
  *
  * When libdispatch registers EVFILT_MACHPORT events on the workqueue
@@ -6574,6 +6689,8 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                 wait_thread != MACH_PORT_NULL;
             long rv;
             int host_errno = 0;
+            uint64_t ulock_started_ns = workloop_monotonic_time_ns();
+            bool ulock_watchdog_fired = false;
 
             if (active_sync_wait) {
                 if (do_strace || getenv("QEMU_DEBUG_CGS")) {
@@ -6656,6 +6773,23 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                 if (macos_signal_pending(env)) {
                     rv = interrupted_ulock_ret(op);
                     break;
+                }
+                if (indefinite && wl_watchdog_ms() && !ulock_watchdog_fired) {
+                    uint64_t waited_ms =
+                        (workloop_monotonic_time_ns() - ulock_started_ns) /
+                        1000000;
+
+                    if (waited_ms >= wl_watchdog_ms()) {
+                        ulock_watchdog_fired = true;
+                        fprintf(stderr,
+                                "qemu: ulock_wait stuck: op=0x%x addr=0x%llx "
+                                "value=0x%llx wl=0x%llx active_sync=%d\n",
+                                op, (unsigned long long)arg2,
+                                (unsigned long long)value,
+                                (unsigned long long)wait_workloop,
+                                active_sync_wait);
+                        dump_workloop_state("ulock_wait", waited_ms);
+                    }
                 }
                 if (!indefinite) {
                     if (remaining_us <= slice_us) {

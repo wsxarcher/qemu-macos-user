@@ -320,6 +320,22 @@ static void host_fault_retry_reset(void)
     host_fault_repeat = 0;
 }
 
+/*
+ * Set QEMU_MACOS_TRACE_FAULTS=1 to log every synchronous SIGSEGV/SIGBUS the
+ * emulator handles.  Much cheaper than -strace, which also logs every
+ * syscall and perturbs timing enough to hide races.
+ */
+static bool trace_faults(void)
+{
+    static int cached = -1;
+
+    if (cached < 0) {
+        const char *s = getenv("QEMU_MACOS_TRACE_FAULTS");
+        cached = s && *s && *s != '0';
+    }
+    return cached != 0;
+}
+
 static void host_fault_report_loop(int host_sig, const siginfo_t *info,
                                    uintptr_t host_addr, abi_ptr guest_addr,
                                    uintptr_t pc, int pflags)
@@ -532,7 +548,7 @@ void host_signal_handler(int host_sig, siginfo_t *info, void *puc)
                 }
             }
 
-            if (do_strace) {
+            if (do_strace || trace_faults()) {
                 fprintf(stderr, "qemu: SIGSEGV guest_addr=0x%llx "
                         "host_addr=%p code=%d %s write=%d "
                         "page_flags=0x%x pc=0x%llx\n",
@@ -550,7 +566,7 @@ void host_signal_handler(int host_sig, siginfo_t *info, void *puc)
             /* NOTREACHED */
         } else {
             sigprocmask(SIG_SETMASK, &uc->uc_sigmask, NULL);
-            if (do_strace) {
+            if (do_strace || trace_faults()) {
                 fprintf(stderr, "qemu: SIGBUS guest_addr=0x%llx "
                         "host_addr=%p code=%d write=%d "
                         "page_flags=0x%x pc=0x%llx\n",

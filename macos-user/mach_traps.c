@@ -346,6 +346,60 @@ static void remember_analyticsd_service_port(mach_port_name_t port,
     }
 }
 
+/*
+ * Map an external Mach memory object into the guest reservation *without*
+ * losing sharing.
+ *
+ * mach_vm_map() sometimes places an object outside the guest reservation
+ * (the kernel picks the address for VM_FLAGS_ANYWHERE).  Copying the
+ * contents into fresh guest memory makes the address usable but silently
+ * turns shared memory into a private snapshot: state another task (notably
+ * WindowServer/CoreAnimation) publishes afterwards never becomes visible,
+ * and the guest's own writes are never seen by it.
+ *
+ * Remap the object into the reserved guest address instead, so the guest
+ * gets a real alias of the same memory object.
+ */
+static abi_long remap_external_mach_mapping_to_guest(
+    mach_vm_address_t host_addr, mach_vm_size_t size,
+    abi_ulong preferred_guest)
+{
+    mach_vm_address_t want;
+    mach_vm_address_t target;
+    vm_prot_t cur_prot = VM_PROT_NONE;
+    vm_prot_t max_prot = VM_PROT_NONE;
+    kern_return_t kr;
+
+    if (!preferred_guest || !size) {
+        return (abi_long)-1;
+    }
+
+    want = (mach_vm_address_t)(uintptr_t)g2h_untagged(preferred_guest);
+    target = want;
+    kr = mach_vm_remap(mach_task_self(), &target, size, 0,
+                       VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+                       mach_task_self(), host_addr, /* copy */ false,
+                       &cur_prot, &max_prot, VM_INHERIT_SHARE);
+    if (kr != KERN_SUCCESS || target != want) {
+        if (kr == KERN_SUCCESS) {
+            mach_vm_deallocate(mach_task_self(), target, size);
+        }
+        return (abi_long)-1;
+    }
+
+    /* The guest alias keeps the memory object alive. */
+    mach_vm_deallocate(mach_task_self(), host_addr, size);
+    if (do_strace) {
+        fprintf(stderr,
+                "  MIG mach_vm_map: remapped external object %p -> guest "
+                "0x%llx size=0x%llx (shared)\n",
+                (void *)(uintptr_t)host_addr,
+                (unsigned long long)preferred_guest,
+                (unsigned long long)size);
+    }
+    return (abi_long)preferred_guest;
+}
+
 static abi_long copy_external_mach_mapping_to_guest(mach_vm_address_t host_addr,
                                                     mach_vm_size_t size,
                                                     abi_ulong preferred_guest,
@@ -1815,8 +1869,17 @@ static bool handle_mig_message(void *buf, void *reply_buf,
                 result = h2g(host_addr);
             } else {
                 if (kr == KERN_SUCCESS) {
-                    result = copy_external_mach_mapping_to_guest(
-                        host_addr, size, reserved_start, "object");
+                    /*
+                     * Prefer a real alias so the mapping stays shared with
+                     * the task that handed us the object; only fall back to
+                     * a private snapshot when that is impossible.
+                     */
+                    result = remap_external_mach_mapping_to_guest(
+                        host_addr, size, reserved_start);
+                    if (result < 0) {
+                        result = copy_external_mach_mapping_to_guest(
+                            host_addr, size, reserved_start, "object");
+                    }
                     reserved_start = 0;
                 } else {
                     result = (abi_long)-1;
@@ -1912,8 +1975,24 @@ mach_vm_map_done:
 
         kern_return_t kr;
         if (result < 0) {
+            static int warned;
+
             kr = KERN_NO_SPACE;
             reply->address = 0;
+            /*
+             * The guest gets address 0 back.  Callers that do not check the
+             * return value then store a NULL pointer and crash later far away
+             * from here, so make the failure visible.
+             */
+            if (warned < 16) {
+                warned++;
+                fprintf(stderr,
+                        "qemu: mach_vm_map failed: addr=0x%llx size=0x%llx "
+                        "flags=0x%x prot=%d object=0x%x kr=0x%x -> "
+                        "returning KERN_NO_SPACE\n",
+                        (unsigned long long)addr, (unsigned long long)size,
+                        flags, cur_prot, object, object_map_kr);
+            }
         } else {
             if (used_object) {
                 int page_flags = PAGE_VALID;
