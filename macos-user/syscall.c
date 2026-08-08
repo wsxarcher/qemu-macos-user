@@ -362,8 +362,6 @@ static pthread_mutex_t workq_machport_lock = PTHREAD_MUTEX_INITIALIZER;
  * __semwait_signal) can steal the reply message the receiver is waiting
  * for, causing an eventual IPC timeout and port-died teardown.
  */
-#define MAX_ACTIVE_RCV_PORTS 128
-#define MAX_ACTIVE_RCV_GROUPS 16
 #define MAX_ACTIVE_RCV_GROUP_PORTS 64
 
 typedef struct ActiveRcvPort {
@@ -377,10 +375,20 @@ typedef struct ActiveRcvGroup {
     int count;
 } ActiveRcvGroup;
 
-static ActiveRcvPort active_rcv_ports[MAX_ACTIVE_RCV_PORTS];
+/*
+ * These tables must grow on demand.  A fixed bound silently dropped the
+ * bookkeeping for a receive once enough guest threads were receiving at the
+ * same time, while the per-port refcounts had already been incremented.  The
+ * matching unmark could then never undo them, so the port stayed "actively
+ * received" forever and every prereceive path skipped it for the rest of the
+ * process's life -- the owning workloop was starved and the guest deadlocked.
+ */
+static ActiveRcvPort *active_rcv_ports;
 static int active_rcv_count;
-static ActiveRcvGroup active_rcv_groups[MAX_ACTIVE_RCV_GROUPS];
+static int active_rcv_capacity;
+static ActiveRcvGroup *active_rcv_groups;
 static int active_rcv_group_count;
+static int active_rcv_group_capacity;
 static pthread_mutex_t active_rcv_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void active_rcv_collect_ports(mach_port_t port, mach_port_t *ports,
@@ -435,11 +443,15 @@ static void active_rcv_add_locked(mach_port_t port)
             return;
         }
     }
-    if (active_rcv_count < MAX_ACTIVE_RCV_PORTS) {
-        active_rcv_ports[active_rcv_count].port = port;
-        active_rcv_ports[active_rcv_count].refs = 1;
-        active_rcv_count++;
+    if (active_rcv_count == active_rcv_capacity) {
+        active_rcv_capacity = active_rcv_capacity ? active_rcv_capacity * 2
+                                                  : 128;
+        active_rcv_ports = g_renew(ActiveRcvPort, active_rcv_ports,
+                                   active_rcv_capacity);
     }
+    active_rcv_ports[active_rcv_count].port = port;
+    active_rcv_ports[active_rcv_count].refs = 1;
+    active_rcv_count++;
 }
 
 static void active_rcv_remove_locked(mach_port_t port)
@@ -468,15 +480,25 @@ void mark_active_rcv_port(mach_port_t port)
     }
 
     pthread_mutex_lock(&active_rcv_lock);
-    for (int i = 0; i < count; i++) {
-        active_rcv_add_locked(ports[i]);
+    /*
+     * Record the group before taking any references so mark/unmark stay
+     * exactly symmetric even under memory pressure.
+     */
+    if (active_rcv_group_count == active_rcv_group_capacity) {
+        active_rcv_group_capacity = active_rcv_group_capacity
+            ? active_rcv_group_capacity * 2 : 32;
+        active_rcv_groups = g_renew(ActiveRcvGroup, active_rcv_groups,
+                                    active_rcv_group_capacity);
     }
-    if (active_rcv_group_count < MAX_ACTIVE_RCV_GROUPS) {
+    {
         ActiveRcvGroup *group = &active_rcv_groups[active_rcv_group_count++];
 
         group->root = port;
         group->count = count;
         memcpy(group->ports, ports, count * sizeof(ports[0]));
+    }
+    for (int i = 0; i < count; i++) {
+        active_rcv_add_locked(ports[i]);
     }
     pthread_mutex_unlock(&active_rcv_lock);
 }
