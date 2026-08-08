@@ -275,6 +275,28 @@ void init_task_state(TaskState *ts)
     sigemptyset(&ts->signal_mask);
 }
 
+/*
+ * Apple Silicon's architectural counter runs at 24 MHz and the commpage
+ * timebase ({125, 3}) assumes exactly that.  QEMU's ARMCPU default is
+ * 1 GHz, which makes CNTVCT_EL0 (and therefore the guest's
+ * mach_absolute_time()) read 41x too large.
+ *
+ * gt_cntfrq_hz lives in ARMCPU, *outside* CPUArchState, so it is not
+ * covered by the memcpy() in cpu_copy().  Every CPU instance must be
+ * configured explicitly, otherwise threads created after the main one
+ * observe a different, badly skewed time base than the main thread and
+ * timers armed on one thread never come due on another.
+ */
+#define MACOS_CNTFRQ_HZ 24000000
+
+void macos_configure_cpu_cntfrq(CPUState *cpu)
+{
+    ARMCPU *arm_cpu = ARM_CPU(cpu);
+
+    arm_cpu->gt_cntfrq_hz = MACOS_CNTFRQ_HZ;
+    cpu_env(cpu)->cp15.c14_cntfrq = MACOS_CNTFRQ_HZ;
+}
+
 CPUArchState *cpu_copy(CPUArchState *env)
 {
     CPUState *cpu = env_cpu(env);
@@ -285,6 +307,12 @@ CPUArchState *cpu_copy(CPUArchState *env)
     cpu_reset(new_cpu);
     new_cpu->tcg_cflags = cpu->tcg_cflags;
     memcpy(new_env, env, sizeof(CPUArchState));
+
+    /*
+     * Carry over CPU-level (non-CPUArchState) configuration that memcpy()
+     * above cannot reach.
+     */
+    macos_configure_cpu_cntfrq(new_cpu);
 
     /* Clone breakpoints */
     CPUBreakpoint *bp;
@@ -570,11 +598,7 @@ int main(int argc, char **argv, char **envp)
      * values ~42x too large, breaking CFAbsoluteTime ↔ mach_absolute_time
      * conversion and making all timers fire in the far future.
      */
-    {
-        ARMCPU *arm_cpu = ARM_CPU(cpu);
-        arm_cpu->gt_cntfrq_hz = 24000000;  /* Apple Silicon CNTFRQ */
-        env->cp15.c14_cntfrq = 24000000;
-    }
+    macos_configure_cpu_cntfrq(cpu);
 
     /*
      * Disable Pointer Authentication for arm64 guest ABI state, as XNU does
