@@ -455,7 +455,7 @@ static void sync_external_ool_identity_mappings_to_host(void)
             continue;
         }
         if (start >= guest_base ||
-            !guest_range_valid_untagged(start, size) ||
+            !guest_range_readable(start, size) ||
             !host_region_contains((uintptr_t)start, size, VM_PROT_WRITE)) {
             continue;
         }
@@ -480,7 +480,7 @@ static void refresh_external_ool_identity_mappings_from_host(void)
             continue;
         }
         if (start >= guest_base ||
-            !guest_range_valid_untagged(start, size) ||
+            !guest_range_writable(start, size) ||
             !host_region_contains((uintptr_t)start, size, VM_PROT_READ)) {
             continue;
         }

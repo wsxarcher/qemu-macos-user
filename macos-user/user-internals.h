@@ -8,10 +8,37 @@
 #include "qemu/osdep.h"
 #include "user/abitypes.h"
 #include "user/guest-host.h"
+#include "user/page-protection.h"
 #include "exec/tb-flush.h"
 #include "exec/translation-block.h"
 #include <mach/mach.h>
 #include <sys/ioctl.h>
+
+/*
+ * Guest pointer validation.
+ *
+ * guest_range_valid_untagged() only bounds-checks against guest_addr_max,
+ * which macos-user sets to ~0 for the 64-bit guest address space.  It
+ * therefore accepts *every* address and offers no protection at all.
+ *
+ * QEMU code that dereferences a guest pointer read out of guest-controlled
+ * memory (kevent udata, dispatch source descriptors, TSD slots, ...) must
+ * check that the range is really mapped.  Otherwise a stale or uninitialised
+ * value makes QEMU itself fault: the host SIGSEGV is then misread as a guest
+ * memory fault and unwound with a longjmp out of arbitrary emulator code,
+ * abandoning locks and leaving the process spinning in its signal handler.
+ */
+static inline bool guest_range_readable(abi_ulong addr, size_t len)
+{
+    return len != 0 && guest_range_valid_untagged(addr, len) &&
+           page_check_range(addr, len, PAGE_READ);
+}
+
+static inline bool guest_range_writable(abi_ulong addr, size_t len)
+{
+    return len != 0 && guest_range_valid_untagged(addr, len) &&
+           page_check_range(addr, len, PAGE_READ | PAGE_WRITE);
+}
 
 /* Environment list */
 struct envlist;

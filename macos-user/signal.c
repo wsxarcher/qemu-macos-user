@@ -26,6 +26,7 @@
 #include "signal-common.h"
 #include "user-internals.h"
 #include "user/guest-host.h"
+#include "user/guest-base.h"
 #include "user/page-protection.h"
 #include "gdbstub/user.h"
 #include "exec/mmap-lock.h"
@@ -275,6 +276,65 @@ void force_sig_fault(int sig, int code, abi_ulong addr)
 /* ---- Host signal handler ---- */
 
 /*
+ * Guard against unbounded host fault loops.
+ *
+ * The synchronous SIGSEGV/SIGBUS path below returns from the handler in
+ * order to retry the faulting instruction whenever it believes it has
+ * (or another thread has) made the page accessible.  If that belief is
+ * wrong the instruction faults again immediately and the thread spins
+ * inside the signal handler forever, which the user sees as a silent
+ * hang rather than a diagnosable failure.
+ *
+ * Track consecutive faults at the same (pc, address) per thread and stop
+ * retrying once it is clear no progress is being made, so the fault is
+ * reported through the normal guest signal path instead.
+ */
+#define HOST_FAULT_RETRY_LIMIT 64
+
+static __thread uintptr_t host_fault_last_addr;
+static __thread uintptr_t host_fault_last_pc;
+static __thread unsigned host_fault_repeat;
+
+/*
+ * Record a fault that is about to be retried.  Returns true when the same
+ * fault has already been retried HOST_FAULT_RETRY_LIMIT times.
+ */
+static bool host_fault_retry_exhausted(uintptr_t addr, uintptr_t pc)
+{
+    if (addr != host_fault_last_addr || pc != host_fault_last_pc) {
+        host_fault_last_addr = addr;
+        host_fault_last_pc = pc;
+        host_fault_repeat = 1;
+        return false;
+    }
+    return ++host_fault_repeat > HOST_FAULT_RETRY_LIMIT;
+}
+
+static void host_fault_retry_reset(void)
+{
+    host_fault_last_addr = 0;
+    host_fault_last_pc = 0;
+    host_fault_repeat = 0;
+}
+
+static void host_fault_report_loop(int host_sig, const siginfo_t *info,
+                                   uintptr_t host_addr, abi_ptr guest_addr,
+                                   uintptr_t pc, int pflags)
+{
+    fprintf(stderr,
+            "qemu: %s fault loop: retried %u times without progress; "
+            "host_addr=%p guest_addr=0x%llx code=%d page_flags=0x%x "
+            "pc=0x%llx guest_base=0x%llx\n",
+            host_sig == SIGSEGV ? "SIGSEGV" : "SIGBUS",
+            host_fault_repeat,
+            (void *)host_addr,
+            (unsigned long long)guest_addr,
+            info->si_code, pflags,
+            (unsigned long long)pc,
+            (unsigned long long)guest_base);
+}
+
+/*
  * Simplified host signal handler for macos-user.
  *
  * Handles the host interrupt signal (used to kick the vCPU) and queues
@@ -342,15 +402,32 @@ void host_signal_handler(int host_sig, siginfo_t *info, void *puc)
                  * The host address is within our PROT_NONE guest reservation.
                  * Use mprotect (not mmap) to materialise the page, since the
                  * backing VMA already exists.
+                 *
+                 * Preserve PAGE_EXEC: an execute-only guest mapping would
+                 * otherwise lose its host PROT_EXEC here and fault forever on
+                 * the next instruction fetch.
                  */
+                int host_prot = PROT_READ | PROT_WRITE;
+                int new_flags = PAGE_VALID | PAGE_READ | PAGE_WRITE;
+
+                if (pflags & PAGE_EXEC) {
+                    host_prot |= PROT_EXEC;
+                    new_flags |= PAGE_EXEC;
+                }
+
                 int rc = mprotect(g2h_untagged(page_start), page_size,
-                                  PROT_READ | PROT_WRITE);
-                if (rc == 0) {
+                                  host_prot);
+                if (rc == 0 &&
+                    !host_fault_retry_exhausted(host_addr, pc)) {
                     mmap_lock();
                     page_set_flags(page_start, page_start + page_size - 1,
-                                   PAGE_VALID | PAGE_READ | PAGE_WRITE, ~0);
+                                   new_flags, ~0);
                     mmap_unlock();
                     return; /* retry the faulting instruction */
+                }
+                if (rc == 0) {
+                    host_fault_report_loop(host_sig, info, host_addr,
+                                           guest_addr, pc, pflags);
                 }
             } else if ((pflags & (PAGE_VALID | PAGE_READ | PAGE_WRITE)) ==
                        (PAGE_VALID | PAGE_READ | PAGE_WRITE)) {
@@ -359,10 +436,20 @@ void host_signal_handler(int host_sig, siginfo_t *info, void *puc)
                  * our fault and our signal-handler entry (concurrent
                  * demand-page race).  The host page is now accessible —
                  * just retry the faulting instruction.
+                 *
+                 * Only a bounded number of retries is allowed: if the page
+                 * is still inaccessible the retry cannot make progress and
+                 * we would spin in the signal handler forever.
                  */
-                return;
+                if (!host_fault_retry_exhausted(host_addr, pc)) {
+                    return;
+                }
+                host_fault_report_loop(host_sig, info, host_addr, guest_addr,
+                                       pc, pflags);
             }
         }
+
+        host_fault_retry_reset();
 
         if (host_sig == SIGSEGV) {
             bool maperr = true;
