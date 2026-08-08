@@ -104,6 +104,21 @@ def _run_emulated(binary: Path, args=None, **kwargs):
     return _run(cmd, **kwargs)
 
 
+# Emitted by macos-user/signal.c when a host fault happens in emulator code
+# rather than in translated guest code.  Such a fault cannot be unwound as a
+# guest signal, so it always indicates an emulator bug.
+_EMULATOR_FAULT_MARKER = "qemu: fatal: emulator faulted"
+
+
+def _assert_no_emulator_fault(testcase, stderr: bytes):
+    """Fail if the emulator reported a fault inside its own code."""
+    decoded = stderr.decode(errors="replace")
+    if _EMULATOR_FAULT_MARKER in decoded:
+        lines = [line for line in decoded.splitlines()
+                 if _EMULATOR_FAULT_MARKER in line]
+        testcase.fail("emulator faulted internally:\n" + "\n".join(lines))
+
+
 # ---------------------------------------------------------------------------
 # Test cases
 # ---------------------------------------------------------------------------
@@ -1888,6 +1903,7 @@ int main(void) {
                                       language="c")
         rc, _, err = _run_emulated(exe, timeout=15)
         decoded = err.decode(errors="replace")
+        _assert_no_emulator_fault(self, err)
         self.assertEqual(rc, 0, f"iokit_props failed: {decoded}")
         self.assertIn("all_props: kr=0", decoded)
         self.assertIn("serial: ok", decoded)
@@ -1990,6 +2006,7 @@ int main(void) {
                                       ["AppKit"])
         rc, out, err = _run_emulated(exe, timeout=25)
         decoded = err.decode(errors="replace")
+        _assert_no_emulator_fault(self, err)
         self.assertEqual(rc, 0, f"appkit_direct_nsalert failed: {decoded}")
         self.assertIn(b"nsalert=result:1", out)
         self.assertIn("nsalert:runModal", decoded)
@@ -2061,6 +2078,7 @@ int main(void) {
                                       ["AppKit"])
         rc, out, err = _run_emulated(exe, timeout=50)
         decoded = err.decode(errors="replace")
+        _assert_no_emulator_fault(self, err)
         self.assertEqual(rc, 0, f"appkit_regular_nsalert failed: {decoded}")
         self.assertIn(b"regular-modal=result:1", out)
         self.assertIn("regular-modal:runModal", decoded)
@@ -2132,6 +2150,7 @@ int main(void) {
                                           "-framework", "SkyLight"])
         rc, _, err = _run_emulated(exe, timeout=15)
         decoded = err.decode(errors="replace")
+        _assert_no_emulator_fault(self, err)
         self.assertEqual(rc, 0, f"ws_query failed: {decoded}")
         self.assertRegex(decoded, r"cid=\d+")
         self.assertRegex(decoded, r"displays=\d+")
@@ -2170,6 +2189,7 @@ int main(void) {
                                       ["CoreGraphics"], language="c")
         rc, _, err = _run_emulated(exe, timeout=15)
         decoded = err.decode(errors="replace")
+        _assert_no_emulator_fault(self, err)
         self.assertEqual(rc, 0, f"cg_display failed: {decoded}")
         self.assertRegex(decoded, r"main_display=0x[0-9a-f]+")
         self.assertRegex(decoded, r"bounds=\d+x\d+")
