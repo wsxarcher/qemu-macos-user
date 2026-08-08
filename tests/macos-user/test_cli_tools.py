@@ -1143,6 +1143,79 @@ int main(void) {
         self.assertIn("ev_error=1", decoded)
         self.assertIn("ev_data=14", decoded)
 
+    _RCV_STRESS_SRC = r'''
+#include <dispatch/dispatch.h>
+#include <mach/mach.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <unistd.h>
+
+/*
+ * Many guest threads receiving on their own Mach ports at the same time.
+ *
+ * The emulator refcounts "a guest thread is receiving on this port" so its
+ * own prereceive paths do not steal the message.  That bookkeeping has to
+ * stay balanced no matter how many threads receive concurrently: a leaked
+ * reference marks a port as actively received forever and starves whichever
+ * workloop owns it.  Dispatch must therefore still make progress afterwards.
+ */
+#define NTHREADS 40
+
+static void *receiver(void *arg) {
+    (void)arg;
+    mach_port_t p = MACH_PORT_NULL;
+    if (mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE,
+                           &p) != KERN_SUCCESS) {
+        return NULL;
+    }
+    for (int i = 0; i < 3; i++) {
+        char buf[1024];
+        mach_msg_header_t *h = (mach_msg_header_t *)buf;
+        mach_msg(h, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(buf), p, 40,
+                 MACH_PORT_NULL);
+    }
+    mach_port_mod_refs(mach_task_self(), p, MACH_PORT_RIGHT_RECEIVE, -1);
+    return NULL;
+}
+
+int main(void) {
+    pthread_t t[NTHREADS];
+    for (int i = 0; i < NTHREADS; i++) {
+        pthread_create(&t[i], NULL, receiver, NULL);
+    }
+    for (int i = 0; i < NTHREADS; i++) {
+        pthread_join(t[i], NULL);
+    }
+    fprintf(stderr, "receivers_done\n");
+
+    dispatch_queue_t q = dispatch_queue_create("after", DISPATCH_QUEUE_SERIAL);
+    __block int sync_ran = 0;
+    dispatch_sync(q, ^{ sync_ran = 1; });
+
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC), q, ^{
+        dispatch_semaphore_signal(sem);
+    });
+    long timed_out = dispatch_semaphore_wait(
+        sem, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC));
+
+    printf("sync_ran=%d after_fired=%d\n", sync_ran, timed_out == 0);
+    return 0;
+}
+'''
+
+    def test_concurrent_mach_receive_stress(self):
+        """Dispatch still progresses after many concurrent Mach receives."""
+        exe = _compile_framework_test("rcv_stress", self._RCV_STRESS_SRC,
+                                      [], "c")
+        rc, out, err = _run_emulated(exe, timeout=40)
+        decoded = out.decode(errors="replace")
+        _assert_no_emulator_fault(self, err)
+        self.assertEqual(rc, 0, f"rcv_stress failed: "
+                                f"{err.decode(errors='replace')}")
+        self.assertIn("sync_ran=1", decoded)
+        self.assertIn("after_fired=1", decoded)
+
     def test_dispatch_async(self):
         """dispatch_async on a global concurrent queue (GCD workqueue)."""
         exe = _compile_framework_test("dispatch_async",
