@@ -15,6 +15,14 @@
 #include <sys/ioctl.h>
 
 /*
+ * Pages of a large PROT_NONE reservation that macos-user registers in the
+ * guest page table without host backing, to be materialised on first
+ * access.  Only these may be demand-materialised: a page the guest itself
+ * made inaccessible (an allocator guard page, say) must keep faulting.
+ */
+#define PAGE_LAZY_RESERVATION PAGE_TARGET_1
+
+/*
  * Guest pointer validation.
  *
  * guest_range_valid_untagged() only bounds-checks against guest_addr_max,

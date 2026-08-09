@@ -1304,6 +1304,69 @@ int main(void) {
                                 f"{err.decode(errors='replace')}")
         self.assertIn("executed=256 expected=256", decoded)
 
+    _GUARD_PAGE_SRC = r'''
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+/*
+ * A page the guest makes inaccessible must stay inaccessible.
+ *
+ * macos-user registers large PROT_NONE reservations in QEMU's page table
+ * without host backing and materialises them on first touch.  If that is
+ * keyed only on "valid but not readable/writable", it also materialises
+ * pages the guest deliberately protected -- every allocator guard page and
+ * thread stack guard page becomes silently writable, so an overrun quietly
+ * corrupts the neighbouring allocation instead of trapping.
+ */
+static void on_fault(int sig) {
+    (void)sig;
+    write(1, "guard-faulted\n", 14);
+    _exit(0);
+}
+
+int main(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_fault;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+
+    size_t ps = (size_t)getpagesize();
+    unsigned char *p = mmap(NULL, ps * 4, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (p == MAP_FAILED) {
+        printf("mmap-failed\n");
+        return 2;
+    }
+    memset(p, 0xAA, ps * 4);
+    if (mprotect(p + ps, ps, PROT_NONE) != 0) {
+        printf("mprotect-failed\n");
+        return 2;
+    }
+    p[ps] = 1;                    /* must fault */
+    printf("guard-write-succeeded\n");
+    return 1;
+}
+'''
+
+    def test_guard_page_stays_protected(self):
+        """A page the guest sets PROT_NONE must keep faulting."""
+        exe = _compile_framework_test("guard_page", self._GUARD_PAGE_SRC,
+                                      [], "c")
+        rc, out, err = _run_emulated(exe, timeout=20)
+        decoded = out.decode(errors="replace")
+        _assert_no_emulator_fault(self, err)
+        self.assertIn("guard-faulted", decoded,
+                      "writing to a PROT_NONE guard page did not fault: "
+                      f"{decoded}")
+        self.assertNotIn("guard-write-succeeded", decoded)
+        self.assertEqual(rc, 0)
+
     def test_dispatch_async(self):
         """dispatch_async on a global concurrent queue (GCD workqueue)."""
         exe = _compile_framework_test("dispatch_async",
