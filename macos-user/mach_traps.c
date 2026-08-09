@@ -4390,9 +4390,22 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                  * escalation the kernel refuses, say) means the pages *are*
                  * mapped, and replacing them with fresh anonymous zero pages
                  * would silently destroy live guest data.
+                 *
+                 * ENOMEM is also raised when only *part* of the range is
+                 * unmapped, so re-mapping the whole thing would zero the
+                 * live part.  Only materialise where the guest has nothing.
                  */
-                abi_long result = target_mmap(guest_addr, size, host_prot,
+                abi_long result;
+
+                mmap_lock();
+                if (!guest_range_pages_unmapped(guest_addr, size)) {
+                    mmap_unlock();
+                    ret = KERN_PROTECTION_FAILURE;
+                    break;
+                }
+                result = target_mmap(guest_addr, size, host_prot,
                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+                mmap_unlock();
                 if (result == (abi_long)guest_addr) {
                     ret = KERN_SUCCESS;
                 } else {
@@ -4427,11 +4440,30 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
 
             int mflags = MAP_PRIVATE | MAP_ANONYMOUS;
             abi_ulong guest_start;
+            bool held_lock = false;
             if (flags & VM_FLAGS_ANYWHERE) {
                 guest_start = (abi_ulong)addr;
             } else {
                 guest_start = (abi_ulong)addr;
                 mflags |= MAP_FIXED;
+                /*
+                 * Same rule as mach_vm_allocate: without VM_FLAGS_OVERWRITE
+                 * the kernel refuses rather than replacing what is already
+                 * mapped.  MAP_FIXED replaces it with fresh zero pages, so
+                 * clobbering here does not merely lose a mapping -- it wipes
+                 * live guest data, which surfaces later as a NULL field in
+                 * somebody's stack frame or a corrupt heap block.
+                 */
+                if (!(flags & VM_FLAGS_OVERWRITE)) {
+                    mmap_lock();
+                    if (!guest_range_pages_unmapped(guest_start,
+                                                    (abi_ulong)size)) {
+                        mmap_unlock();
+                        ret = KERN_NO_SPACE;
+                        break;
+                    }
+                    held_lock = true;
+                }
             }
 
             abi_long result;
@@ -4441,6 +4473,9 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
             } else {
                 result = target_mmap(guest_start, size,
                                      host_prot, mflags, anon_fd, 0);
+            }
+            if (held_lock) {
+                mmap_unlock();
             }
             if (result < 0) {
                 ret = KERN_NO_SPACE;
