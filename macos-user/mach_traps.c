@@ -4390,22 +4390,9 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                  * escalation the kernel refuses, say) means the pages *are*
                  * mapped, and replacing them with fresh anonymous zero pages
                  * would silently destroy live guest data.
-                 *
-                 * ENOMEM is also raised when only *part* of the range is
-                 * unmapped, so re-mapping the whole thing would zero the
-                 * live part.  Only materialise where the guest has nothing.
                  */
-                abi_long result;
-
-                mmap_lock();
-                if (!guest_range_pages_unmapped(guest_addr, size)) {
-                    mmap_unlock();
-                    ret = KERN_PROTECTION_FAILURE;
-                    break;
-                }
-                result = target_mmap(guest_addr, size, host_prot,
+                abi_long result = target_mmap(guest_addr, size, host_prot,
                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-                mmap_unlock();
                 if (result == (abi_long)guest_addr) {
                     ret = KERN_SUCCESS;
                 } else {
