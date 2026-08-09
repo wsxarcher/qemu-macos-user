@@ -918,7 +918,8 @@ static inline abi_ulong get_sigframe(struct target_sigaction *ka,
  * setup_sigframe_arch().
  */
 void setup_frame(int sig, struct target_sigaction *ka,
-                 target_sigset_t *set, CPUArchState *env)
+                 target_sigset_t *set, CPUArchState *env,
+                 const target_siginfo_t *info)
 {
     struct target_sigframe *frame;
     abi_ulong frame_addr;
@@ -932,6 +933,16 @@ void setup_frame(int sig, struct target_sigaction *ka,
 
     memset(frame, 0, sizeof(*frame));
     setup_sigframe_arch(env, frame_addr, frame, 0);
+
+    /* siginfo the guest handler receives in x1 */
+    frame->si.si_signo = sig;
+    if (info) {
+        frame->si.si_errno = info->si_errno;
+        frame->si.si_code = info->si_code;
+        frame->si.si_pid = info->si_pid;
+        frame->si.si_uid = info->si_uid;
+        frame->si.si_addr = info->si_addr;
+    }
 
     frame->uc_sigmask = *set;
 
@@ -1064,7 +1075,7 @@ static void handle_pending_signal(CPUArchState *env, int sig,
         sigprocmask(SIG_SETMASK, &ts->signal_mask, NULL);
 
         /* Prepare the stack frame of the virtual CPU. */
-        setup_frame(sig, sa, &target_old_set, env);
+        setup_frame(sig, sa, &target_old_set, env, &k->info);
 
         if (sa->sa_flags & TARGET_SA_RESETHAND) {
             sa->_sa_handler = TARGET_SIG_DFL;

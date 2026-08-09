@@ -1415,6 +1415,76 @@ int main(void) {
         self.assertNotIn("null-read-succeeded", decoded)
         self.assertEqual(rc, 0)
 
+    _SIGINFO_SRC = r'''
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/ucontext.h>
+#include <unistd.h>
+
+/*
+ * An SA_SIGINFO handler is void(int, siginfo_t *, void *).  The emulator
+ * has to build both of those structures in guest memory in the layout
+ * macOS uses and pass them in x1/x2; leaving whatever happened to be in
+ * those registers gives handlers garbage.
+ */
+static volatile unsigned char *target;
+
+static void handler(int sig, siginfo_t *info, void *ucv) {
+    ucontext_t *uc = (ucontext_t *)ucv;
+    unsigned long pc = (uc && uc->uc_mcontext) ? uc->uc_mcontext->__ss.__pc : 0;
+
+    printf("sig=%d\n", sig);
+    printf("si_signo=%d\n", info ? info->si_signo : -1);
+    printf("si_addr_matches=%d\n",
+           (info && info->si_addr == (void *)target) ? 1 : 0);
+    printf("uc_nonnull=%d\n", uc ? 1 : 0);
+    printf("uc_pc_nonzero=%d\n", pc ? 1 : 0);
+    fflush(stdout);
+    _exit(0);
+}
+
+int main(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+
+    size_t ps = (size_t)getpagesize();
+    unsigned char *p = mmap(NULL, ps, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (p == MAP_FAILED) {
+        printf("mmap-failed\n");
+        return 2;
+    }
+    mprotect(p, ps, PROT_NONE);
+    target = p + 8;
+    *target = 1;                 /* fault */
+    printf("no-fault\n");
+    return 1;
+}
+'''
+
+    def test_sa_siginfo_handler_arguments(self):
+        """SA_SIGINFO handlers get a real siginfo and ucontext."""
+        exe = _compile_framework_test("siginfo_args", self._SIGINFO_SRC,
+                                      [], "c")
+        rc, out, err = _run_emulated(exe, timeout=20)
+        decoded = out.decode(errors="replace")
+        _assert_no_emulator_fault(self, err)
+        self.assertEqual(rc, 0, f"siginfo_args failed: "
+                                f"{err.decode(errors='replace')}")
+        self.assertNotIn("no-fault", decoded)
+        self.assertIn("si_signo=10", decoded)
+        self.assertIn("si_addr_matches=1", decoded)
+        self.assertIn("uc_nonnull=1", decoded)
+        self.assertIn("uc_pc_nonzero=1", decoded)
+
     def test_dispatch_async(self):
         """dispatch_async on a global concurrent queue (GCD workqueue)."""
         exe = _compile_framework_test("dispatch_async",

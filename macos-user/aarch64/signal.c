@@ -39,6 +39,15 @@ abi_long set_sigtramp_args(CPUARMState *env, int sig,
     abi_ulong tramp_addr = get_sigreturn_trampoline_addr();
 
     env->xregs[0] = sig;
+    /*
+     * An SA_SIGINFO handler is void(int, siginfo_t *, void *), and even a
+     * plain handler may be declared that way.  Both pointers must be real
+     * guest addresses: leaving them as whatever happened to be in x1/x2
+     * gave handlers garbage, so anything that inspected si_addr or the
+     * ucontext (crash reporters, JIT guard-page handlers) misbehaved.
+     */
+    env->xregs[1] = frame_addr + offsetof(struct target_sigframe, si);
+    env->xregs[2] = frame_addr + offsetof(struct target_sigframe, uc);
     env->xregs[28] = frame_addr;        /* saved for sigreturn trampoline */
     env->xregs[30] = tramp_addr;        /* LR = sigreturn trampoline */
     env->xregs[31] = frame_addr & ~15;  /* SP aligned at frame */
@@ -59,6 +68,27 @@ abi_long setup_sigframe_arch(CPUARMState *env, abi_ulong frame_addr,
     frame->uc_mcontext.sp = env->xregs[31];
     frame->uc_mcontext.pc = env->pc;
     frame->uc_mcontext.pstate = pstate_read(env);
+
+    /* The guest-visible mcontext, in the layout macOS handlers expect. */
+    for (i = 0; i < 29; i++) {
+        frame->mc.ss.x[i] = env->xregs[i];
+    }
+    frame->mc.ss.fp = env->xregs[29];
+    frame->mc.ss.lr = env->xregs[30];
+    frame->mc.ss.sp = env->xregs[31];
+    frame->mc.ss.pc = env->pc;
+    frame->mc.ss.cpsr = (uint32_t)pstate_read(env);
+    for (i = 0; i < 32; i++) {
+        frame->mc.ns.v[i] = ((__uint128_t)env->vfp.zregs[i].d[1] << 64) |
+                            env->vfp.zregs[i].d[0];
+    }
+    frame->mc.ns.fpsr = vfp_get_fpsr(env);
+    frame->mc.ns.fpcr = vfp_get_fpcr(env);
+
+    frame->uc.uc_onstack = 0;
+    frame->uc.uc_mcsize = sizeof(frame->mc);
+    frame->uc.uc_mcontext = frame_addr +
+        offsetof(struct target_sigframe, mc);
     return 0;
 }
 

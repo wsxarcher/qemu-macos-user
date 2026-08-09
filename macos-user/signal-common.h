@@ -11,7 +11,8 @@
 
 void host_signal_handler(int host_signum, siginfo_t *info, void *puc);
 void setup_frame(int sig, struct target_sigaction *ka,
-                 target_sigset_t *set, CPUArchState *env);
+                 target_sigset_t *set, CPUArchState *env,
+                 const target_siginfo_t *info);
 
 #define SI_KERNEL 0x80
 
