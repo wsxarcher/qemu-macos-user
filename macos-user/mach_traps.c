@@ -1961,7 +1961,7 @@ static bool handle_mig_message(void *buf, void *reply_buf,
                  */
                 mmap_lock();
                 page_set_flags(guest_start, guest_start + size - 1,
-                               PAGE_VALID, 0);
+                               PAGE_VALID | PAGE_LAZY_RESERVATION, 0);
                 mmap_unlock();
                 result = guest_start;
             }

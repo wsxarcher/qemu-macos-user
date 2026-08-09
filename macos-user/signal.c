@@ -414,7 +414,8 @@ void host_signal_handler(int host_sig, siginfo_t *info, void *puc)
          */
         if (h2g_valid(host_addr)) {
             int pflags = page_get_flags(guest_addr);
-            if ((pflags & PAGE_VALID) && !(pflags & (PAGE_READ | PAGE_WRITE))) {
+            if ((pflags & PAGE_VALID) && (pflags & PAGE_LAZY_RESERVATION) &&
+                !(pflags & (PAGE_READ | PAGE_WRITE))) {
                 unsigned long host_page = qemu_real_host_page_size();
                 abi_ulong page_start = guest_addr & ~(host_page - 1);
                 abi_ulong page_size = host_page;
