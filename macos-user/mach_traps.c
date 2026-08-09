@@ -1786,6 +1786,174 @@ static bool handle_mig_message(void *buf, void *reply_buf,
         *ret_out = kr;
         return true;
     }
+    case 4804: {
+        /*
+         * mach_vm_read — MIG subsystem mach_vm, routine 4.
+         * Returns a copy of a range of the task's memory out-of-line.
+         *
+         * Forwarding this to the host kernel passed a raw guest address,
+         * so it always failed.  Serve it here and hand the guest an OOL
+         * buffer that lives in guest memory, the way the kernel would.
+         *
+         * Request: header(24) + NDR(8) + address(8) + size(8) = 48
+         * Reply (COMPLEX): header(24) + body(4) + ool_desc(16) + NDR(8) +
+         *   dataCnt(4) = 56
+         */
+        struct __attribute__((packed)) {
+            mach_msg_header_t hdr;
+            NDR_record_t NDR;
+            uint64_t address;
+            uint64_t size;
+        } *req = buf;
+
+        struct __attribute__((packed)) {
+            mach_msg_header_t hdr;
+            mach_msg_body_t body;
+            mach_msg_ool_descriptor_t data;
+            NDR_record_t NDR;
+            mach_msg_type_number_t dataCnt;
+        } *reply = reply_buf;
+
+        if (hdr->msgh_size < sizeof(*req) ||
+            !mig_reply_fits(reply_buf_size, sizeof(*reply))) {
+            return false;
+        }
+
+        abi_ulong src = (abi_ulong)req->address;
+        abi_ulong size = (abi_ulong)req->size;
+        abi_long dest = -1;
+        kern_return_t kr = KERN_SUCCESS;
+
+        if (size == 0 || !guest_range_readable(src, size)) {
+            kr = KERN_INVALID_ADDRESS;
+        } else {
+            dest = target_mmap(0, size, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (dest < 0) {
+                kr = KERN_NO_SPACE;
+            } else {
+                memcpy(g2h_untagged(dest), g2h_untagged(src), size);
+            }
+        }
+
+        if (do_strace) {
+            fprintf(stderr,
+                    "  MIG mach_vm_read: addr=0x%llx size=0x%llx "
+                    "-> 0x%llx kr=%d\n",
+                    (unsigned long long)src, (unsigned long long)size,
+                    (unsigned long long)dest, kr);
+        }
+
+        if (kr != KERN_SUCCESS) {
+            /* Error replies are simple, not complex. */
+            struct __attribute__((packed)) {
+                mach_msg_header_t hdr;
+                NDR_record_t NDR;
+                kern_return_t retval;
+            } *err = reply_buf;
+
+            err->hdr.msgh_bits =
+                MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+            err->hdr.msgh_size = sizeof(*err);
+            err->hdr.msgh_remote_port = MACH_PORT_NULL;
+            err->hdr.msgh_local_port = hdr->msgh_local_port;
+            err->hdr.msgh_id = msg_id + 100;
+            err->NDR = NDR_record;
+            err->retval = kr;
+            *ret_out = KERN_SUCCESS;
+            return true;
+        }
+
+        memset(reply, 0, sizeof(*reply));
+        reply->hdr.msgh_bits =
+            MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0) |
+            MACH_MSGH_BITS_COMPLEX;
+        reply->hdr.msgh_size = sizeof(*reply);
+        reply->hdr.msgh_remote_port = MACH_PORT_NULL;
+        reply->hdr.msgh_local_port = hdr->msgh_local_port;
+        reply->hdr.msgh_id = msg_id + 100;
+        reply->body.msgh_descriptor_count = 1;
+        reply->data.address = (void *)(uintptr_t)dest;
+        reply->data.size = (mach_msg_size_t)size;
+        reply->data.deallocate = false;
+        reply->data.copy = MACH_MSG_VIRTUAL_COPY;
+        reply->data.type = MACH_MSG_OOL_DESCRIPTOR;
+        reply->NDR = NDR_record;
+        reply->dataCnt = (mach_msg_type_number_t)size;
+
+        *ret_out = KERN_SUCCESS;
+        return true;
+    }
+    case 4806: {
+        /*
+         * mach_vm_write — MIG subsystem mach_vm, routine 6.
+         * Writes an out-of-line buffer into the task's memory.  Only the
+         * OOL descriptor was translated to a host address on the way out;
+         * the destination stayed a guest address, so the host kernel
+         * rejected the call.
+         *
+         * Request (COMPLEX): header(24) + body(4) + ool_desc(16) +
+         *   NDR(8) + address(8) + dataCnt(4) = 64
+         * Reply: header(24) + NDR(8) + retval(4) = 36
+         */
+        struct __attribute__((packed)) {
+            mach_msg_header_t hdr;
+            mach_msg_body_t body;
+            mach_msg_ool_descriptor_t data;
+            NDR_record_t NDR;
+            uint64_t address;
+            mach_msg_type_number_t dataCnt;
+        } *req = buf;
+
+        struct __attribute__((packed)) {
+            mach_msg_header_t hdr;
+            NDR_record_t NDR;
+            kern_return_t retval;
+        } *reply = reply_buf;
+
+        if (hdr->msgh_size < sizeof(*req) ||
+            !(hdr->msgh_bits & MACH_MSGH_BITS_COMPLEX) ||
+            req->body.msgh_descriptor_count != 1 ||
+            req->data.type != MACH_MSG_OOL_DESCRIPTOR ||
+            !mig_reply_fits(reply_buf_size, sizeof(*reply))) {
+            return false;
+        }
+
+        abi_ulong dst = (abi_ulong)req->address;
+        abi_ulong size = req->dataCnt;
+        abi_ulong src = (abi_ulong)(uintptr_t)req->data.address;
+        kern_return_t kr;
+
+        if (size == 0) {
+            kr = KERN_SUCCESS;
+        } else if (!guest_range_readable(src, size)) {
+            kr = KERN_INVALID_ADDRESS;
+        } else if (!guest_range_writable(dst, size)) {
+            kr = KERN_PROTECTION_FAILURE;
+        } else {
+            memmove(g2h_untagged(dst), g2h_untagged(src), size);
+            kr = KERN_SUCCESS;
+        }
+
+        if (do_strace) {
+            fprintf(stderr,
+                    "  MIG mach_vm_write: dst=0x%llx src=0x%llx size=0x%llx "
+                    "kr=%d\n", (unsigned long long)dst,
+                    (unsigned long long)src, (unsigned long long)size, kr);
+        }
+
+        reply->hdr.msgh_bits =
+            MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+        reply->hdr.msgh_size = sizeof(*reply);
+        reply->hdr.msgh_remote_port = MACH_PORT_NULL;
+        reply->hdr.msgh_local_port = hdr->msgh_local_port;
+        reply->hdr.msgh_id = msg_id + 100;
+        reply->NDR = NDR_record;
+        reply->retval = kr;
+
+        *ret_out = KERN_SUCCESS;
+        return true;
+    }
     case 4807:
     case 4808: {
         /*
