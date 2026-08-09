@@ -579,6 +579,25 @@ void host_signal_handler(int host_sig, siginfo_t *info, void *puc)
                         (unsigned long long)pc);
             }
             if (info->si_code == BUS_ADRALN) {
+                /*
+                 * Every guest address lives inside one big PROT_NONE
+                 * reservation, so the host reports *all* guest faults as
+                 * protection violations -- SIGBUS.  macOS does not: it
+                 * raises SIGSEGV (SEGV_ACCERR) when the address is not
+                 * mapped, and SIGBUS (BUS_ADRALN) only when it is mapped
+                 * but the access is not permitted.
+                 *
+                 * Reporting SIGBUS for everything means code that installs
+                 * only a SIGSEGV handler -- the common case -- never sees
+                 * the fault, and the process dies on an access it was
+                 * prepared to recover from.  Decide from the guest's own
+                 * page table, which is what the guest can observe.
+                 */
+                if (!(page_get_flags(guest_addr) & PAGE_VALID)) {
+                    cpu_loop_exit_sigsegv(cpu, guest_addr, access_type,
+                                          false, pc);
+                    /* NOTREACHED */
+                }
                 cpu_loop_exit_sigbus(cpu, guest_addr, access_type, pc);
                 /* NOTREACHED */
             }
@@ -665,15 +684,43 @@ int do_sigaction(int sig, abi_ulong act_addr, abi_ulong oact_addr)
      *   offset 12: sa_flags  (4 bytes, int)
      * Total: 16 bytes
      */
+    /*
+     * macOS splits the two directions of __sigaction(2):
+     *
+     *   int __sigaction(int, const struct __sigaction *, struct sigaction *);
+     *
+     * The incoming action is a 24-byte struct __sigaction, which carries the
+     * sa_tramp pointer libsystem uses to return from a handler:
+     *   0: sa_handler   8: sa_tramp   16: sa_mask   20: sa_flags
+     *
+     * The returned action is a plain 16-byte struct sigaction with no
+     * trampoline:
+     *   0: sa_handler   8: sa_mask   12: sa_flags
+     *
+     * Writing the 24-byte layout into oact wrote sa_tramp where the caller
+     * keeps sa_mask/sa_flags and ran 8 bytes past the end of its struct.
+     * struct sigaction is almost always a local, so every query of a
+     * handler silently corrupted 8 bytes of the caller's stack -- adjacent
+     * locals, saved registers, whatever followed it.
+     */
     if (oact_addr) {
-        uint8_t *oact = g2h_untagged(oact_addr);
+        uint8_t *oact;
+
+        if (!guest_range_writable(oact_addr, 16)) {
+            return -TARGET_EFAULT;
+        }
+        oact = g2h_untagged(oact_addr);
         *(uint64_t *)(oact + 0) = k->_sa_handler;
-        *(uint64_t *)(oact + 8) = k->sa_tramp;
-        *(uint32_t *)(oact + 16) = (uint32_t)k->sa_mask;
-        *(uint32_t *)(oact + 20) = (uint32_t)k->sa_flags;
+        *(uint32_t *)(oact + 8) = (uint32_t)k->sa_mask;
+        *(uint32_t *)(oact + 12) = (uint32_t)k->sa_flags;
     }
     if (act_addr) {
-        const uint8_t *act = g2h_untagged(act_addr);
+        const uint8_t *act;
+
+        if (!guest_range_readable(act_addr, 24)) {
+            return -TARGET_EFAULT;
+        }
+        act = g2h_untagged(act_addr);
         abi_ulong new_handler = *(uint64_t *)(act + 0);
         abi_ulong new_tramp = *(uint64_t *)(act + 8);
         abi_ulong new_mask = *(uint32_t *)(act + 16);
@@ -938,7 +985,14 @@ void setup_frame(int sig, struct target_sigaction *ka,
     frame->si.si_signo = sig;
     if (info) {
         frame->si.si_errno = info->si_errno;
-        frame->si.si_code = info->si_code;
+        /*
+         * queue_signal() packs QEMU's internal si_type into the top byte
+         * of si_code so that this code knows how to read the siginfo
+         * union.  The guest must not see it: leaving it in turned
+         * BUS_ADRALN (1) into 0x1000001 and broke every handler that
+         * switches on si_code.
+         */
+        frame->si.si_code = sextract32(info->si_code, 0, 24);
         frame->si.si_pid = info->si_pid;
         frame->si.si_uid = info->si_uid;
         frame->si.si_addr = info->si_addr;

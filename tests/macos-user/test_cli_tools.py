@@ -1542,6 +1542,131 @@ int main(void) {
 }
 '''
 
+    _SIGACTION_OLDACT_SRC = r'''
+#include <stdio.h>
+#include <string.h>
+#include <signal.h>
+
+static void h(int s) { (void)s; }
+
+int main(void) {
+    /* A canary immediately after the struct the kernel writes into. */
+    struct { struct sigaction old; unsigned long canary; } box;
+    struct sigaction sa;
+
+    memset(&box, 0, sizeof box);
+    box.canary = 0xA5A5A5A5A5A5A5A5UL;
+
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = h;
+    sa.sa_flags = SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    sigaddset(&sa.sa_mask, SIGUSR2);
+    sigaction(SIGUSR1, &sa, NULL);
+
+    /* Query it back; the kernel must write only sizeof(struct sigaction). */
+    sigaction(SIGUSR1, NULL, &box.old);
+
+    int handler_ok = (box.old.sa_handler == h);
+    int flags_ok = ((box.old.sa_flags & SA_RESTART) != 0);
+    int mask_ok = (sigismember(&box.old.sa_mask, SIGUSR2) == 1);
+    int canary_ok = (box.canary == 0xA5A5A5A5A5A5A5A5UL);
+
+    printf("handler=%d flags=%d mask=%d canary=%d\n",
+           handler_ok, flags_ok, mask_ok, canary_ok);
+    printf("%s\n", (handler_ok && flags_ok && mask_ok && canary_ok)
+                       ? "RESULT=ok" : "RESULT=bad");
+    return 0;
+}
+'''
+
+    def test_sigaction_oldact_does_not_overflow(self):
+        """sigaction must fill only a 16-byte struct sigaction in oldact."""
+        exe = _compile_framework_test("sigaction_oldact",
+                                      self._SIGACTION_OLDACT_SRC, [], "c")
+        rc, out, err = _run_emulated(exe, timeout=20)
+        decoded = out.decode(errors="replace")
+        _assert_no_emulator_fault(self, err)
+        self.assertEqual(rc, 0, decoded + err.decode(errors="replace"))
+        self.assertIn("RESULT=ok", decoded,
+                      "sigaction wrote the wrong layout or past the end of "
+                      f"the caller's struct sigaction: {decoded}")
+
+    _FAULT_SIGNAL_SRC = r'''
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include <stdio.h>
+#include <string.h>
+#include <signal.h>
+#include <setjmp.h>
+#include <stdint.h>
+
+static sigjmp_buf jb;
+static volatile int got, code;
+static void h(int s, siginfo_t *si, void *u) {
+    got = s; code = si ? si->si_code : -1; siglongjmp(jb, 1);
+}
+
+static void probe(const char *who, volatile char *p, int write) {
+    got = 0; code = 0;
+    if (sigsetjmp(jb, 1) == 0) {
+        if (write) *p = 0x41; else (void)*p;
+    }
+    printf( "%-16s sig=%d code=%d\n", who, got, code);
+}
+
+int main(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = h;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+
+    probe("pagezero_w", (volatile char *)(uintptr_t)0x30, 1);
+    probe("pagezero_r", (volatile char *)(uintptr_t)0x30, 0);
+
+    mach_vm_address_t a = 0;
+    mach_vm_allocate(mach_task_self(), &a, 0x8000, VM_FLAGS_ANYWHERE);
+    memset((void *)a, 1, 0x8000);
+    mach_vm_protect(mach_task_self(), a, 0x8000, FALSE, VM_PROT_NONE);
+    probe("protnone_w", (volatile char *)a, 1);
+    probe("protnone_r", (volatile char *)a, 0);
+
+    mach_vm_address_t b = 0;
+    mach_vm_allocate(mach_task_self(), &b, 0x8000, VM_FLAGS_ANYWHERE);
+    mach_vm_protect(mach_task_self(), b, 0x8000, FALSE, VM_PROT_READ);
+    probe("readonly_w", (volatile char *)b, 1);
+
+    mach_vm_address_t c = 0;
+    mach_vm_allocate(mach_task_self(), &c, 0x8000, VM_FLAGS_ANYWHERE);
+    mach_vm_deallocate(mach_task_self(), c, 0x8000);
+    probe("deallocated_w", (volatile char *)c, 1);
+
+    printf( "DONE\n");
+    return 0;
+}
+'''
+
+    def test_fault_signal_matches_native(self):
+        """Unmapped access raises SIGSEGV, protection violation SIGBUS."""
+        exe = _compile_framework_test("fault_signal", self._FAULT_SIGNAL_SRC,
+                                      [], "c")
+        rc, out, err = _run_emulated(exe, timeout=20)
+        decoded = out.decode(errors="replace")
+        _assert_no_emulator_fault(self, err)
+        self.assertEqual(rc, 0, decoded + err.decode(errors="replace"))
+        for line in ("pagezero_w       sig=11 code=2",
+                     "pagezero_r       sig=11 code=2",
+                     "protnone_w       sig=10 code=1",
+                     "protnone_r       sig=10 code=1",
+                     "readonly_w       sig=10 code=1",
+                     "deallocated_w    sig=11 code=2"):
+            self.assertIn(line, decoded,
+                          f"wrong fault signal/si_code, expected {line!r} "
+                          f"in:\n{decoded}")
+
     def test_vm_protect_max_is_enforced(self):
         """Lowering max_protection must block a later escalation."""
         exe = _compile_framework_test("vm_maxprot", self._VM_MAXPROT_SRC,
