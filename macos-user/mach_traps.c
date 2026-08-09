@@ -3984,18 +3984,46 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
             int mflags = MAP_PRIVATE | MAP_ANONYMOUS;
             int anon_fd = mach_vm_anon_tag_fd(flags);
             abi_ulong guest_start;
+            bool held_lock = false;
 
             if (flags & VM_FLAGS_ANYWHERE) {
                 guest_start = 0;
             } else {
                 guest_start = (abi_ulong)addr;
                 mflags |= MAP_FIXED;
+                /*
+                 * MAP_FIXED destroys whatever is already mapped, but
+                 * mach_vm_allocate() at a fixed address is only allowed to
+                 * do that when the guest passes VM_FLAGS_OVERWRITE.
+                 * Otherwise the kernel returns KERN_NO_SPACE and leaves the
+                 * range untouched.  Clobbering regardless silently wipes
+                 * live guest memory and shows up later as heap corruption.
+                 *
+                 * Every guest address sits inside our PROT_NONE reservation,
+                 * so ask the guest page table (kernel-confirmed) rather than
+                 * the host whether the range is really in use.  mmap_lock is
+                 * recursive and target_mmap() takes it too, so holding it
+                 * here closes the race with a concurrent mapping.
+                 */
+                if (!(flags & VM_FLAGS_OVERWRITE)) {
+                    mmap_lock();
+                    if (!guest_range_pages_unmapped(guest_start,
+                                                    (abi_ulong)arg3)) {
+                        mmap_unlock();
+                        ret = KERN_NO_SPACE;
+                        break;
+                    }
+                    held_lock = true;
+                }
             }
 
             abi_long result = target_mmap(guest_start, (abi_ulong)arg3,
                                            PROT_READ | PROT_WRITE,
                                            mflags, anon_fd, 0);
             if (result < 0) {
+                if (held_lock) {
+                    mmap_unlock();
+                }
                 ret = KERN_NO_SPACE;
             } else {
                 addr = (mach_vm_address_t)result;
@@ -4006,6 +4034,9 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                 page_set_flags(result, result + arg3 - 1,
                                PAGE_VALID | PAGE_READ | PAGE_WRITE, ~0);
                 mmap_unlock();
+                if (held_lock) {
+                    mmap_unlock();
+                }
                 ret = KERN_SUCCESS;
             }
         }
