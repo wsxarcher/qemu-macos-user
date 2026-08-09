@@ -1736,6 +1736,62 @@ int main(void) {
 }
 '''
 
+    _UCONTEXT_SRC = r'''
+#include <stdio.h>
+#include <string.h>
+#include <signal.h>
+#include <setjmp.h>
+#include <stdint.h>
+#include <sys/ucontext.h>
+
+static sigjmp_buf jb;
+static int r_onstack, r_maskhas, r_mcsize_ok, r_mc_nonnull, r_pc_ok, r_far_ok;
+static volatile uintptr_t fault_pc;
+
+static void h(int s, siginfo_t *si, void *uc_) {
+    ucontext_t *uc = (ucontext_t *)uc_;
+    r_onstack = uc->uc_onstack;
+    r_maskhas = sigismember((sigset_t *)&uc->uc_sigmask, SIGUSR1);
+    r_mcsize_ok = (uc->uc_mcsize == sizeof(struct __darwin_mcontext64));
+    r_mc_nonnull = (uc->uc_mcontext != NULL);
+    if (uc->uc_mcontext) {
+        r_pc_ok = (uc->uc_mcontext->__ss.__pc != 0);
+        r_far_ok = (uc->uc_mcontext->__es.__far == (uint64_t)0x30);
+    }
+    siglongjmp(jb, 1);
+}
+
+int main(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = h;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sigaddset(&sa.sa_mask, SIGUSR1);   /* must show up in uc_sigmask */
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+
+    if (sigsetjmp(jb, 1) == 0) { *(volatile char *)(uintptr_t)0x30 = 1; }
+
+    printf("onstack=%d mask_has_usr1=%d mcsize_ok=%d mc_nonnull=%d "
+           "pc_nonzero=%d far_ok=%d\n",
+           r_onstack, r_maskhas, r_mcsize_ok, r_mc_nonnull, r_pc_ok, r_far_ok);
+    printf("DONE\n");
+    return 0;
+}
+'''
+
+    def test_signal_ucontext_contents(self):
+        """The ucontext a handler receives must carry the fault address."""
+        exe = _compile_framework_test("ucontext", self._UCONTEXT_SRC, [], "c")
+        rc, out, err = _run_emulated(exe, timeout=20)
+        decoded = out.decode(errors="replace")
+        _assert_no_emulator_fault(self, err)
+        self.assertEqual(rc, 0, decoded + err.decode(errors="replace"))
+        self.assertIn("onstack=0 mask_has_usr1=0 mcsize_ok=1 mc_nonnull=1 "
+                      "pc_nonzero=1 far_ok=1", decoded,
+                      f"ucontext handed to the handler is wrong: {decoded}")
+
     def test_pipe_and_socketpair(self):
         """pipe() and socketpair() must return usable descriptor pairs."""
         exe = _compile_framework_test("pipe_socketpair",

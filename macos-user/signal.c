@@ -1023,6 +1023,37 @@ void setup_frame(int sig, struct target_sigaction *ka,
 
     frame->uc_sigmask = *set;
 
+    /*
+     * Fault signals carry the faulting address and the exception kind in
+     * the mcontext's exception state.  Leaving it zeroed meant a handler
+     * that reads uc_mcontext->__es.__far -- the normal way to find out
+     * what was touched -- saw address 0 for every fault.
+     */
+    if (info) {
+        CPUARMState *e = env;
+
+        frame->mc.es.far = info->si_addr;
+        frame->mc.es.esr = e->exception.syndrome;
+        switch (sig) {
+        case TARGET_SIGSEGV:
+        case TARGET_SIGBUS:
+            frame->mc.es.exception = 1;   /* EXC_BAD_ACCESS */
+            break;
+        case TARGET_SIGILL:
+            frame->mc.es.exception = 2;   /* EXC_BAD_INSTRUCTION */
+            break;
+        case TARGET_SIGFPE:
+            frame->mc.es.exception = 3;   /* EXC_ARITHMETIC */
+            break;
+        case TARGET_SIGTRAP:
+            frame->mc.es.exception = 6;   /* EXC_BREAKPOINT */
+            break;
+        default:
+            frame->mc.es.exception = 0;
+            break;
+        }
+    }
+
     set_sigtramp_args(env, sig, frame, frame_addr, ka);
 
     unlock_user(frame, frame_addr, sizeof(*frame));
