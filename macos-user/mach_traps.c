@@ -623,6 +623,12 @@ static bool guest_range_pages_unmapped(abi_ulong start, abi_ulong size)
 {
     unsigned long page_size = qemu_real_host_page_size();
     abi_ulong end = start + size - 1;
+    mach_vm_address_t region_addr;
+    mach_vm_size_t region_size = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object_name = MACH_PORT_NULL;
+    kern_return_t kr;
 
     if (end < start || !guest_range_valid_untagged(start, size)) {
         return false;
@@ -636,6 +642,34 @@ static bool guest_range_pages_unmapped(abi_ulong start, abi_ulong size)
         if (addr > end - page_size) {
             break;
         }
+    }
+
+    /*
+     * QEMU's page table is not a complete record of the guest address
+     * space: mappings the guest creates through Mach VM calls, and pages
+     * materialised lazily out of PROT_NONE reservations, are not always
+     * registered.  Callers use this to decide whether it is safe to
+     * mach_vm_remap(VM_FLAGS_OVERWRITE) an external identity mapping over
+     * the range, so a false "unmapped" answer silently destroys live guest
+     * memory -- which shows up much later as guest heap corruption.
+     *
+     * Confirm with the kernel that nothing accessible is mapped there.
+     * The whole guest address space is a PROT_NONE reservation, so only a
+     * region with real protection counts as live memory.
+     */
+    region_addr = (mach_vm_address_t)(uintptr_t)g2h_untagged(start);
+    kr = mach_vm_region(mach_task_self(), &region_addr, &region_size,
+                        VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info,
+                        &count, &object_name);
+    if (object_name != MACH_PORT_NULL) {
+        mach_port_deallocate(mach_task_self(), object_name);
+    }
+    if (kr == KERN_SUCCESS &&
+        info.protection != VM_PROT_NONE &&
+        region_addr <= (mach_vm_address_t)(uintptr_t)g2h_untagged(end) &&
+        region_addr + region_size >
+            (mach_vm_address_t)(uintptr_t)g2h_untagged(start)) {
+        return false;
     }
     return true;
 }
