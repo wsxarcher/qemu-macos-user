@@ -1476,6 +1476,55 @@ int main(void) {
 }
 '''
 
+    _VM_READ_WRITE_SRC = r'''
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include <stdio.h>
+#include <string.h>
+
+#define SZ 0x4000
+
+int main(void) {
+    mach_vm_address_t s = 0;
+    if (mach_vm_allocate(mach_task_self(), &s, SZ, VM_FLAGS_ANYWHERE)) {
+        printf("alloc-failed\n");
+        return 2;
+    }
+    memset((void *)s, 0x3C, SZ);
+
+    vm_offset_t rd = 0;
+    mach_msg_type_number_t rn = 0;
+    kern_return_t kr = mach_vm_read(mach_task_self(), s, SZ, &rd, &rn);
+    int ok = (kr == KERN_SUCCESS) && rn == SZ && rd &&
+             ((unsigned char *)rd)[0] == 0x3C &&
+             ((unsigned char *)rd)[SZ - 1] == 0x3C;
+    printf("read-kr=%d read-ok=%d\n", kr, ok);
+
+    char buf[64];
+    memset(buf, 0x6D, sizeof buf);
+    kern_return_t kr2 = mach_vm_write(mach_task_self(), s,
+                                      (vm_offset_t)buf, sizeof buf);
+    int ok2 = (kr2 == KERN_SUCCESS) && ((unsigned char *)s)[0] == 0x6D &&
+              ((unsigned char *)s)[63] == 0x6D &&
+              ((unsigned char *)s)[64] == 0x3C;
+    printf("write-kr=%d write-ok=%d\n", kr2, ok2);
+
+    printf("%s\n", (ok && ok2) ? "RESULT=ok" : "RESULT=bad");
+    return 0;
+}
+'''
+
+    def test_vm_read_and_write(self):
+        """mach_vm_read and mach_vm_write must transfer guest memory."""
+        exe = _compile_framework_test("vm_read_write",
+                                      self._VM_READ_WRITE_SRC, [], "c")
+        rc, out, err = _run_emulated(exe, timeout=20)
+        decoded = out.decode(errors="replace")
+        _assert_no_emulator_fault(self, err)
+        self.assertEqual(rc, 0, decoded + err.decode(errors="replace"))
+        self.assertIn("RESULT=ok", decoded,
+                      f"mach_vm_read/mach_vm_write did not work: {decoded}")
+
     def test_vm_copy_and_read_overwrite(self):
         """mach_vm_copy and mach_vm_read_overwrite must copy guest memory."""
         exe = _compile_framework_test("vm_copy", self._VM_COPY_SRC, [], "c")
