@@ -475,6 +475,9 @@
 
 #define TARGET_NSIG      32
 
+/* Darwin's sigset_t is a 32-bit bitmask, not a word. */
+#define TARGET_SIGSET_SIZE 4
+
 /* sigaction flags */
 #define TARGET_SA_ONSTACK   0x0001
 #define TARGET_SA_RESTART   0x0002

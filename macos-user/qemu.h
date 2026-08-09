@@ -138,6 +138,8 @@ long do_rt_sigreturn(CPUArchState *env);
 void force_sig_fault(int sig, int code, abi_ulong addr);
 void queue_signal(CPUArchState *env, int sig, int si_type,
                   target_siginfo_t *info);
+void queue_async_signal(CPUArchState *env, int sig, target_siginfo_t *info);
+abi_long do_bsd_sigpending(abi_ulong arg_set);
 void process_pending_signals(CPUArchState *env);
 int do_sigaction(int sig, abi_ulong act_addr, abi_ulong oact_addr);
 abi_ulong get_sigreturn_trampoline_addr(void);

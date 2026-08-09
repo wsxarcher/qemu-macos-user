@@ -1649,6 +1649,69 @@ int main(void) {
 }
 '''
 
+    _SIGNAL_MASK_SRC = r'''
+#include <stdio.h>
+#include <string.h>
+#include <signal.h>
+#include <unistd.h>
+
+static volatile int ran;
+static void h(int s) { ran = s; }
+
+int main(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = h;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGUSR1, &sa, NULL);
+
+    /* sigprocmask must not write past the caller's 4-byte sigset_t. */
+    struct { sigset_t set; unsigned long canary; } box;
+    memset(&box, 0, sizeof box);
+    box.canary = 0xB7B7B7B7B7B7B7B7UL;
+
+    sigset_t block;
+    sigemptyset(&block);
+    sigaddset(&block, SIGUSR1);
+    sigprocmask(SIG_BLOCK, &block, NULL);
+    sigprocmask(SIG_BLOCK, NULL, &box.set);
+
+    int canary_ok = (box.canary == 0xB7B7B7B7B7B7B7B7UL);
+    int mask_ok = (sigismember(&box.set, SIGUSR1) == 1);
+
+    /* A self-signal that is blocked must stay pending, not kill us. */
+    ran = 0;
+    raise(SIGUSR1);
+    int held = (ran == 0);
+
+    sigset_t pend;
+    sigemptyset(&pend);
+    sigpending(&pend);
+    int pending_ok = (sigismember(&pend, SIGUSR1) == 1);
+
+    sigprocmask(SIG_UNBLOCK, &block, NULL);
+    int delivered = (ran == SIGUSR1);
+
+    printf("canary=%d mask=%d held=%d pending=%d delivered=%d\n",
+           canary_ok, mask_ok, held, pending_ok, delivered);
+    printf("%s\n", (canary_ok && mask_ok && held && pending_ok && delivered)
+                       ? "RESULT=ok" : "RESULT=bad");
+    return 0;
+}
+'''
+
+    def test_blocked_signal_stays_pending(self):
+        """A blocked self-signal pends until unblocked, and sigprocmask
+        must not write past the caller's sigset_t."""
+        exe = _compile_framework_test("signal_mask", self._SIGNAL_MASK_SRC,
+                                      [], "c")
+        rc, out, err = _run_emulated(exe, timeout=20)
+        decoded = out.decode(errors="replace")
+        _assert_no_emulator_fault(self, err)
+        self.assertEqual(rc, 0, decoded + err.decode(errors="replace"))
+        self.assertIn("RESULT=ok", decoded,
+                      f"blocked signal handling diverges from native: {decoded}")
+
     def test_fault_signal_matches_native(self):
         """Unmapped access raises SIGSEGV, protection violation SIGBUS."""
         exe = _compile_framework_test("fault_signal", self._FAULT_SIGNAL_SRC,

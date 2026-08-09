@@ -6439,6 +6439,11 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
         ret = do_sigaction(arg1, arg2, arg3);
         break;
 
+    case TARGET_MACOS_NR_sigpending:
+        /* sigpending(sigset_t *set) */
+        ret = do_bsd_sigpending(arg1);
+        break;
+
     case TARGET_MACOS_NR_sigprocmask:
         /* sigprocmask(int how, const sigset_t *set, sigset_t *oldset) */
         ret = do_bsd_sigprocmask(cpu_env, arg1, arg2, arg3);
@@ -6487,7 +6492,7 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                 info.si_code = SI_USER;
                 info.si_pid = getpid();
                 info.si_uid = getuid();
-                queue_signal(cpu_env, guest_sig, QEMU_SI_KILL, &info);
+                queue_async_signal(cpu_env, guest_sig, &info);
                 ret = 0;
             } else {
                 ret = -TARGET_EINVAL;
@@ -6500,9 +6505,8 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
     case TARGET_MACOS_NR___pthread_kill:
         /*
          * __pthread_kill(pthread_t thread, int sig)
-         * We're single-threaded — the only thread is self.  Queue the
-         * signal directly for guest delivery instead of using host kill(),
-         * which may fail if the host signal mask blocks it.
+         * Queue the signal for guest delivery instead of using host
+         * kill(), which may fail if the host signal mask blocks it.
          */
         if (arg2 == 0) {
             ret = 0;
@@ -6514,7 +6518,7 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                 info.si_code = SI_USER;
                 info.si_pid = getpid();
                 info.si_uid = getuid();
-                queue_signal(cpu_env, guest_sig, QEMU_SI_KILL, &info);
+                queue_async_signal(cpu_env, guest_sig, &info);
                 ret = 0;
             } else {
                 ret = -TARGET_EINVAL;
