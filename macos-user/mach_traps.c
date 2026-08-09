@@ -4338,6 +4338,36 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
             size_t aligned_size = aligned_end - aligned_start;
             void *aligned_addr = g2h_untagged(aligned_start);
 
+            /*
+             * set_max lowers the ceiling on what the range may ever be
+             * protected to.  mprotect() has no way to express that, so a
+             * guest that dropped max_protection could still raise
+             * cur_protection afterwards -- the kernel refuses that with
+             * KERN_PROTECTION_FAILURE.  Let the host kernel track the
+             * ceiling for us by using the same call the guest made; later
+             * mprotect() escalations then fail on their own.
+             */
+            if (arg4) {
+                kern_return_t pkr = mach_vm_protect(
+                    mach_task_self(),
+                    (mach_vm_address_t)(uintptr_t)aligned_addr,
+                    aligned_size, TRUE, prot);
+                if (pkr == KERN_SUCCESS) {
+                    int qemu_flags = PAGE_VALID;
+                    if (host_prot & PROT_READ)  qemu_flags |= PAGE_READ;
+                    if (host_prot & PROT_WRITE) qemu_flags |= PAGE_WRITE;
+                    if (host_prot & PROT_EXEC)  qemu_flags |= PAGE_EXEC;
+                    mmap_lock();
+                    page_set_flags(guest_addr, guest_addr + size - 1,
+                                   qemu_flags, ~0);
+                    mmap_unlock();
+                    ret = KERN_SUCCESS;
+                } else {
+                    ret = KERN_PROTECTION_FAILURE;
+                }
+                break;
+            }
+
             if (mprotect(aligned_addr, aligned_size, host_prot) == 0) {
                 /* Host pages already mapped — just update QEMU page flags */
                 int qemu_flags = PAGE_VALID;

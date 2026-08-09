@@ -1514,6 +1514,46 @@ int main(void) {
 }
 '''
 
+    _VM_MAXPROT_SRC = r'''
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include <stdio.h>
+
+#define SZ 0x4000
+
+int main(void) {
+    mach_vm_address_t a = 0;
+    if (mach_vm_allocate(mach_task_self(), &a, SZ, VM_FLAGS_ANYWHERE)) {
+        printf("alloc-failed\n");
+        return 2;
+    }
+
+    /* Lower the ceiling to read-only. */
+    kern_return_t set = mach_vm_protect(mach_task_self(), a, SZ, TRUE,
+                                        VM_PROT_READ);
+    /* Raising cur_protection past the ceiling must now be refused. */
+    kern_return_t raise = mach_vm_protect(mach_task_self(), a, SZ, FALSE,
+                                          VM_PROT_READ | VM_PROT_WRITE);
+
+    printf("set=%d raise=%d\n", set, raise);
+    printf("%s\n", (set == KERN_SUCCESS && raise != KERN_SUCCESS)
+                       ? "RESULT=ok" : "RESULT=bad");
+    return 0;
+}
+'''
+
+    def test_vm_protect_max_is_enforced(self):
+        """Lowering max_protection must block a later escalation."""
+        exe = _compile_framework_test("vm_maxprot", self._VM_MAXPROT_SRC,
+                                      [], "c")
+        rc, out, err = _run_emulated(exe, timeout=20)
+        decoded = out.decode(errors="replace")
+        _assert_no_emulator_fault(self, err)
+        self.assertEqual(rc, 0, decoded + err.decode(errors="replace"))
+        self.assertIn("RESULT=ok", decoded,
+                      "raising protection above max_protection was allowed: "
+                      f"{decoded}")
+
     def test_vm_read_and_write(self):
         """mach_vm_read and mach_vm_write must transfer guest memory."""
         exe = _compile_framework_test("vm_read_write",
