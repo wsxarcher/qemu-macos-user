@@ -261,6 +261,29 @@ void queue_signal(CPUArchState *env, int sig, int si_type,
 }
 
 /*
+ * Queue an asynchronously generated signal (kill(2), pthread_kill(2)).
+ *
+ * Unlike queue_signal(), this goes into the per-signal table rather than
+ * the synchronous slot, so process_pending_signals() leaves it pending
+ * while the thread has it blocked.  Synchronous delivery is only correct
+ * for faults raised by the CPU itself: a blocked one is undeliverable, so
+ * that path resets the handler to SIG_DFL and kills the process.  Doing
+ * that to a signal the guest sent itself turns the ordinary
+ * "block it, raise it, handle it after unblocking" idiom into a crash.
+ */
+void queue_async_signal(CPUArchState *env, int sig, target_siginfo_t *info)
+{
+    CPUState *cpu = env_cpu(env);
+    TaskState *ts = get_task_state(cpu);
+    struct emulated_sigtable *k = &ts->sigtab[sig - 1];
+
+    info->si_code = deposit32(info->si_code, 24, 8, QEMU_SI_KILL);
+    k->info = *info;
+    k->pending = sig;
+    qatomic_set(&ts->signal_pending, 1);
+}
+
+/*
  * Force a synchronously taken QEMU_SI_FAULT signal.  For QEMU the
  * 'force' part is handled in process_pending_signals().
  */
@@ -1251,20 +1274,27 @@ abi_long do_bsd_sigprocmask(void *cpu_env, int how,
     target_sigset_t target_set;
     sigset_t set, oset;
 
+    /*
+     * Darwin's sigset_t is a 32-bit bitmask.  target_sigset_t is an
+     * abi_ulong, so using sizeof(target_sigset_t) here wrote 8 bytes into
+     * the guest's 4-byte sigset_t -- clobbering whatever followed it, which
+     * for the usual `sigset_t old;` local is another local -- and read 4
+     * bytes of adjacent garbage back as extra signals to block.
+     */
     if (arg_oldset) {
-        target_sigset_t *p;
+        uint32_t *p;
         host_to_target_sigset(&target_set, &ts->signal_mask);
-        p = lock_user(VERIFY_WRITE, arg_oldset, sizeof(target_sigset_t), 0);
+        p = lock_user(VERIFY_WRITE, arg_oldset, TARGET_SIGSET_SIZE, 0);
         if (!p) {
             return -TARGET_EFAULT;
         }
-        *p = target_set;
-        unlock_user(p, arg_oldset, sizeof(target_sigset_t));
+        *p = (uint32_t)target_set;
+        unlock_user(p, arg_oldset, TARGET_SIGSET_SIZE);
     }
 
     if (arg_set) {
-        target_sigset_t *p;
-        p = lock_user(VERIFY_READ, arg_set, sizeof(target_sigset_t), 1);
+        uint32_t *p;
+        p = lock_user(VERIFY_READ, arg_set, TARGET_SIGSET_SIZE, 1);
         if (!p) {
             return -TARGET_EFAULT;
         }
@@ -1299,7 +1329,54 @@ abi_long do_bsd_sigprocmask(void *cpu_env, int how,
         sigdelset(&oset, SIGSEGV);
         sigdelset(&oset, SIGBUS);
         sigprocmask(SIG_SETMASK, &oset, NULL);
+
+        /*
+         * Relaxing the mask can make an already queued signal deliverable.
+         * process_pending_signals() clears signal_pending once it has
+         * scanned the table, so without this the signal stays queued
+         * forever and is never delivered after the unblock.
+         */
+        for (int i = 0; i < TARGET_NSIG; i++) {
+            if (ts->sigtab[i].pending) {
+                qatomic_set(&ts->signal_pending, 1);
+                break;
+            }
+        }
     }
 
+    return 0;
+}
+
+/* ---- do_bsd_sigpending ---- */
+
+abi_long do_bsd_sigpending(abi_ulong arg_set)
+{
+    TaskState *ts = get_task_state(thread_cpu);
+    target_sigset_t target_set;
+    sigset_t host_set, queued;
+    uint32_t *p;
+
+    /*
+     * Signals the guest sent itself while they were blocked live in our
+     * own table, not the host's, so ask the host first and add ours.
+     */
+    if (sigpending(&host_set) != 0) {
+        sigemptyset(&host_set);
+    }
+    sigemptyset(&queued);
+    for (int i = 0; i < TARGET_NSIG; i++) {
+        if (ts->sigtab[i].pending) {
+            sigaddset(&queued, target_to_host_signal(i + 1));
+        }
+    }
+    sigorset(&host_set, &host_set, &queued);
+    host_to_target_sigset(&target_set, &host_set);
+
+    p = lock_user(VERIFY_WRITE, arg_set, TARGET_SIGSET_SIZE, 0);
+    if (!p) {
+        return -TARGET_EFAULT;
+    }
+    *p = (uint32_t)target_set;
+    unlock_user(p, arg_set, TARGET_SIGSET_SIZE);
     return 0;
 }
