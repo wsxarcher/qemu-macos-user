@@ -1409,6 +1409,47 @@ int main(void) {
 }
 '''
 
+    _VM_ALLOC_FIXED_SRC = r'''
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include <stdio.h>
+#include <string.h>
+
+#define SZ 0x4000
+
+int main(void) {
+    mach_vm_address_t a = 0, b;
+    if (mach_vm_allocate(mach_task_self(), &a, SZ, VM_FLAGS_ANYWHERE)) {
+        printf("alloc-failed\n");
+        return 2;
+    }
+    memset((void *)a, 0xAB, SZ);
+
+    /* Fixed address, no VM_FLAGS_OVERWRITE: must fail, not clobber. */
+    b = a;
+    kern_return_t kr = mach_vm_allocate(mach_task_self(), &b, SZ,
+                                        VM_FLAGS_FIXED);
+    unsigned char *p = (unsigned char *)a;
+    int intact = (p[0] == 0xAB && p[SZ - 1] == 0xAB);
+    printf("kr=%d intact=%d\n", kr, intact);
+    printf("%s\n", (kr != KERN_SUCCESS && intact) ? "RESULT=ok"
+                                                  : "RESULT=clobbered");
+    return 0;
+}
+'''
+
+    def test_vm_allocate_fixed_does_not_clobber(self):
+        """mach_vm_allocate at a fixed address must not overwrite live memory."""
+        exe = _compile_framework_test("vm_alloc_fixed",
+                                      self._VM_ALLOC_FIXED_SRC, [], "c")
+        rc, out, err = _run_emulated(exe, timeout=20)
+        decoded = out.decode(errors="replace")
+        _assert_no_emulator_fault(self, err)
+        self.assertEqual(rc, 0, decoded + err.decode(errors="replace"))
+        self.assertIn("RESULT=ok", decoded,
+                      "mach_vm_allocate without VM_FLAGS_OVERWRITE destroyed "
+                      f"an existing mapping: {decoded}")
+
     def test_vm_map_fixed_does_not_clobber(self):
         """mach_vm_map at a fixed address must not overwrite live memory."""
         exe = _compile_framework_test("vm_map_overwrite",
