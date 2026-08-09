@@ -1367,6 +1367,60 @@ int main(void) {
         self.assertNotIn("guard-write-succeeded", decoded)
         self.assertEqual(rc, 0)
 
+    _VM_MAP_OVERWRITE_SRC = r'''
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    kern_return_t kr;
+    mach_vm_address_t live = 0;
+    const mach_vm_size_t sz = 0x4000;
+
+    kr = mach_vm_allocate(mach_task_self(), &live, sz, VM_FLAGS_ANYWHERE);
+    if (kr != KERN_SUCCESS) { printf("alloc-failed=%d\n", kr); return 2; }
+    memset((void *)live, 0xAB, sz);
+
+    /* A separate buffer turned into a Mach memory object. */
+    mach_vm_address_t src = 0;
+    kr = mach_vm_allocate(mach_task_self(), &src, sz, VM_FLAGS_ANYWHERE);
+    if (kr != KERN_SUCCESS) { printf("alloc2-failed=%d\n", kr); return 2; }
+    memset((void *)src, 0x5C, sz);
+
+    mach_port_t obj = MACH_PORT_NULL;
+    memory_object_size_t osz = sz;
+    kr = mach_make_memory_entry_64(mach_task_self(), &osz, src,
+                                   VM_PROT_READ | VM_PROT_WRITE,
+                                   &obj, MACH_PORT_NULL);
+    if (kr != KERN_SUCCESS) { printf("entry-failed=%d\n", kr); return 2; }
+
+    /* Fixed address, NO VM_FLAGS_OVERWRITE: must not clobber `live`. */
+    mach_vm_address_t at = live;
+    kr = mach_vm_map(mach_task_self(), &at, sz, 0, VM_FLAGS_FIXED,
+                     obj, 0, FALSE, VM_PROT_READ | VM_PROT_WRITE,
+                     VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE);
+
+    unsigned char *p = (unsigned char *)live;
+    int intact = (p[0] == 0xAB && p[sz - 1] == 0xAB);
+    printf("map-kr=%d intact=%d\n", kr, intact);
+    printf("%s\n", (kr != KERN_SUCCESS && intact) ? "RESULT=ok" : "RESULT=clobbered");
+    return 0;
+}
+'''
+
+    def test_vm_map_fixed_does_not_clobber(self):
+        """mach_vm_map at a fixed address must not overwrite live memory."""
+        exe = _compile_framework_test("vm_map_overwrite",
+                                      self._VM_MAP_OVERWRITE_SRC, [], "c")
+        rc, out, err = _run_emulated(exe, timeout=20)
+        decoded = out.decode(errors="replace")
+        _assert_no_emulator_fault(self, err)
+        self.assertEqual(rc, 0, decoded + err.decode(errors="replace"))
+        self.assertIn("RESULT=ok", decoded,
+                      "mach_vm_map without VM_FLAGS_OVERWRITE destroyed an "
+                      f"existing mapping instead of failing: {decoded}")
+
     _NULL_DEREF_SRC = r'''
 #include <signal.h>
 #include <stdio.h>

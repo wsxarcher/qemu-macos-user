@@ -1863,6 +1863,8 @@ static bool handle_mig_message(void *buf, void *reply_buf,
 
         abi_long result;
         bool used_object = false;
+        bool took_mmap_lock = false;
+        bool range_occupied = false;
         abi_long reserved_start = 0;
         kern_return_t object_map_kr = KERN_SUCCESS;
 
@@ -1904,12 +1906,45 @@ static bool handle_mig_message(void *buf, void *reply_buf,
                     host_addr = (mach_vm_address_t)(uintptr_t)
                         g2h_untagged(guest_start);
                 }
+                /*
+                 * The whole guest address space is one PROT_NONE
+                 * reservation, so the host kernel would always report the
+                 * target range as occupied.  We therefore have to force
+                 * VM_FLAGS_OVERWRITE to punch through our own reservation.
+                 *
+                 * But VM_FLAGS_OVERWRITE is exactly what the guest did not
+                 * ask for: without it mach_vm_map() must fail with
+                 * KERN_NO_SPACE rather than destroy whatever is already
+                 * mapped there.  Overwriting unconditionally silently
+                 * replaces live guest memory -- a heap block, a stack, a
+                 * shared CoreGraphics buffer -- and surfaces much later as
+                 * "memory corruption of free block" inside libmalloc.
+                 *
+                 * Distinguish the two by asking whether anything of the
+                 * guest's own is mapped in the range, and hold mmap_lock
+                 * across the test and the map so another thread cannot map
+                 * the range in between.
+                 */
+                if (!(flags & VM_FLAGS_OVERWRITE)) {
+                    mmap_lock();
+                    if (!guest_range_pages_unmapped(guest_start, size)) {
+                        mmap_unlock();
+                        range_occupied = true;
+                        result = -1;
+                        goto mach_vm_map_done;
+                    }
+                    took_mmap_lock = true;
+                }
                 map_flags = (flags & ~VM_FLAGS_ANYWHERE) | VM_FLAGS_OVERWRITE;
             }
 
             kr = mach_vm_map(mach_task_self(), &host_addr, size,
                              req->mask, map_flags, object, offset, copy,
                              cur_prot, max_prot, inheritance);
+            if (took_mmap_lock) {
+                mmap_unlock();
+                took_mmap_lock = false;
+            }
             object_map_kr = kr;
             if (kr == KERN_SUCCESS && h2g_valid(host_addr)) {
                 result = h2g(host_addr);
@@ -2030,7 +2065,7 @@ mach_vm_map_done:
              * return value then store a NULL pointer and crash later far away
              * from here, so make the failure visible.
              */
-            if (warned < 16) {
+            if (!range_occupied && warned < 16) {
                 warned++;
                 fprintf(stderr,
                         "qemu: mach_vm_map failed: addr=0x%llx size=0x%llx "
