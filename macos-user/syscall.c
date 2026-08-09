@@ -5796,15 +5796,43 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
         break;
 
     case TARGET_MACOS_NR_pipe:
-        /* pipe() -> returns fd[0] in X0, fd[1] in X1 */
+        /*
+         * pipe() returns the read end in X0 and the write end in X1.
+         *
+         * Setting xregs[0] here was pointless: the common return path
+         * below overwrites X0 with `ret`, so the guest got 0 -- i.e. fd 0,
+         * stdin -- as the read end.  libc stores that into fds[0], and
+         * every later read of the pipe silently read stdin instead, so
+         * runloop and dispatch wakeups built on a pipe never arrived.
+         * Return the read end as the syscall result instead.
+         */
         {
             int pipefd[2];
             ret = get_errno(pipe(pipefd));
             if (!is_error(ret)) {
                 CPUARMState *arm_env = (CPUARMState *)cpu_env;
-                arm_env->xregs[0] = pipefd[0];
                 arm_env->xregs[1] = pipefd[1];
-                ret = 0;
+                ret = pipefd[0];
+            }
+        }
+        break;
+
+    case TARGET_MACOS_NR_socketpair:
+        /* socketpair(int domain, int type, int protocol, int *sv) */
+        {
+            int sv[2];
+            ret = get_errno(socketpair(arg1, arg2, arg3, sv));
+            if (!is_error(ret)) {
+                if (!arg4 || !guest_range_writable(arg4, 2 * sizeof(int32_t))) {
+                    close(sv[0]);
+                    close(sv[1]);
+                    ret = -TARGET_EFAULT;
+                } else {
+                    int32_t *p = g2h_untagged(arg4);
+                    p[0] = sv[0];
+                    p[1] = sv[1];
+                    ret = 0;
+                }
             }
         }
         break;
