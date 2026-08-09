@@ -1367,6 +1367,54 @@ int main(void) {
         self.assertNotIn("guard-write-succeeded", decoded)
         self.assertEqual(rc, 0)
 
+    _NULL_DEREF_SRC = r'''
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+/*
+ * Guest address 0 is __PAGEZERO and must be inaccessible.
+ *
+ * dyld is a fully position-independent MH_DYLINKER whose __TEXT has vmaddr
+ * 0, so loading it at its preferred address places it over guest address 0.
+ * Every NULL read then quietly returns dyld's Mach-O header instead of
+ * faulting, and bugs surface far away from their cause.
+ */
+static void on_fault(int sig) {
+    (void)sig;
+    write(1, "null-faulted\n", 13);
+    _exit(0);
+}
+
+int main(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_fault;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+
+    volatile long *p = (volatile long *)0;
+    long v = *p;                  /* must fault */
+    printf("null-read-succeeded value=%ld\n", v);
+    return 1;
+}
+'''
+
+    def test_null_dereference_faults(self):
+        """Guest address 0 (__PAGEZERO) must not be readable."""
+        exe = _compile_framework_test("null_deref", self._NULL_DEREF_SRC,
+                                      [], "c")
+        rc, out, err = _run_emulated(exe, timeout=20)
+        decoded = out.decode(errors="replace")
+        _assert_no_emulator_fault(self, err)
+        self.assertIn("null-faulted", decoded,
+                      f"reading guest address 0 did not fault: {decoded}")
+        self.assertNotIn("null-read-succeeded", decoded)
+        self.assertEqual(rc, 0)
+
     def test_dispatch_async(self):
         """dispatch_async on a global concurrent queue (GCD workqueue)."""
         exe = _compile_framework_test("dispatch_async",

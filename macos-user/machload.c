@@ -51,6 +51,13 @@ static off_t find_fat_arm64_offset(int fd)
 }
 
 /* Load a Mach-O image into memory */
+/*
+ * Where to place a fully position-independent image (dyld) so that it does
+ * not land on guest address 0.  Set from the executable's extent once that
+ * has been loaded.
+ */
+static abi_ulong pie_load_hint;
+
 static int load_macho_image(const char *filename, int fd,
                             struct image_info *info,
                             char **pinterp_name)
@@ -144,6 +151,23 @@ static int load_macho_image(const char *filename, int fd,
     abi_ulong total_size = hi - lo;
 
     /*
+     * Guest addresses below 4 GB are __PAGEZERO and must stay inaccessible
+     * so a NULL dereference faults exactly as it does natively.
+     *
+     * dyld is a fully position-independent MH_DYLINKER whose __TEXT has
+     * vmaddr 0 and which carries no __PAGEZERO, so mapping it at its
+     * preferred address puts it on guest address 0.  Every guest NULL read
+     * then quietly returned dyld's header instead of faulting.
+     */
+#define GUEST_PAGEZERO_END 0x100000000ULL
+
+    abi_ulong preferred = lo;
+    if (guest_base != 0 && lo < GUEST_PAGEZERO_END) {
+        preferred = pie_load_hint ? pie_load_hint
+                                  : (abi_ulong)0x110000000ULL;
+    }
+
+    /*
      * Map the binary into the guest address space.
      *
      * When guest_base is set, we map at the binary's preferred addresses
@@ -156,7 +180,7 @@ static int load_macho_image(const char *filename, int fd,
     void *base;
     if (guest_base != 0) {
         /* Map at the original vmaddr, translated to host via guest_base */
-        base = mmap(g2h_untagged(lo), total_size,
+        base = mmap(g2h_untagged(preferred), total_size,
                     PROT_NONE,
                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
                     -1, 0);
@@ -419,6 +443,12 @@ int loader_exec(const char *filename, char **argv, char **envp,
      */
     if (interp_name) {
         struct image_info dyld_info = {0};
+
+        /* Place dyld above the executable, mirroring the native layout. */
+        pie_load_hint = TARGET_PAGE_ALIGN(info->end_data + 0x1000000);
+        if (pie_load_hint < GUEST_PAGEZERO_END) {
+            pie_load_hint = 0x110000000ULL;
+        }
 
         fd = open(interp_name, O_RDONLY);
         if (fd < 0) {
