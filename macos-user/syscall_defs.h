@@ -553,11 +553,19 @@ struct target_sigaction {
     abi_ulong sa_mask;
 };
 
-/* sigaltstack structure */
+/*
+ * sigaltstack structure.
+ *
+ * Darwin's ss_flags is a 4-byte int followed by 4 bytes of tail padding,
+ * not an 8-byte word: reading it as abi_long pulled the uninitialised
+ * padding in as the high half and rejected perfectly valid stacks with
+ * EINVAL.
+ */
 struct target_sigaltstack {
     abi_ulong ss_sp;
     abi_ulong ss_size;
-    abi_long ss_flags;
+    int32_t ss_flags;
+    int32_t __pad;
 };
 
 #define TARGET_SS_ONSTACK   0x0001
