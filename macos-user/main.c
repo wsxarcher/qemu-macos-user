@@ -289,12 +289,35 @@ void init_task_state(TaskState *ts)
  */
 #define MACOS_CNTFRQ_HZ 24000000
 
+/*
+ * Apple Silicon zeroes 64 bytes per DC ZVA; QEMU's "max" CPU advertises
+ * 512.  Guest code reads DCZID_EL0 to size its zeroing loops, so a guest
+ * that trusts the register erases eight times as much memory as the same
+ * binary does on real hardware -- silently wiping whatever follows the
+ * object it meant to clear.
+ *
+ * Emulating an arm64 guest on an arm64 host, the right answer is simply
+ * the host's own value.
+ */
+static void macos_configure_cpu_dcz(CPUState *cpu)
+{
+    ARMCPU *arm_cpu = ARM_CPU(cpu);
+    uint64_t dczid;
+
+    __asm__ volatile("mrs %0, dczid_el0" : "=r"(dczid));
+    if (dczid & (1u << 4)) {
+        return;         /* DC ZVA prohibited on the host; keep the default */
+    }
+    set_dczid_bs(arm_cpu, dczid & 0xf);
+}
+
 void macos_configure_cpu_cntfrq(CPUState *cpu)
 {
     ARMCPU *arm_cpu = ARM_CPU(cpu);
 
     arm_cpu->gt_cntfrq_hz = MACOS_CNTFRQ_HZ;
     cpu_env(cpu)->cp15.c14_cntfrq = MACOS_CNTFRQ_HZ;
+    macos_configure_cpu_dcz(cpu);
 }
 
 CPUArchState *cpu_copy(CPUArchState *env)

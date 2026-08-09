@@ -1792,6 +1792,66 @@ int main(void) {
                       "pc_nonzero=1 far_ok=1", decoded,
                       f"ucontext handed to the handler is wrong: {decoded}")
 
+    _DC_ZVA_SRC = r'''
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+
+int main(void) {
+    uint64_t dczid;
+    __asm__ volatile("mrs %0, dczid_el0" : "=r"(dczid));
+    int dzp = (dczid >> 4) & 1;
+    int bs_log = dczid & 0xf;
+    size_t bs = 4u << bs_log;
+    printf("dczid=0x%llx dzp=%d block=%zu\n", (unsigned long long)dczid, dzp, bs);
+    if (dzp) { printf("RESULT=ok (dc zva prohibited)\n"); return 0; }
+
+    size_t area = 4096;
+    unsigned char *buf = aligned_alloc(4096, area);
+    memset(buf, 0xFF, area);
+
+    unsigned char *target = buf + 1024;           /* block-aligned */
+    __asm__ volatile("dc zva, %0" :: "r"(target) : "memory");
+
+    size_t zeros_before = 0, zeros_after = 0, zeroed = 0;
+    for (size_t i = 0; i < bs; i++) if (target[i] == 0) zeroed++;
+    for (size_t i = 1; i <= 128; i++) if (target[-(long)i] == 0) zeros_before++;
+    for (size_t i = 0; i < 128; i++) if (target[bs + i] == 0) zeros_after++;
+
+    printf("zeroed_in_block=%zu/%zu spill_before=%zu spill_after=%zu\n",
+           zeroed, bs, zeros_before, zeros_after);
+    printf("%s\n", (zeroed == bs && zeros_before == 0 && zeros_after == 0)
+                       ? "RESULT=ok" : "RESULT=bad");
+    free(buf);
+    return 0;
+}
+'''
+
+    def test_dc_zva_block_size_matches_host(self):
+        """DC ZVA must clear exactly as many bytes as it does on the host.
+
+        Guest code sizes its zeroing loops from DCZID_EL0, so advertising a
+        larger block than the hardware makes a single DC ZVA erase memory
+        beyond the object the guest meant to clear.
+        """
+        exe = _compile_framework_test("dc_zva", self._DC_ZVA_SRC, [], "c")
+        rc, out, err = _run_emulated(exe, timeout=20)
+        emulated = out.decode(errors="replace")
+        _assert_no_emulator_fault(self, err)
+        self.assertEqual(rc, 0, emulated + err.decode(errors="replace"))
+        self.assertIn("RESULT=ok", emulated,
+                      f"DC ZVA cleared the wrong range: {emulated}")
+
+        native_rc, native_out, _ = _run([str(exe)], timeout=20)
+        self.assertEqual(native_rc, 0)
+        native = native_out.decode(errors="replace")
+        self.assertEqual(
+            native.splitlines()[0], emulated.splitlines()[0],
+            "emulated DCZID_EL0 differs from the host:\n"
+            f"  native:   {native.splitlines()[0]}\n"
+            f"  emulated: {emulated.splitlines()[0]}")
+
     def test_pipe_and_socketpair(self):
         """pipe() and socketpair() must return usable descriptor pairs."""
         exe = _compile_framework_test("pipe_socketpair",
