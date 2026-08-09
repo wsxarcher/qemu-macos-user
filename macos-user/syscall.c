@@ -255,6 +255,8 @@ static uint32_t saved_mach_thread_self_offset; /* registration data +32 */
 static pthread_mutex_t workq_lock = PTHREAD_MUTEX_INITIALIZER;
 
 #define WQ_STACK_SIZE    (512 * 1024)  /* 512 KB per workqueue thread */
+/* How many parked workers the idle monitor keeps ready. */
+#define WORKQ_IDLE_THREAD_POOL 4
 
 #define WQOPS_THREAD_RETURN            0x004
 #define WQOPS_QUEUE_NEWSPISUPP         0x010
@@ -3188,6 +3190,18 @@ static bool has_parked_workloop_thread(uint64_t workloop_id)
     return has_exact_parked_workloop_thread(workloop_id);
 }
 
+static int parked_workloop_thread_count(void)
+{
+    int n = 0;
+
+    pthread_mutex_lock(&parked_workloop_lock);
+    for (parked_workloop_wq *pw = parked_workloop_list; pw; pw = pw->next) {
+        n++;
+    }
+    pthread_mutex_unlock(&parked_workloop_lock);
+    return n;
+}
+
 /*
  * Workloop deadlock diagnostics.
  *
@@ -4123,8 +4137,18 @@ static void *workq_kqueue_monitor_func(void *arg)
             service_workloop_machport_events();
             service_workq_notification_events_filtered(true);
             idle_ticks++;
+            /*
+             * Keep a small pool of workers ready, but do not keep making
+             * them forever.  This ran unconditionally every 100ms, so an
+             * idle process grew by ~10 guest threads a second, each with a
+             * 512KB guest stack and a CPU that is never reclaimed.  Beyond
+             * the unbounded growth, every one of those creations runs
+             * cpu_create() on the monitor thread concurrently with code
+             * generation on the guest threads.
+             */
             if (idle_ticks >= 2 && saved_wqthread
-                && workq_monitor_parent_env) {
+                && workq_monitor_parent_env
+                && parked_workloop_thread_count() < WORKQ_IDLE_THREAD_POOL) {
                 idle_ticks = 0;
                 create_guest_thread_for_wq(workq_monitor_parent_env, 4);
             }

@@ -3436,6 +3436,45 @@ static void mark_guest_ool_mapping(abi_ulong guest_addr, mach_msg_size_t size);
 static kern_return_t release_host_ool_mapping(void *host_addr,
                                               mach_msg_size_t size);
 
+/*
+ * Set QEMU_MACOS_TRACE_ERRORS=1 to log MIG replies that carry a non-zero
+ * kern_return.  Failures are rare, so this stays quiet enough not to
+ * perturb the timing of the races it is used to chase -- unlike -strace,
+ * which hides them.
+ */
+static bool trace_mig_errors(void)
+{
+    static int cached = -1;
+
+    if (cached < 0) {
+        const char *e = getenv("QEMU_MACOS_TRACE_ERRORS");
+        cached = e && *e && *e != '0';
+    }
+    return cached != 0;
+}
+
+static void log_mig_reply_error(const void *reply_buf, uint32_t size,
+                                const char *where)
+{
+    const mach_msg_header_t *hdr = reply_buf;
+    struct __attribute__((packed)) mig_reply {
+        mach_msg_header_t hdr;
+        NDR_record_t NDR;
+        kern_return_t retval;
+    } const *r = reply_buf;
+
+    if (!trace_mig_errors() || !reply_buf || size < sizeof(*r)) {
+        return;
+    }
+    if (hdr->msgh_bits & MACH_MSGH_BITS_COMPLEX) {
+        return; /* complex replies do not start with a kern_return */
+    }
+    if (r->retval != KERN_SUCCESS) {
+        fprintf(stderr, "qemu: MIG reply id=%d kr=0x%x (%s)\n",
+                hdr->msgh_id, r->retval, where);
+    }
+}
+
 kern_return_t fixup_mig_reply_ool(void *reply_buf,
                                   mach_msg_size_t reply_buf_size,
                                   mach_port_name_t receive_set)
@@ -5030,6 +5069,8 @@ vec_after_receive:
                                 ret = fix_ret;
                             }
                             if (ret == KERN_SUCCESS) {
+                                log_mig_reply_error(vec_reply_buf,
+                                                    vec_reply_size, "vec");
                                 fixup_iokit_scalar_reply_identity_pointers(
                                     vec_reply_buf, vec_reply_size);
                                 refresh_external_ool_identity_mappings_from_host();
@@ -5536,6 +5577,8 @@ direct_after_receive:
                         if (fix_ret != KERN_SUCCESS) {
                             ret = fix_ret;
                         }
+                        log_mig_reply_error(host_data, direct_reply_size,
+                                            "plain");
                         if (ret == KERN_SUCCESS) {
                             fixup_iokit_scalar_reply_identity_pointers(
                                 host_data, direct_reply_size);
