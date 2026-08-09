@@ -1700,6 +1700,58 @@ int main(void) {
 }
 '''
 
+    _PIPE_SOCKETPAIR_SRC = r'''
+#include <stdio.h>
+#include <unistd.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <errno.h>
+
+int main(void) {
+    int fds[2] = { -1, -1 };
+    int r = pipe(fds);
+    printf("pipe_rc=%d fd0=%d fd1=%d\n", r, fds[0], fds[1]);
+    if (r == 0 && fds[0] > 2 && fds[1] > 2) {
+        char buf[8] = {0};
+        write(fds[1], "hi", 2);
+        ssize_t n = read(fds[0], buf, sizeof buf);
+        printf("pipe_roundtrip=%d data=%s\n", n == 2, buf);
+    } else {
+        printf("pipe_roundtrip=0 data=-\n");
+    }
+
+    int sv[2] = { -1, -1 };
+    int s = socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+    printf("sp_rc=%d fd0=%d fd1=%d\n", s, sv[0], sv[1]);
+    if (s == 0 && sv[0] > 2 && sv[1] > 2) {
+        char b2[8] = {0};
+        write(sv[1], "yo", 2);
+        ssize_t n = read(sv[0], b2, sizeof b2);
+        printf("sp_roundtrip=%d data=%s\n", n == 2, b2);
+    } else {
+        printf("sp_roundtrip=0 data=-\n");
+    }
+    printf("DONE\n");
+    return 0;
+}
+'''
+
+    def test_pipe_and_socketpair(self):
+        """pipe() and socketpair() must return usable descriptor pairs."""
+        exe = _compile_framework_test("pipe_socketpair",
+                                      self._PIPE_SOCKETPAIR_SRC, [], "c")
+        rc, out, err = _run_emulated(exe, timeout=20)
+        decoded = out.decode(errors="replace")
+        _assert_no_emulator_fault(self, err)
+        self.assertEqual(rc, 0, decoded + err.decode(errors="replace"))
+        self.assertIn("pipe_roundtrip=1", decoded,
+                      f"pipe() did not return a working pair: {decoded}")
+        self.assertIn("sp_roundtrip=1", decoded,
+                      f"socketpair() did not return a working pair: {decoded}")
+        for bad in ("fd0=0 ", "fd0=-1", "fd1=0\n", "fd1=-1"):
+            self.assertNotIn(bad, decoded,
+                             f"descriptor pair contains a bogus fd: {decoded}")
+
     def test_blocked_signal_stays_pending(self):
         """A blocked self-signal pends until unblocked, and sigprocmask
         must not write past the caller's sigset_t."""
