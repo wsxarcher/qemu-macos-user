@@ -1786,6 +1786,86 @@ static bool handle_mig_message(void *buf, void *reply_buf,
         *ret_out = kr;
         return true;
     }
+    case 4807:
+    case 4808: {
+        /*
+         * mach_vm_copy (4807) and mach_vm_read_overwrite (4808) — MIG
+         * subsystem mach_vm, routines 7 and 8.  Both copy a range of the
+         * task's memory onto another range of the same task.
+         *
+         * Neither was handled here, so the request was forwarded to the
+         * host kernel with raw guest addresses.  Those are not valid host
+         * addresses, so the calls failed; callers that copy a buffer this
+         * way then carried on with stale or uninitialised data.
+         *
+         * Request: header(24) + NDR(8) + src(8) + size(8) + dst(8) = 56
+         * Reply (4807): header(24) + NDR(8) + retval(4)
+         * Reply (4808): header(24) + NDR(8) + retval(4) + outsize(8)
+         */
+        struct __attribute__((packed)) {
+            mach_msg_header_t hdr;
+            NDR_record_t NDR;
+            uint64_t src_address;
+            uint64_t size;
+            uint64_t dst_address;
+        } *req = buf;
+
+        struct __attribute__((packed)) {
+            mach_msg_header_t hdr;
+            NDR_record_t NDR;
+            kern_return_t retval;
+            uint64_t outsize;
+        } *reply = reply_buf;
+
+        bool overwrite = (msg_id == 4808);
+        size_t reply_size = overwrite ? sizeof(*reply)
+                                      : sizeof(*reply) - sizeof(uint64_t);
+
+        if (hdr->msgh_size < sizeof(*req) ||
+            !mig_reply_fits(reply_buf_size, reply_size)) {
+            return false;
+        }
+
+        abi_ulong src = (abi_ulong)req->src_address;
+        abi_ulong dst = (abi_ulong)req->dst_address;
+        abi_ulong size = (abi_ulong)req->size;
+        kern_return_t kr;
+
+        if (size == 0) {
+            kr = KERN_SUCCESS;
+        } else if (!guest_range_readable(src, size)) {
+            kr = KERN_INVALID_ADDRESS;
+        } else if (!guest_range_writable(dst, size)) {
+            kr = KERN_PROTECTION_FAILURE;
+        } else {
+            memmove(g2h_untagged(dst), g2h_untagged(src), size);
+            kr = KERN_SUCCESS;
+        }
+
+        if (overwrite) {
+            reply->outsize = (kr == KERN_SUCCESS) ? size : 0;
+        }
+
+        if (do_strace) {
+            fprintf(stderr,
+                    "  MIG %s: src=0x%llx dst=0x%llx size=0x%llx kr=%d\n",
+                    overwrite ? "mach_vm_read_overwrite" : "mach_vm_copy",
+                    (unsigned long long)src, (unsigned long long)dst,
+                    (unsigned long long)size, kr);
+        }
+
+        reply->hdr.msgh_bits =
+            MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+        reply->hdr.msgh_size = reply_size;
+        reply->hdr.msgh_remote_port = MACH_PORT_NULL;
+        reply->hdr.msgh_local_port = hdr->msgh_local_port;
+        reply->hdr.msgh_id = msg_id + 100;
+        reply->NDR = NDR_record;
+        reply->retval = kr;
+
+        *ret_out = KERN_SUCCESS;
+        return true;
+    }
     case 4811: {
         /*
          * mach_vm_map — MIG subsystem mach_vm, routine 11.

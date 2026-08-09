@@ -1438,6 +1438,54 @@ int main(void) {
 }
 '''
 
+    _VM_COPY_SRC = r'''
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include <stdio.h>
+#include <string.h>
+
+#define SZ 0x4000
+
+static mach_vm_address_t fresh(unsigned char fill) {
+    mach_vm_address_t a = 0;
+    if (mach_vm_allocate(mach_task_self(), &a, SZ, VM_FLAGS_ANYWHERE)) {
+        return 0;
+    }
+    memset((void *)a, fill, SZ);
+    return a;
+}
+
+int main(void) {
+    mach_vm_address_t s = fresh(0x5A), d = fresh(0x00);
+    if (!s || !d) { printf("alloc-failed\n"); return 2; }
+
+    kern_return_t kr = mach_vm_copy(mach_task_self(), s, SZ, d);
+    int ok = (kr == KERN_SUCCESS) && ((unsigned char *)d)[SZ - 1] == 0x5A;
+    printf("copy-kr=%d copy-ok=%d\n", kr, ok);
+
+    mach_vm_address_t s2 = fresh(0x77), d2 = fresh(0x00);
+    mach_vm_size_t got = 0;
+    kern_return_t kr2 = mach_vm_read_overwrite(mach_task_self(), s2, SZ,
+                                               d2, &got);
+    int ok2 = (kr2 == KERN_SUCCESS) && got == SZ &&
+              ((unsigned char *)d2)[0] == 0x77;
+    printf("ovw-kr=%d ovw-ok=%d\n", kr2, ok2);
+
+    printf("%s\n", (ok && ok2) ? "RESULT=ok" : "RESULT=bad");
+    return 0;
+}
+'''
+
+    def test_vm_copy_and_read_overwrite(self):
+        """mach_vm_copy and mach_vm_read_overwrite must copy guest memory."""
+        exe = _compile_framework_test("vm_copy", self._VM_COPY_SRC, [], "c")
+        rc, out, err = _run_emulated(exe, timeout=20)
+        decoded = out.decode(errors="replace")
+        _assert_no_emulator_fault(self, err)
+        self.assertEqual(rc, 0, decoded + err.decode(errors="replace"))
+        self.assertIn("RESULT=ok", decoded,
+                      f"mach_vm_copy/read_overwrite did not work: {decoded}")
+
     def test_vm_allocate_fixed_does_not_clobber(self):
         """mach_vm_allocate at a fixed address must not overwrite live memory."""
         exe = _compile_framework_test("vm_alloc_fixed",
