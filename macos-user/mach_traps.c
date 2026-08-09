@@ -705,9 +705,11 @@ static bool copy_external_ool_identity_to_guest(void *host_addr,
     }
     map_size = (page_offset + size + page_size - 1) &
                ~(abi_ulong)(page_size - 1);
+    mmap_lock();
     already_mapped = external_ool_identity_mapping_contains(page_start,
                                                             map_size);
     if (!already_mapped && !guest_range_pages_unmapped(page_start, map_size)) {
+        mmap_unlock();
         return false;
     }
     if (!already_mapped) {
@@ -718,10 +720,12 @@ static bool copy_external_ool_identity_to_guest(void *host_addr,
             if (map_ret >= 0) {
                 target_munmap(map_ret, map_size);
             }
+            mmap_unlock();
             return false;
         }
         remember_external_ool_identity_mapping(page_start, map_size, false);
     }
+    mmap_unlock();
 
     memcpy(g2h_untagged(guest_addr), host_addr, size);
     *guest_addr_out = guest_addr;
@@ -768,7 +772,15 @@ static bool remap_external_identity_to_guest(void *host_addr,
     if (already_mapped) {
         return true;
     }
+
+    /*
+     * Hold mmap_lock across the "is this range free" test and the overwrite:
+     * target_mmap() takes the same lock, so without it another guest thread
+     * can map the range in between and we destroy its memory.
+     */
+    mmap_lock();
     if (!guest_range_pages_unmapped(page_start, map_size)) {
+        mmap_unlock();
         return false;
     }
 
@@ -780,10 +792,10 @@ static bool remap_external_identity_to_guest(void *host_addr,
                        &cur_prot, &max_prot, VM_INHERIT_NONE);
     if (kr != KERN_SUCCESS ||
         target_addr != (mach_vm_address_t)(uintptr_t)g2h_untagged(page_start)) {
+        mmap_unlock();
         return false;
     }
 
-    mmap_lock();
     page_set_flags(page_start, page_start + map_size - 1,
                    PAGE_VALID |
                    ((cur_prot & VM_PROT_READ) ? PAGE_READ : 0) |
@@ -3984,12 +3996,17 @@ abi_long do_mach_trap(void *cpu_env, int trap_num, abi_long arg1,
                                qemu_flags, ~0);
                 mmap_unlock();
                 ret = KERN_SUCCESS;
-            } else if (host_prot != 0) {
+            } else if (host_prot != 0 && errno == ENOMEM) {
                 /*
-                 * mprotect failed — likely because the host pages don't
-                 * exist yet (PROT_NONE reservation created by vm_map only
-                 * registered pages in the guest page table).  Materialise
-                 * the host mapping now with target_mmap(MAP_FIXED).
+                 * mprotect reported that the range is not mapped, which
+                 * happens for the parts of a PROT_NONE reservation created
+                 * by vm_map that only exist in the guest page table.
+                 * Materialise the host mapping now.
+                 *
+                 * Only do this for ENOMEM: any other failure (a protection
+                 * escalation the kernel refuses, say) means the pages *are*
+                 * mapped, and replacing them with fresh anonymous zero pages
+                 * would silently destroy live guest data.
                  */
                 abi_long result = target_mmap(guest_addr, size, host_prot,
                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
