@@ -8,6 +8,7 @@ System binary tests run real macOS /bin and /usr/bin tools under emulation
 and compare output against native execution.
 """
 
+import ast
 import os
 from pathlib import Path
 import signal
@@ -162,6 +163,32 @@ def _assert_no_emulator_fault(testcase, stderr: bytes):
 
 class TestHarness(unittest.TestCase):
     """Test the bounded subprocess harness without launching QEMU."""
+
+    def test_testcase_method_names_are_unique(self):
+        """Test methods cannot silently shadow earlier definitions."""
+        tree = ast.parse(Path(__file__).read_text())
+        duplicates = {}
+
+        for node in tree.body:
+            if not isinstance(node, ast.ClassDef) or not node.name.startswith(
+                "Test"
+            ):
+                continue
+
+            seen = set()
+            repeated = set()
+            for item in node.body:
+                if not isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if not item.name.startswith("test_"):
+                    continue
+                if item.name in seen:
+                    repeated.add(item.name)
+                seen.add(item.name)
+            if repeated:
+                duplicates[node.name] = sorted(repeated)
+
+        self.assertEqual(duplicates, {})
 
     def test_default_stdin_is_isolated_from_runner(self):
         """Commands cannot inherit data or state from the test runner's stdin."""
@@ -969,22 +996,21 @@ int main(void) {
 }
 '''
 
-    _DISPATCH_ASYNC_SRC = r'''
+    _DISPATCH_GLOBAL_ASYNC_SRC = r'''
 #include <stdio.h>
-#include <unistd.h>
 #include <dispatch/dispatch.h>
 int main(void) {
-    __block int done = 0;
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
     dispatch_queue_t q = dispatch_get_global_queue(
             DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
     dispatch_async(q, ^{
         printf("async_block_ran=YES\n");
-        done = 1;
+        dispatch_semaphore_signal(done);
     });
-    for (int i = 0; i < 100 && !done; i++)
-        usleep(50000);
-    printf("done=%d\n", done);
-    return done ? 0 : 1;
+    long timed_out = dispatch_semaphore_wait(
+        done, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+    printf("done=%d\n", timed_out == 0);
+    return timed_out == 0 ? 0 : 1;
 }
 '''
 
@@ -2168,10 +2194,10 @@ int main(void) {
         self.assertIn("uc_nonnull=1", decoded)
         self.assertIn("uc_pc_nonzero=1", decoded)
 
-    def test_dispatch_async(self):
+    def test_dispatch_global_async(self):
         """dispatch_async on a global concurrent queue (GCD workqueue)."""
-        exe = _compile_framework_test("dispatch_async",
-                                      self._DISPATCH_ASYNC_SRC,
+        exe = _compile_framework_test("dispatch_global_async",
+                                      self._DISPATCH_GLOBAL_ASYNC_SRC,
                                       [], "c")
         rc, out, _ = _run_emulated(exe, timeout=15)
         self.assertEqual(rc, 0)
@@ -2450,33 +2476,6 @@ int main(void) {
         rc, out, _ = _run_emulated(exe, timeout=10)
         self.assertEqual(rc, 0)
         self.assertIn(b"ok=1", out)
-
-    # -- dispatch_async test (validates GCD workqueue threading) -------------
-    _DISPATCH_ASYNC_SRC = r'''
-#include <stdio.h>
-#include <unistd.h>
-#include <dispatch/dispatch.h>
-int main(void) {
-    __block int done = 0;
-    dispatch_queue_t q = dispatch_get_global_queue(0, 0);
-    dispatch_async(q, ^{
-        done = 1;
-    });
-    for (int i = 0; i < 50 && !done; i++) usleep(100000);
-    printf("dispatched=%d\n", done);
-    return done ? 0 : 1;
-}
-'''
-
-    def test_dispatch_async(self):
-        """GCD dispatch_async executes block on worker thread."""
-        exe = _compile_framework_test("dispatch_async",
-                                      self._DISPATCH_ASYNC_SRC,
-                                      [],
-                                      language="c")
-        rc, out, _ = _run_emulated(exe, timeout=10)
-        self.assertEqual(rc, 0)
-        self.assertIn(b"dispatched=1", out)
 
     # -- AppKit class resolution (no WindowServer, no UI) ----------------
     _APPKIT_CLASSES_SRC = r'''
