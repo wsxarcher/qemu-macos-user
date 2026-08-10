@@ -9,6 +9,7 @@ and compare output against native execution.
 """
 
 import ast
+import hashlib
 import os
 from pathlib import Path
 import signal
@@ -217,6 +218,25 @@ class TestHarness(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         self.assertEqual(result.stdout, b"")
+
+    def test_framework_compile_cache_includes_build_inputs(self):
+        """Same-name probes with different sources build distinct binaries."""
+        first = _compile_framework_test(
+            "compile_cache_probe",
+            '#include <stdio.h>\nint main(void) { puts("first"); }\n',
+            [],
+            "c",
+        )
+        second = _compile_framework_test(
+            "compile_cache_probe",
+            '#include <stdio.h>\nint main(void) { puts("second"); }\n',
+            [],
+            "c",
+        )
+
+        self.assertNotEqual(first, second)
+        self.assertEqual(_run_native(first)[1], b"first\n")
+        self.assertEqual(_run_native(second)[1], b"second\n")
 
     def test_timeout_kills_descendant_processes(self):
         """A timed-out command cannot leak descendants into later tests."""
@@ -3383,29 +3403,34 @@ int main(void) {
 # Helper: compile Objective-C / C test programs from source strings
 # ---------------------------------------------------------------------------
 
-_fw_build_cache: dict[str, Path] = {}
+_fw_build_cache: dict[tuple, Path] = {}
 
 
 def _compile_framework_test(name, source, frameworks=None, language="objc",
                             extra_flags=None):
     """Compile a C/ObjC source string into a dynamic arm64 binary."""
-    if name in _fw_build_cache:
-        return _fw_build_cache[name]
+    frameworks = tuple(frameworks or ())
+    extra_flags = tuple(extra_flags or ())
+    cache_key = (name, source, frameworks, language, extra_flags)
+    if cache_key in _fw_build_cache:
+        return _fw_build_cache[cache_key]
 
-    build_dir = _get_build_dir()
+    digest = hashlib.sha256(repr(cache_key).encode()).hexdigest()[:16]
+    build_dir = _get_build_dir() / f"{name}-{digest}"
+    build_dir.mkdir(exist_ok=True)
     ext = ".m" if language == "objc" else ".c"
-    src_path = build_dir / f"{name}{ext}"
+    src_path = build_dir / f"source{ext}"
     exe_path = build_dir / name
 
     src_path.write_text(source)
 
     cmd = ["clang", "-arch", "arm64", "-o", str(exe_path), str(src_path)]
-    for fw in (frameworks or []):
+    for fw in frameworks:
         cmd += ["-framework", fw]
-    cmd += extra_flags or []
+    cmd += extra_flags
 
     _run_process(cmd, timeout=_BUILD_TIMEOUT).check_returncode()
-    _fw_build_cache[name] = exe_path
+    _fw_build_cache[cache_key] = exe_path
     return exe_path
 
 
