@@ -163,6 +163,34 @@ def _assert_no_emulator_fault(testcase, stderr: bytes):
 class TestHarness(unittest.TestCase):
     """Test the bounded subprocess harness without launching QEMU."""
 
+    def test_default_stdin_is_isolated_from_runner(self):
+        """Commands cannot inherit data or state from the test runner's stdin."""
+        child = (
+            "import sys; "
+            "sys.stdout.buffer.write(sys.stdin.buffer.read())"
+        )
+        parent = (
+            "import importlib.util, sys; "
+            "spec = importlib.util.spec_from_file_location('subject', "
+            "sys.argv[1]); "
+            "module = importlib.util.module_from_spec(spec); "
+            "spec.loader.exec_module(module); "
+            "rc, stdout, stderr = module._run("
+            "[sys.executable, '-c', sys.argv[2]], timeout=5); "
+            "sys.stdout.buffer.write(stdout); "
+            "sys.stderr.buffer.write(stderr); "
+            "sys.exit(rc)"
+        )
+
+        result = _run_process(
+            [sys.executable, "-c", parent, str(Path(__file__).resolve()), child],
+            timeout=10,
+            stdin_data=b"runner input must not leak",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertEqual(result.stdout, b"")
+
     def test_timeout_kills_descendant_processes(self):
         """A timed-out command cannot leak descendants into later tests."""
         with tempfile.TemporaryDirectory(prefix="qemu_timeout_test_") as tmp:
