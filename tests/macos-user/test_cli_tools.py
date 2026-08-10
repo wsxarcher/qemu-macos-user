@@ -2893,18 +2893,12 @@ int main(void) {
         """CFPreferencesCopyValue returns without hanging."""
         exe = _compile_framework_test("cfprefs", self._CF_PREFERENCES_SRC,
                                       ["CoreFoundation"], language="c")
-        rc, out, _ = _run_emulated(exe, timeout=30)
-        if rc == 0:
-            self.assertIn(b"cfprefs_done", out)
-            # Value may be NULL (daemon unreachable) or found
-            self.assertTrue(b"cfprefs=null" in out or
-                            b"cfprefs=found" in out)
-        else:
-            # rc=99 means SIGALRM fired — cfprefsd never replied.
-            # rc=-6 means SIGABRT from XPC timeout assertion — the
-            # dispatch timer correctly fired the XPC deadline before
-            # the alarm.  Both are acceptable: neither hangs.
-            self.assertIn(rc, (99, -6), f"unexpected exit code: {rc}")
+        rc, out, err = _run_emulated(exe, timeout=30)
+        _assert_no_emulator_fault(self, err)
+        self.assertEqual(rc, 0, err.decode(errors="replace"))
+        self.assertIn(b"cfprefs_done", out)
+        # Value may be NULL (daemon unreachable) or found.
+        self.assertTrue(b"cfprefs=null" in out or b"cfprefs=found" in out)
 
     # -- HIToolbox input-source cache: workloop sync-end wake -----------------
     _HITOOLBOX_TIS_SRC = r'''
