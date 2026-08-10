@@ -1266,9 +1266,11 @@ int main(void) {
 
     _RCV_STRESS_SRC = r'''
 #include <dispatch/dispatch.h>
+#include <errno.h>
 #include <mach/mach.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 /*
@@ -1299,13 +1301,36 @@ static void *receiver(void *arg) {
     return NULL;
 }
 
+static int create_receiver(pthread_t *thread, int index) {
+    const char *fail_at = getenv("QEMU_TEST_PTHREAD_FAIL_AT");
+    if (fail_at && atoi(fail_at) == index) {
+        return EAGAIN;
+    }
+    return pthread_create(thread, NULL, receiver, NULL);
+}
+
 int main(void) {
     pthread_t t[NTHREADS];
+    int created = 0;
+
     for (int i = 0; i < NTHREADS; i++) {
-        pthread_create(&t[i], NULL, receiver, NULL);
+        int err = create_receiver(&t[i], i);
+        if (err != 0) {
+            fprintf(stderr, "pthread_create[%d]=%d\n", i, err);
+            break;
+        }
+        created++;
     }
-    for (int i = 0; i < NTHREADS; i++) {
-        pthread_join(t[i], NULL);
+    for (int i = 0; i < created; i++) {
+        int err = pthread_join(t[i], NULL);
+        if (err != 0) {
+            fprintf(stderr, "pthread_join[%d]=%d\n", i, err);
+            return 3;
+        }
+    }
+    printf("threads_created=%d expected=%d\n", created, NTHREADS);
+    if (created != NTHREADS) {
+        return 2;
     }
     fprintf(stderr, "receivers_done\n");
 
@@ -1334,13 +1359,29 @@ int main(void) {
         _assert_no_emulator_fault(self, err)
         self.assertEqual(rc, 0, f"rcv_stress failed: "
                                 f"{err.decode(errors='replace')}")
+        self.assertIn("threads_created=40 expected=40", decoded)
         self.assertIn("sync_ran=1", decoded)
         self.assertIn("after_fired=1", decoded)
 
+    def test_concurrent_mach_receive_partial_thread_start(self):
+        """Mach receive stress joins only threads that were created."""
+        exe = _compile_framework_test("rcv_stress", self._RCV_STRESS_SRC,
+                                      [], "c")
+        env = os.environ.copy()
+        env["QEMU_TEST_PTHREAD_FAIL_AT"] = "3"
+        rc, out, err = _run_emulated(exe, timeout=20, env=env)
+        decoded = out.decode(errors="replace")
+        _assert_no_emulator_fault(self, err)
+        self.assertEqual(rc, 2, err.decode(errors="replace"))
+        self.assertIn("threads_created=3 expected=40", decoded)
+        self.assertIn("pthread_create[3]=", err.decode(errors="replace"))
+
     _JIT_PAGES_SRC = r'''
+#include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -1396,14 +1437,37 @@ static void *worker(void *arg) {
     return NULL;
 }
 
+static int create_worker(pthread_t *thread, int *result, int index) {
+    const char *fail_at = getenv("QEMU_TEST_PTHREAD_FAIL_AT");
+    if (fail_at && atoi(fail_at) == index) {
+        return EAGAIN;
+    }
+    return pthread_create(thread, NULL, worker, result);
+}
+
 int main(void) {
     pthread_t t[NTHREADS];
-    int res[NTHREADS];
+    int res[NTHREADS] = {0};
+    int created = 0;
+
     for (int i = 0; i < NTHREADS; i++) {
-        pthread_create(&t[i], NULL, worker, &res[i]);
+        int err = create_worker(&t[i], &res[i], i);
+        if (err != 0) {
+            fprintf(stderr, "pthread_create[%d]=%d\n", i, err);
+            break;
+        }
+        created++;
     }
-    for (int i = 0; i < NTHREADS; i++) {
-        pthread_join(t[i], NULL);
+    for (int i = 0; i < created; i++) {
+        int err = pthread_join(t[i], NULL);
+        if (err != 0) {
+            fprintf(stderr, "pthread_join[%d]=%d\n", i, err);
+            return 3;
+        }
+    }
+    printf("threads_created=%d expected=%d\n", created, NTHREADS);
+    if (created != NTHREADS) {
+        return 2;
     }
     int total = 0;
     for (int i = 0; i < NTHREADS; i++) {
@@ -1423,7 +1487,21 @@ int main(void) {
         _assert_no_emulator_fault(self, err)
         self.assertEqual(rc, 0, f"jit_pages failed: "
                                 f"{err.decode(errors='replace')}")
+        self.assertIn("threads_created=4 expected=4", decoded)
         self.assertIn("executed=256 expected=256", decoded)
+
+    def test_concurrent_new_page_partial_thread_start(self):
+        """JIT stress joins only threads that were created."""
+        exe = _compile_framework_test("jit_pages", self._JIT_PAGES_SRC,
+                                      [], "c")
+        env = os.environ.copy()
+        env["QEMU_TEST_PTHREAD_FAIL_AT"] = "2"
+        rc, out, err = _run_emulated(exe, timeout=20, env=env)
+        decoded = out.decode(errors="replace")
+        _assert_no_emulator_fault(self, err)
+        self.assertEqual(rc, 2, err.decode(errors="replace"))
+        self.assertIn("threads_created=2 expected=4", decoded)
+        self.assertIn("pthread_create[2]=", err.decode(errors="replace"))
 
     _GUARD_PAGE_SRC = r'''
 #include <signal.h>
