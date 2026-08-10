@@ -10,9 +10,11 @@ and compare output against native execution.
 
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 # ---------------------------------------------------------------------------
@@ -45,6 +47,8 @@ QEMU_BINARY = Path(
 
 _build_cache: dict[str, Path] = {}
 _build_dir: tempfile.TemporaryDirectory | None = None
+_BUILD_TIMEOUT = 30
+_PROCESS_TERM_GRACE = 2
 
 
 def _get_build_dir() -> Path:
@@ -67,27 +71,59 @@ def _build_asm(name: str) -> Path:
     obj = build_dir / f"{name}.o"
     exe = build_dir / name
 
-    subprocess.run(
+    _run_process(
         ["as", "-o", str(obj), str(src)],
-        check=True, capture_output=True,
-    )
-    subprocess.run(
+        timeout=_BUILD_TIMEOUT,
+    ).check_returncode()
+    _run_process(
         ["ld", "-o", str(exe), str(obj), "-e", "_main", "-static"],
-        check=True, capture_output=True,
-    )
+        timeout=_BUILD_TIMEOUT,
+    ).check_returncode()
 
     _build_cache[name] = exe
     return exe
 
 
+def _run_process(args, *, timeout, env=None, stdin_data=None):
+    """Run *args* in an isolated process group with a hard timeout."""
+    process = subprocess.Popen(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
+        env=env,
+        start_new_session=True,
+    )
+
+    try:
+        stdout, stderr = process.communicate(input=stdin_data, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            stdout, stderr = process.communicate(timeout=_PROCESS_TERM_GRACE)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            stdout, stderr = process.communicate()
+        raise subprocess.TimeoutExpired(
+            args, timeout, output=stdout, stderr=stderr
+        ) from None
+
+    return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
+
+
 def _run(args, *, timeout=30, env=None, stdin_data=None):
     """Run *args* and return (returncode, stdout, stderr)."""
-    result = subprocess.run(
+    result = _run_process(
         args,
-        capture_output=True,
         timeout=timeout,
         env=env,
-        input=stdin_data,
+        stdin_data=stdin_data,
     )
     return result.returncode, result.stdout, result.stderr
 
@@ -122,6 +158,37 @@ def _assert_no_emulator_fault(testcase, stderr: bytes):
 # ---------------------------------------------------------------------------
 # Test cases
 # ---------------------------------------------------------------------------
+
+
+class TestHarness(unittest.TestCase):
+    """Test the bounded subprocess harness without launching QEMU."""
+
+    def test_timeout_kills_descendant_processes(self):
+        """A timed-out command cannot leak descendants into later tests."""
+        with tempfile.TemporaryDirectory(prefix="qemu_timeout_test_") as tmp:
+            marker = Path(tmp) / "descendant-survived"
+            child = (
+                "import pathlib, sys, time; "
+                "time.sleep(1); "
+                "pathlib.Path(sys.argv[1]).write_text('leaked')"
+            )
+            parent = (
+                "import subprocess, sys, time; "
+                "subprocess.Popen([sys.executable, '-c', sys.argv[1], "
+                "sys.argv[2]]); "
+                "print('spawned', flush=True); "
+                "time.sleep(10)"
+            )
+
+            with self.assertRaises(subprocess.TimeoutExpired) as raised:
+                _run(
+                    [sys.executable, "-c", parent, child, str(marker)],
+                    timeout=0.5,
+                )
+
+            self.assertIn(b"spawned", raised.exception.output)
+            time.sleep(1)
+            self.assertFalse(marker.exists())
 
 
 class TestStaticBinaries(unittest.TestCase):
@@ -3238,7 +3305,7 @@ def _compile_framework_test(name, source, frameworks=None, language="objc",
         cmd += ["-framework", fw]
     cmd += extra_flags or []
 
-    subprocess.run(cmd, check=True, capture_output=True)
+    _run_process(cmd, timeout=_BUILD_TIMEOUT).check_returncode()
     _fw_build_cache[name] = exe_path
     return exe_path
 
