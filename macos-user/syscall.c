@@ -7825,6 +7825,16 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                     ts->active_workloop_id = pw.workloop_id;
                 }
 
+                /*
+                 * Re-check owner liveness here rather than only at delivery
+                 * time: this runs on the guest thread immediately before the
+                 * events reach libdispatch, so a source torn down while this
+                 * thread was parked is caught with a much smaller window.
+                 */
+                pw.delivered_nevents = drop_dead_owner_events(
+                    pw.workloop_id, pw.delivered_events,
+                    pw.delivered_nevents);
+
                 /* Copy delivered events to guest stack with wl ID */
                 CPUArchState *env = (CPUArchState *)cpu_env;
 #define DISPATCH_DEFERRED_ITEMS_MAX 16
