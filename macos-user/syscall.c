@@ -1538,6 +1538,50 @@ static void release_prereceived_workloop_event(struct kevent_qos_s *event)
     }
 }
 
+/*
+ * Is the libdispatch object that owns this knote still alive?
+ *
+ * MACHPORT knote templates are cached so events can be replayed onto a
+ * workloop servicer later.  A guest that tears its dispatch source down in
+ * the meantime leaves us holding a template whose udata points at a freed
+ * dispatch_unote.  libdispatch's _dispatch_kevent_merge() retains the
+ * unote's owner before merging and aborts the process with "API MISUSE:
+ * Resurrection of an object" when that retain sees a dead refcount, so
+ * replaying such an event kills the guest.
+ *
+ * Apply the same test up front: follow udata -> du_owner_wref -> owner and
+ * check the internal refcount.  Anything that cannot be decoded is treated
+ * as live so this never drops a legitimate event.
+ */
+static bool workloop_event_owner_is_live(const struct kevent_qos_s *event)
+{
+    abi_ulong du_addr;
+    abi_ulong owner_addr;
+    uint64_t owner_wref;
+    int32_t ref_cnt;
+
+    if (event->filter != EVFILT_MACHPORT) {
+        return true;
+    }
+
+    du_addr = (abi_ulong)event->udata;
+    /* Bit 0 tags a muxed unote, which has a different layout. */
+    if (!du_addr || (du_addr & 1) ||
+        !guest_range_readable(du_addr, 2 * sizeof(uint64_t))) {
+        return true;
+    }
+
+    owner_wref = *(uint64_t *)g2h_untagged(du_addr + sizeof(uint64_t));
+    owner_addr = (abi_ulong)~owner_wref;
+    if (!owner_addr ||
+        !guest_range_readable(owner_addr, 2 * sizeof(uint64_t))) {
+        return true;
+    }
+
+    ref_cnt = *(int32_t *)g2h_untagged(owner_addr + 8);
+    return ref_cnt >= 1;
+}
+
 static bool is_mach_notification_msg(const mach_msg_header_t *hdr)
 {
     return hdr->msgh_id >= MACH_NOTIFY_FIRST &&
@@ -2206,6 +2250,50 @@ static void remove_workloop_port(mach_port_t port)
     remove_workq_machport_template(port);
     unregister_workq_notification_port(port);
     remove_pending_cgs_window_port(port);
+}
+
+/*
+ * Drop events whose owning dispatch object has already been freed, and stop
+ * tracking the port so a dead knote is not replayed again.
+ */
+static int drop_dead_owner_events(uint64_t wl_id, struct kevent_qos_s *events,
+                                  int nevents)
+{
+    mach_port_t dead_ports[8];
+    int dead_count = 0;
+    int out = 0;
+
+    if (!events || nevents <= 0) {
+        return nevents;
+    }
+
+    for (int i = 0; i < nevents; i++) {
+        if (workloop_event_owner_is_live(&events[i])) {
+            if (out != i) {
+                events[out] = events[i];
+            }
+            out++;
+            continue;
+        }
+
+        if (do_strace) {
+            fprintf(stderr, "  workloop wl=0x%llx: dropping event for freed "
+                    "dispatch owner ident=0x%llx udata=0x%llx\n",
+                    (unsigned long long)wl_id,
+                    (unsigned long long)events[i].ident,
+                    (unsigned long long)events[i].udata);
+        }
+        if (dead_count < (int)ARRAY_SIZE(dead_ports)) {
+            dead_ports[dead_count++] = (mach_port_t)events[i].ident;
+        }
+        release_prereceived_workloop_event(&events[i]);
+    }
+
+    for (int i = 0; i < dead_count; i++) {
+        remove_workloop_port(dead_ports[i]);
+    }
+
+    return out;
 }
 
 static int stash_workloop_port_events(mach_port_t port,
@@ -4772,6 +4860,7 @@ static void deliver_workloop_events_to_thread(uint64_t workloop_id,
                                               int nevents)
 {
     qatomic_set(&last_workloop_delivery_ns, workloop_monotonic_time_ns());
+    nevents = drop_dead_owner_events(workloop_id, events, nevents);
     if (nevents <= 0) {
         if (do_strace) {
             fprintf(stderr, "  workq_monitor: skipping empty workloop "
