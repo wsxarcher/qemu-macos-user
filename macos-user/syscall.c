@@ -661,6 +661,14 @@ static abi_ulong prereceive_one_msg_timeout(mach_port_t port,
  * ever fills up.
  */
 #define WORKLOOP_SYNC_WILDCARD_HANDOFF_STALE_NS (5ULL * 1000 * 1000 * 1000)
+/*
+ * How long a parked NOTE_WL_THREAD_REQUEST may wait for a MACHPORT event to
+ * pair it with before it is delivered on its own.  See
+ * service_pending_workloop_reqs().
+ */
+#define WORKLOOP_ZERO_WAKE_STALL_NS (1000ULL * 1000 * 1000)
+
+static uint64_t last_workloop_delivery_ns;
 typedef struct {
     uint64_t workloop_id;
     mach_port_t waiter;
@@ -685,6 +693,7 @@ typedef struct {
     struct kevent_qos_s event;
     bool active;
     bool zero_wake;
+    uint64_t zero_wake_since_ns;
 } pending_workloop_req;
 
 static pending_workloop_req pending_wl_reqs[MAX_PENDING_WL];
@@ -1653,6 +1662,7 @@ static void store_pending_workloop_req(uint64_t wl_id,
         } else {
             if (!entry->zero_wake) {
                 entry->event = *ev;
+                entry->zero_wake_since_ns = workloop_monotonic_time_ns();
             }
             entry->zero_wake = true;
             entry->active = false;
@@ -1742,6 +1752,102 @@ static void clear_pending_workloop_req(uint64_t wl_id)
     pthread_mutex_unlock(&pending_wl_lock);
 }
 
+/*
+ * Deliver thread requests that nothing is ever going to pair with.
+ *
+ * A NOTE_WL_THREAD_REQUEST on a workloop that owns MACHPORT knotes is
+ * parked as a zero-wake request so it can be delivered together with the
+ * MACHPORT event that is expected to follow.  That expectation does not
+ * always hold: when a guest cancels a MACH_RECV dispatch source, the queue
+ * has a cancel handler to run but no knote will ever fire again, and the
+ * parked request would sit there forever with the guest blocked waiting for
+ * the cancel handler.  XNU has no such restriction - a thread request alone
+ * is enough to get a servicer - so once a parked request has had a fair
+ * chance to be paired, hand it to the workloop on its own.
+ *
+ * Only called from paths where a guest thread is already blocked, so this
+ * cannot pre-empt work the guest could have made progress on itself.
+ */
+/* Lowest bit of a libdispatch dq_state: the queue has enqueued work. */
+#define GUEST_DISPATCH_QUEUE_DIRTY 0x1ULL
+
+/*
+ * Would dispatching a servicer for this parked thread request be safe?
+ *
+ * ext[1]/ext[2]/ext[3] are libdispatch's WL_ADDR/WL_MASK/WL_VALUE: the queue
+ * state the request was registered against.  XNU treats a request whose
+ * guard no longer matches as stale, and libdispatch aborts with "Invalid
+ * wlh state" if a servicer turns up for a queue with no work, so require
+ * both that the guard still holds and that it describes a dirty queue.  A
+ * request registered against a clean queue is a state update, not a plea
+ * for a thread.
+ */
+static bool workloop_req_wants_servicer(const struct kevent_qos_s *ev)
+{
+    uint64_t dq_state;
+
+    if (!ev->ext[1] || !(ev->ext[2] & GUEST_DISPATCH_QUEUE_DIRTY) ||
+        !(ev->ext[3] & GUEST_DISPATCH_QUEUE_DIRTY) ||
+        !guest_range_readable((abi_ulong)ev->ext[1], sizeof(uint64_t))) {
+        return false;
+    }
+
+    dq_state = *(uint64_t *)g2h_untagged((abi_ulong)ev->ext[1]);
+    return (dq_state & ev->ext[2]) == (ev->ext[3] & ev->ext[2]);
+}
+
+static void service_stalled_zero_wake_workloop_reqs(void)
+{
+    uint64_t now_ns = workloop_monotonic_time_ns();
+
+    /*
+     * Only step in once the emulated workloop machinery has gone quiet.
+     * While anything is still being delivered the guest is making progress
+     * and will service its own thread requests; forcing one through then
+     * races with libdispatch and trips its internal state assertions.
+     */
+    if (now_ns - qatomic_read(&last_workloop_delivery_ns) <
+        WORKLOOP_ZERO_WAKE_STALL_NS) {
+        return;
+    }
+
+    for (;;) {
+        struct kevent_qos_s ev;
+        uint64_t wl_id = 0;
+
+        pthread_mutex_lock(&pending_wl_lock);
+        for (int i = 0; i < pending_wl_count; i++) {
+            pending_workloop_req *req = &pending_wl_reqs[i];
+
+            if (!req->zero_wake || req->active ||
+                now_ns - req->zero_wake_since_ns <
+                    WORKLOOP_ZERO_WAKE_STALL_NS ||
+                !has_parked_workloop_thread(req->workloop_id) ||
+                !workloop_req_wants_servicer(&req->event)) {
+                continue;
+            }
+            wl_id = req->workloop_id;
+            ev = req->event;
+            req->zero_wake = false;
+            break;
+        }
+        pthread_mutex_unlock(&pending_wl_lock);
+
+        if (!wl_id) {
+            return;
+        }
+
+        if (do_strace) {
+            fprintf(stderr, "  workloop wl=0x%llx: delivering parked "
+                    "THREAD_REQUEST that no knote paired with "
+                    "(dq_state=0x%llx)\n",
+                    (unsigned long long)wl_id,
+                    (unsigned long long)ev.ext[3]);
+        }
+        deliver_workloop_events_to_thread(wl_id, &ev, 1);
+    }
+}
+
 void service_pending_workloop_reqs(void)
 {
     pthread_mutex_lock(&pending_wl_lock);
@@ -1772,6 +1878,7 @@ void service_pending_workloop_reqs(void)
         req = pending_wl_reqs[i];
         pending_wl_reqs[i].active = false;
         pthread_mutex_unlock(&pending_wl_lock);
+
 
         ev = req.event;
         wl_id = req.workloop_id;
@@ -1806,6 +1913,8 @@ void service_pending_workloop_reqs(void)
         pthread_mutex_lock(&pending_wl_lock);
     }
     pthread_mutex_unlock(&pending_wl_lock);
+
+    service_stalled_zero_wake_workloop_reqs();
 }
 
 static void add_workloop_port(uint64_t wl_id,
@@ -4655,6 +4764,7 @@ static void deliver_workloop_events_to_thread(uint64_t workloop_id,
                                               struct kevent_qos_s *events,
                                               int nevents)
 {
+    qatomic_set(&last_workloop_delivery_ns, workloop_monotonic_time_ns());
     if (nevents <= 0) {
         if (do_strace) {
             fprintf(stderr, "  workq_monitor: skipping empty workloop "

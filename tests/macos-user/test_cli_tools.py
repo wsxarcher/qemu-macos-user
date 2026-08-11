@@ -2302,6 +2302,129 @@ int main(void) {
         self.assertIn(b"async_block_ran=YES", out)
         self.assertIn(b"done=1", out)
 
+    _DISPATCH_MACH_SOURCE_CHURN_SRC = r'''
+#include <dispatch/dispatch.h>
+#include <mach/mach.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+/*
+ * Create, feed, cancel and destroy MACH_RECV dispatch sources in a loop.
+ *
+ * Each round leaves the emulator holding a cached MACHPORT knote template
+ * for a port whose dispatch source is about to be freed.  Replaying such a
+ * template afterwards makes libdispatch abort the process with "API MISUSE:
+ * Resurrection of an object", so the loop simply has to survive.
+ */
+#define ROUNDS 24
+#define MSGS_PER_ROUND 4
+
+static void send_ping(mach_port_t port)
+{
+    mach_msg_header_t msg;
+
+    memset(&msg, 0, sizeof(msg));
+    msg.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+    msg.msgh_size = sizeof(msg);
+    msg.msgh_remote_port = port;
+    msg.msgh_local_port = MACH_PORT_NULL;
+    msg.msgh_id = 0x4242;
+    mach_msg(&msg, MACH_SEND_MSG | MACH_SEND_TIMEOUT, sizeof(msg), 0,
+             MACH_PORT_NULL, 100, MACH_PORT_NULL);
+}
+
+int main(void)
+{
+    dispatch_queue_t queue = dispatch_queue_create("churn", NULL);
+    __block unsigned long handled = 0;
+
+    alarm(60);
+
+    for (int round = 0; round < ROUNDS; round++) {
+        mach_port_t port = MACH_PORT_NULL;
+        dispatch_source_t src;
+        dispatch_semaphore_t cancelled = dispatch_semaphore_create(0);
+
+        if (mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE,
+                               &port) != KERN_SUCCESS) {
+            fprintf(stderr, "mach_port_allocate failed at round %d\n", round);
+            return 2;
+        }
+        if (mach_port_insert_right(mach_task_self(), port, port,
+                                   MACH_MSG_TYPE_MAKE_SEND) != KERN_SUCCESS) {
+            fprintf(stderr, "mach_port_insert_right failed at round %d\n",
+                    round);
+            return 2;
+        }
+
+        src = dispatch_source_create(DISPATCH_SOURCE_TYPE_MACH_RECV, port, 0,
+                                     queue);
+        if (!src) {
+            fprintf(stderr, "dispatch_source_create failed at round %d\n",
+                    round);
+            return 2;
+        }
+        dispatch_source_set_event_handler(src, ^{
+            union {
+                mach_msg_header_t hdr;
+                char buf[256];
+            } rcv;
+
+            while (mach_msg(&rcv.hdr, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0,
+                            sizeof(rcv), port, 0,
+                            MACH_PORT_NULL) == MACH_MSG_SUCCESS) {
+                handled++;
+            }
+        });
+        dispatch_source_set_cancel_handler(src, ^{
+            dispatch_semaphore_signal(cancelled);
+        });
+        dispatch_resume(src);
+
+        for (int i = 0; i < MSGS_PER_ROUND; i++) {
+            send_ping(port);
+        }
+        usleep(2000);
+
+        dispatch_source_cancel(src);
+        if (dispatch_semaphore_wait(
+                cancelled,
+                dispatch_time(DISPATCH_TIME_NOW, 10LL * NSEC_PER_SEC)) != 0) {
+            fprintf(stderr, "cancel handler stuck at round %d\n", round);
+            return 3;
+        }
+        dispatch_release(src);
+        dispatch_release(cancelled);
+        mach_port_mod_refs(mach_task_self(), port, MACH_PORT_RIGHT_SEND, -1);
+        mach_port_mod_refs(mach_task_self(), port, MACH_PORT_RIGHT_RECEIVE,
+                           -1);
+
+        /* Give the emulator a chance to replay any stale template. */
+        usleep(2000);
+    }
+
+    dispatch_release(queue);
+    printf("rounds=%d handled=%lu\n", ROUNDS, handled);
+    printf("mach_source_churn=ok\n");
+    return 0;
+}
+'''
+
+    def test_dispatch_mach_source_churn(self):
+        """Destroyed MACH_RECV sources must not be re-armed from a stale
+        cached knote template."""
+        exe = _compile_framework_test("dispatch_mach_source_churn",
+                                      self._DISPATCH_MACH_SOURCE_CHURN_SRC,
+                                      [], "c")
+        rc, out, err = _run_emulated(exe, timeout=90)
+        decoded = err.decode(errors="replace")
+        _assert_no_emulator_fault(self, err)
+        self.assertNotIn("Resurrection", decoded)
+        self.assertEqual(rc, 0,
+                         f"dispatch_mach_source_churn failed: {decoded}")
+        self.assertIn(b"mach_source_churn=ok", out)
+
     # --- AppKit tests ---
 
     _APPKIT_COLOR_SRC = r'''
