@@ -1993,13 +1993,14 @@ static void add_workloop_port(uint64_t wl_id,
         }
     }
     if ((kev->flags & EV_ADD) && workloop_port_count < MAX_WORKLOOP_PORTS) {
-        workloop_ports[workloop_port_count].workloop_id = wl_id;
-        workloop_ports[workloop_port_count].port = port;
-        workloop_ports[workloop_port_count].template_kev = *kev;
-        workloop_ports[workloop_port_count].has_template = true;
-        workloop_ports[workloop_port_count].readiness_inflight = false;
-        workloop_ports[workloop_port_count].readiness_seqno = 0;
-        workloop_ports[workloop_port_count].readiness_msgcount = 0;
+        workloop_port_entry *entry = &workloop_ports[workloop_port_count];
+
+        /* Start from a clean slot; never inherit a previous port's state. */
+        memset(entry, 0, sizeof(*entry));
+        entry->workloop_id = wl_id;
+        entry->port = port;
+        entry->template_kev = *kev;
+        entry->has_template = true;
         workloop_port_count++;
         drop_synthetic = true;
     }
@@ -2229,6 +2230,16 @@ static void remove_workloop_port(mach_port_t port)
                        stashed_count * sizeof(stashed[0]));
             }
             workloop_ports[i] = workloop_ports[--workloop_port_count];
+            /*
+             * Swap-delete leaves an identical copy of the moved entry
+             * behind.  Ownership of its stashed prereceived events moved to
+             * index i, so wipe the vacated slot: a later add_workloop_port()
+             * reuses it and would otherwise inherit another port's stashed
+             * events, delivering them a second time on the wrong workloop
+             * and unmapping their guest buffers twice.
+             */
+            memset(&workloop_ports[workloop_port_count], 0,
+                   sizeof(workloop_ports[0]));
             removed = true;
             break;
         }
