@@ -645,16 +645,21 @@ static abi_ulong prereceive_one_msg_timeout(mach_port_t port,
 #define MAX_PENDING_WL 128
 #define WORKLOOP_ACTIVE_STALE_NS (100ULL * 1000 * 1000)
 /*
- * A sync handoff can be observed (the waker runs) long before the waiter
- * arms its wait.  AppKit modal sessions are the worst case: WindowServer
- * hands ownership back while the nested modal session is still building
- * its window, so several tens of milliseconds of window creation, Metal
- * device enumeration and workloop setup run before the waiter reaches
- * kevent_id().  Dropping the handoff in that window loses the wake and the
- * modal run loop blocks forever, so keep an exact-waiter handoff alive
- * nearly as long as the wildcard one below.
+ * A wildcard handoff names no waiter, so any thread waiting on the workloop
+ * can claim it.  That is only safe for a short while; time it out so a wake
+ * nobody wanted cannot satisfy an unrelated wait much later.
+ *
+ * Handoffs that do name a waiter are not timed out at all.  libdispatch
+ * routinely posts NOTE_WL_SYNC_WAKE well before the named waiter reaches
+ * __ulock_wait: during AppKit modal setup the waiter first builds the panel
+ * window, enumerates Metal devices and starts a nested run loop, which
+ * takes seconds under emulation.  Any deadline we pick is a race we lose
+ * sometimes, and losing it blocks the modal run loop forever.  Such a
+ * handoff is dropped when it is consumed, when a newer wake for the same
+ * waiter replaces it, or when that waiter finishes a wait on the workloop
+ * (see end_active_ulock_sync_wait); the oldest one is recycled if the table
+ * ever fills up.
  */
-#define WORKLOOP_SYNC_HANDOFF_STALE_NS (2ULL * 1000 * 1000 * 1000)
 #define WORKLOOP_SYNC_WILDCARD_HANDOFF_STALE_NS (5ULL * 1000 * 1000 * 1000)
 typedef struct {
     uint64_t workloop_id;
@@ -888,12 +893,13 @@ static void prune_pending_sync_handoffs_locked(uint64_t now_ns)
 {
     for (int i = 0; i < MAX_PENDING_WL; i++) {
         pending_sync_handoff *handoff = &pending_sync_handoffs[i];
-        uint64_t stale_ns = handoff->waiter == MACH_PORT_NULL
-            ? WORKLOOP_SYNC_WILDCARD_HANDOFF_STALE_NS
-            : WORKLOOP_SYNC_HANDOFF_STALE_NS;
 
+        if (handoff->waiter != MACH_PORT_NULL) {
+            continue;
+        }
         if ((handoff->wait_armed || handoff->wake_pending) &&
-            now_ns - handoff->created_ns >= stale_ns) {
+            now_ns - handoff->created_ns >=
+                WORKLOOP_SYNC_WILDCARD_HANDOFF_STALE_NS) {
             *handoff = (pending_sync_handoff) { 0 };
         }
     }
@@ -903,6 +909,7 @@ static pending_sync_handoff *ensure_pending_sync_handoff_locked(
     uint64_t wl_id, mach_port_t waiter, uint64_t now_ns)
 {
     pending_sync_handoff *free_entry = NULL;
+    pending_sync_handoff *oldest = NULL;
 
     prune_pending_sync_handoffs_locked(now_ns);
     for (int i = 0; i < MAX_PENDING_WL; i++) {
@@ -917,8 +924,15 @@ static pending_sync_handoff *ensure_pending_sync_handoff_locked(
         if (handoff->workloop_id == wl_id && handoff->waiter == waiter) {
             return handoff;
         }
+        if (!oldest || handoff->created_ns < oldest->created_ns) {
+            oldest = handoff;
+        }
     }
 
+    if (!free_entry) {
+        /* Named handoffs never time out, so recycle the oldest one. */
+        free_entry = oldest;
+    }
     if (free_entry) {
         *free_entry = (pending_sync_handoff) {
             .workloop_id = wl_id,
