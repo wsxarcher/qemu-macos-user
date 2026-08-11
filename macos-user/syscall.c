@@ -1753,6 +1753,35 @@ static void clear_pending_workloop_req(uint64_t wl_id)
 }
 
 /*
+ * libdispatch dq_state bits.  _dispatch_root_queue_drain_deferred_wlh()
+ * aborts the process with "BUG IN LIBDISPATCH: Invalid wlh state" unless the
+ * queue a servicer was dispatched for is a base workloop with queued work,
+ * so these are the exact bits it tests.
+ */
+#define GUEST_DISPATCH_QUEUE_DIRTY          0x0000000000000001ULL
+#define GUEST_DISPATCH_QUEUE_ROLE_MASK      0x0000006000000000ULL
+#define GUEST_DISPATCH_QUEUE_ROLE_BASE_WLH  0x0000002000000000ULL
+
+/* Would dispatching a servicer for this parked thread request be safe? */
+static bool workloop_req_wants_servicer(const struct kevent_qos_s *ev)
+{
+    const uint64_t mask = GUEST_DISPATCH_QUEUE_ROLE_MASK |
+                          GUEST_DISPATCH_QUEUE_DIRTY;
+    const uint64_t want = GUEST_DISPATCH_QUEUE_ROLE_BASE_WLH |
+                          GUEST_DISPATCH_QUEUE_DIRTY;
+    uint64_t dq_state;
+
+    /* ext[1] is libdispatch's WL_ADDR, i.e. &dq->dq_state. */
+    if (!ev->ext[1] ||
+        !guest_range_readable((abi_ulong)ev->ext[1], sizeof(uint64_t))) {
+        return false;
+    }
+
+    dq_state = *(uint64_t *)g2h_untagged((abi_ulong)ev->ext[1]);
+    return (dq_state & mask) == want;
+}
+
+/*
  * Deliver thread requests that nothing is ever going to pair with.
  *
  * A NOTE_WL_THREAD_REQUEST on a workloop that owns MACHPORT knotes is
@@ -1768,34 +1797,6 @@ static void clear_pending_workloop_req(uint64_t wl_id)
  * Only called from paths where a guest thread is already blocked, so this
  * cannot pre-empt work the guest could have made progress on itself.
  */
-/* Lowest bit of a libdispatch dq_state: the queue has enqueued work. */
-#define GUEST_DISPATCH_QUEUE_DIRTY 0x1ULL
-
-/*
- * Would dispatching a servicer for this parked thread request be safe?
- *
- * ext[1]/ext[2]/ext[3] are libdispatch's WL_ADDR/WL_MASK/WL_VALUE: the queue
- * state the request was registered against.  XNU treats a request whose
- * guard no longer matches as stale, and libdispatch aborts with "Invalid
- * wlh state" if a servicer turns up for a queue with no work, so require
- * both that the guard still holds and that it describes a dirty queue.  A
- * request registered against a clean queue is a state update, not a plea
- * for a thread.
- */
-static bool workloop_req_wants_servicer(const struct kevent_qos_s *ev)
-{
-    uint64_t dq_state;
-
-    if (!ev->ext[1] || !(ev->ext[2] & GUEST_DISPATCH_QUEUE_DIRTY) ||
-        !(ev->ext[3] & GUEST_DISPATCH_QUEUE_DIRTY) ||
-        !guest_range_readable((abi_ulong)ev->ext[1], sizeof(uint64_t))) {
-        return false;
-    }
-
-    dq_state = *(uint64_t *)g2h_untagged((abi_ulong)ev->ext[1]);
-    return (dq_state & ev->ext[2]) == (ev->ext[3] & ev->ext[2]);
-}
-
 static void service_stalled_zero_wake_workloop_reqs(void)
 {
     uint64_t now_ns = workloop_monotonic_time_ns();
@@ -1823,6 +1824,7 @@ static void service_stalled_zero_wake_workloop_reqs(void)
                 now_ns - req->zero_wake_since_ns <
                     WORKLOOP_ZERO_WAKE_STALL_NS ||
                 !has_parked_workloop_thread(req->workloop_id) ||
+                is_workloop_active(req->workloop_id) ||
                 !workloop_req_wants_servicer(&req->event)) {
                 continue;
             }
@@ -1837,6 +1839,11 @@ static void service_stalled_zero_wake_workloop_reqs(void)
             return;
         }
 
+        /* Re-check as late as possible: the guest may have moved on. */
+        if (!workloop_req_wants_servicer(&ev)) {
+            store_pending_workloop_req(wl_id, &ev, true);
+            continue;
+        }
         if (do_strace) {
             fprintf(stderr, "  workloop wl=0x%llx: delivering parked "
                     "THREAD_REQUEST that no knote paired with "
