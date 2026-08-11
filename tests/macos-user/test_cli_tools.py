@@ -3201,6 +3201,75 @@ int main(void) {
         self.assertIn("regular-modal:auto-close", decoded)
         self.assertIn("regular-modal:done", decoded)
 
+    _APPKIT_REPEATED_NSALERT_SRC = r'''
+#import <AppKit/AppKit.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+@interface RepeatedModalDelegate : NSObject <NSApplicationDelegate>
+@end
+
+@implementation RepeatedModalDelegate
+- (void)applicationDidFinishLaunching:(NSNotification *)notification
+{
+    (void)notification;
+
+    for (int iteration = 0; iteration < 3; iteration++) {
+        NSAlert *alert = [[NSAlert alloc] init];
+        [alert setMessageText:@"qemu-macos-user repeated NSAlert"];
+        [alert setInformativeText:@"workloop sync handoff stress"];
+        [alert addButtonWithTitle:@"OK"];
+
+        NSTimer *timer = [NSTimer timerWithTimeInterval:0.2
+                                                repeats:NO
+                                                  block:^(NSTimer *timer) {
+            (void)timer;
+            [NSApp stopModalWithCode:NSModalResponseOK];
+        }];
+        [[NSRunLoop mainRunLoop] addTimer:timer
+                                  forMode:NSModalPanelRunLoopMode];
+
+        NSInteger result = [alert runModal];
+        fprintf(stderr, "modal[%d]=%ld\n", iteration, (long)result);
+        if (result != NSModalResponseOK) {
+            exit(2);
+        }
+    }
+
+    fprintf(stderr, "repeated-modal:done\n");
+    exit(0);
+}
+@end
+
+int main(void)
+{
+    alarm(60);
+
+    @autoreleasepool {
+        NSApplication *app = [NSApplication sharedApplication];
+        [app setActivationPolicy:NSApplicationActivationPolicyRegular];
+        RepeatedModalDelegate *delegate = [[RepeatedModalDelegate alloc] init];
+        [app setDelegate:delegate];
+        [app run];
+    }
+    return 0;
+}
+'''
+
+    def test_appkit_repeated_regular_nsalert_modal(self):
+        """Successive Regular NSAlert modals keep their sync wake handoffs."""
+        exe = _compile_framework_test("appkit_repeated_nsalert",
+                                      self._APPKIT_REPEATED_NSALERT_SRC,
+                                      ["AppKit"])
+        rc, _, err = _run_emulated(exe, timeout=70)
+        decoded = err.decode(errors="replace")
+        _assert_no_emulator_fault(self, err)
+        self.assertEqual(rc, 0, f"appkit_repeated_nsalert failed: {decoded}")
+        for iteration in range(3):
+            self.assertIn(f"modal[{iteration}]=1", decoded)
+        self.assertIn("repeated-modal:done", decoded)
+
     # -- WindowServer query test (SkyLight framework) -----------------------
 
     _WS_QUERY_SRC = r'''
