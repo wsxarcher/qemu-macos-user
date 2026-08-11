@@ -3443,6 +3443,39 @@ int main(void) {
 #include <stdio.h>
 #include <stdlib.h>
 
+/*
+ * Modal sessions run dispatch_sync() on AppKit's queues, and the waiter's
+ * dispatch_sync_context_s lives on this thread's stack.  If a waiter is
+ * ever left linked on a queue after runModal returns, the next push on that
+ * queue writes "prev->do_next" into a stack frame that no longer exists.
+ * Claim that stack, paint it, let the run loop turn over, and check it: a
+ * stray write shows up here long before it happens to land on something
+ * AppKit is about to branch through.
+ */
+#define CANARY_WORDS 8192
+
+static int stack_below_is_intact(void)
+{
+    volatile unsigned long long canary[CANARY_WORDS];
+
+    for (int i = 0; i < CANARY_WORDS; i++) {
+        canary[i] = 0xD15EA5E000000000ULL + (unsigned long long)i;
+    }
+
+    [[NSRunLoop mainRunLoop] runUntilDate:
+        [NSDate dateWithTimeIntervalSinceNow:0.15]];
+
+    for (int i = 0; i < CANARY_WORDS; i++) {
+        if (canary[i] != 0xD15EA5E000000000ULL + (unsigned long long)i) {
+            fprintf(stderr,
+                    "stack canary clobbered at word %d: 0x%llx\n",
+                    i, canary[i]);
+            return 0;
+        }
+    }
+    return 1;
+}
+
 @interface RepeatedModalDelegate : NSObject <NSApplicationDelegate>
 @end
 
@@ -3470,6 +3503,9 @@ int main(void) {
         fprintf(stderr, "modal[%d]=%ld\n", iteration, (long)result);
         if (result != NSModalResponseOK) {
             exit(2);
+        }
+        if (!stack_below_is_intact()) {
+            exit(5);
         }
     }
 
@@ -3501,6 +3537,7 @@ int main(void)
         rc, _, err = _run_emulated(exe, timeout=70)
         decoded = err.decode(errors="replace")
         _assert_no_emulator_fault(self, err)
+        self.assertNotIn("stack canary clobbered", decoded)
         self.assertEqual(rc, 0, f"appkit_repeated_nsalert failed: {decoded}")
         for iteration in range(3):
             self.assertIn(f"modal[{iteration}]=1", decoded)

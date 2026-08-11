@@ -1035,6 +1035,103 @@ static void record_workloop_sync_wake(uint64_t wl_id, mach_port_t waiter,
     }
 }
 
+/*
+ * libdispatch queue layout used by the sync-wake repair below.  Taken from
+ * _dispatch_lane_push_waiter():
+ *
+ *   ldr  x8, [x1, #0x30]      dsc->dc_data
+ *   str  xzr, [x1, #0x10]     dsc->do_next = NULL
+ *   add  x8, x0, #0x30        &dq->dq_items_tail
+ *   swpl x1, x10, [x8]        exchange tail
+ *   str  x1, [x10, #0x10]     prev->do_next = dsc
+ *   str  x1, [x0, #0x68]      dq->dq_items_head = dsc (list was empty)
+ */
+#define GUEST_DQ_ITEMS_TAIL_OFF 0x30
+#define GUEST_DQ_ITEMS_HEAD_OFF 0x68
+#define GUEST_DSC_EVENT_OFF     0x60
+#define GUEST_DO_NEXT_OFF       0x10
+
+/*
+ * Detach a sync waiter we are about to wake by hand.
+ *
+ * A real drainer pops the waiter off the queue before signalling it, so by
+ * the time dispatch_sync() returns and the caller's frame dies nothing
+ * points at it any more.  Our synthesised wake has no drainer, so the
+ * dispatch_sync_context_s - which lives on the waiter's stack - stays linked
+ * as the queue's MPSC tail forever.  The next push on that queue then does
+ * "prev->do_next = new" straight into a stack frame that has long since been
+ * reused, which is how an AppKit event-filter block ends up holding a
+ * pointer to some worker thread's stack and the guest branches to garbage.
+ *
+ * Unlink it properly: find the node whose do_next is the waiter, move the
+ * tail back to it and clear its link.  Everything is conditional on a
+ * compare-and-swap of the tail, so a concurrent push just makes the repair
+ * give up rather than corrupt the queue.
+ */
+#define GUEST_MPSC_WALK_MAX 64
+
+static void detach_woken_sync_waiter(uint64_t dq, abi_ulong wait_addr)
+{
+    abi_ulong dsc = wait_addr - GUEST_DSC_EVENT_OFF;
+    uint64_t *tail;
+    uint64_t *head;
+    uint64_t node;
+    uint64_t pred = 0;
+
+    if (!dq || wait_addr < GUEST_DSC_EVENT_OFF ||
+        !guest_range_writable((abi_ulong)dq + GUEST_DQ_ITEMS_HEAD_OFF,
+                              sizeof(uint64_t))) {
+        return;
+    }
+
+    tail = (uint64_t *)g2h_untagged((abi_ulong)dq + GUEST_DQ_ITEMS_TAIL_OFF);
+    head = (uint64_t *)g2h_untagged((abi_ulong)dq + GUEST_DQ_ITEMS_HEAD_OFF);
+
+    if (qatomic_read(tail) != (uint64_t)dsc) {
+        return;
+    }
+
+    node = qatomic_read(head);
+    if (node != (uint64_t)dsc) {
+        for (int i = 0; i < GUEST_MPSC_WALK_MAX; i++) {
+            uint64_t next;
+
+            if (!node ||
+                !guest_range_readable((abi_ulong)node + GUEST_DO_NEXT_OFF,
+                                      sizeof(uint64_t))) {
+                return;
+            }
+            next = qatomic_read((uint64_t *)g2h_untagged(
+                (abi_ulong)node + GUEST_DO_NEXT_OFF));
+            if (next == (uint64_t)dsc) {
+                pred = node;
+                break;
+            }
+            node = next;
+        }
+        if (!pred) {
+            return;
+        }
+    }
+
+    if (qatomic_cmpxchg(tail, (uint64_t)dsc, pred) != (uint64_t)dsc) {
+        return;
+    }
+    if (pred) {
+        qatomic_set((uint64_t *)g2h_untagged((abi_ulong)pred +
+                                             GUEST_DO_NEXT_OFF), 0);
+    } else {
+        qatomic_cmpxchg(head, (uint64_t)dsc, 0);
+    }
+
+    if (do_strace) {
+        fprintf(stderr, "  ulock_wait: detached hand-woken sync waiter "
+                "dsc=0x%llx pred=0x%llx from queue 0x%llx\n",
+                (unsigned long long)dsc, (unsigned long long)pred,
+                (unsigned long long)dq);
+    }
+}
+
 static bool consume_active_ulock_sync_wake(uint64_t wl_id, mach_port_t waiter,
                                            abi_ulong wait_addr, uint64_t value,
                                            bool allow_wildcard_handoff,
@@ -1070,6 +1167,7 @@ static bool consume_active_ulock_sync_wake(uint64_t wl_id, mach_port_t waiter,
         return false;
     }
 
+    detach_woken_sync_waiter(wl_id, wait_addr);
     if (guest_range_writable(wait_addr, sizeof(uint32_t))) {
         *(uint32_t *)g2h_untagged(wait_addr) = 0;
     }
