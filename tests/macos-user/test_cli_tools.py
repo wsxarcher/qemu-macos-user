@@ -2425,6 +2425,119 @@ int main(void)
                          f"dispatch_mach_source_churn failed: {decoded}")
         self.assertIn(b"mach_source_churn=ok", out)
 
+    _DISPATCH_MULTI_SOURCE_CHURN_SRC = r'''
+#include <dispatch/dispatch.h>
+#include <mach/mach.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+#define LIVE 4
+#define ROUNDS 10
+
+static mach_port_t ports[LIVE];
+static dispatch_source_t srcs[LIVE];
+static dispatch_semaphore_t cancels[LIVE];
+
+static void send_ping(mach_port_t port)
+{
+    mach_msg_header_t msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+    msg.msgh_size = sizeof(msg);
+    msg.msgh_remote_port = port;
+    msg.msgh_id = 0x4242;
+    mach_msg(&msg, MACH_SEND_MSG | MACH_SEND_TIMEOUT, sizeof(msg), 0,
+             MACH_PORT_NULL, 100, MACH_PORT_NULL);
+}
+
+static void make_slot(dispatch_queue_t q, int i, unsigned long *handled)
+{
+    mach_port_t port = MACH_PORT_NULL;
+    mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &port);
+    mach_port_insert_right(mach_task_self(), port, port,
+                           MACH_MSG_TYPE_MAKE_SEND);
+    ports[i] = port;
+    cancels[i] = dispatch_semaphore_create(0);
+    srcs[i] = dispatch_source_create(DISPATCH_SOURCE_TYPE_MACH_RECV, port, 0, q);
+    dispatch_source_set_event_handler(srcs[i], ^{
+        union { mach_msg_header_t h; char b[256]; } r;
+        while (mach_msg(&r.h, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0,
+                        sizeof(r), port, 0, MACH_PORT_NULL) == MACH_MSG_SUCCESS) {
+            (*handled)++;
+        }
+    });
+    dispatch_semaphore_t sem = cancels[i];
+    dispatch_source_set_cancel_handler(srcs[i], ^{
+        dispatch_semaphore_signal(sem);
+    });
+    dispatch_resume(srcs[i]);
+}
+
+static int kill_slot(int i)
+{
+    dispatch_source_cancel(srcs[i]);
+    if (dispatch_semaphore_wait(cancels[i],
+            dispatch_time(DISPATCH_TIME_NOW, 20LL * NSEC_PER_SEC)) != 0) {
+        fprintf(stderr, "cancel stuck on slot %d\n", i);
+        return -1;
+    }
+    dispatch_release(srcs[i]);
+    dispatch_release(cancels[i]);
+    mach_port_mod_refs(mach_task_self(), ports[i], MACH_PORT_RIGHT_SEND, -1);
+    mach_port_mod_refs(mach_task_self(), ports[i], MACH_PORT_RIGHT_RECEIVE, -1);
+    srcs[i] = NULL;
+    return 0;
+}
+
+int main(void)
+{
+    dispatch_queue_t q = dispatch_queue_create("multi", NULL);
+    static unsigned long handled;
+
+    alarm(120);
+    for (int i = 0; i < LIVE; i++) {
+        make_slot(q, i, &handled);
+    }
+    for (int round = 0; round < ROUNDS; round++) {
+        int victim = round % LIVE;
+        for (int i = 0; i < LIVE; i++) {
+            if (srcs[i]) {
+                send_ping(ports[i]);
+                send_ping(ports[i]);
+            }
+        }
+        usleep(2000);
+        if (kill_slot(victim) < 0) {
+            return 3;
+        }
+        make_slot(q, victim, &handled);
+    }
+    for (int i = 0; i < LIVE; i++) {
+        if (srcs[i] && kill_slot(i) < 0) {
+            return 3;
+        }
+    }
+    dispatch_release(q);
+    printf("rounds=%d handled=%lu\n", ROUNDS, handled);
+    printf("multi_source_churn=ok\n");
+    return 0;
+}
+'''
+
+    def test_dispatch_multi_mach_source_churn(self):
+        """Recycling one of several live MACH_RECV sources on a queue keeps
+        the surviving sources delivering."""
+        exe = _compile_framework_test("dispatch_multi_mach_source_churn",
+                                      self._DISPATCH_MULTI_SOURCE_CHURN_SRC,
+                                      [], "c")
+        rc, out, err = _run_emulated(exe, timeout=120)
+        decoded = err.decode(errors="replace")
+        _assert_no_emulator_fault(self, err)
+        self.assertEqual(rc, 0,
+                         f"dispatch_multi_mach_source_churn failed: {decoded}")
+        self.assertIn(b"multi_source_churn=ok", out)
+
     # --- AppKit tests ---
 
     _APPKIT_COLOR_SRC = r'''
