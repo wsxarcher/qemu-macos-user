@@ -1160,6 +1160,7 @@ static void detach_woken_sync_waiter(uint64_t dq, abi_ulong wait_addr)
 
 static bool consume_active_ulock_sync_wake(uint64_t wl_id, mach_port_t waiter,
                                            abi_ulong wait_addr, uint64_t value,
+                                           bool allow_queued_handoff,
                                            bool allow_wildcard_handoff,
                                            const char *where)
 {
@@ -1182,7 +1183,7 @@ static bool consume_active_ulock_sync_wake(uint64_t wl_id, mach_port_t waiter,
             break;
         }
     }
-    if (!consume) {
+    if (!consume && allow_queued_handoff) {
         consume = take_pending_sync_handoff_wake_locked(
             wl_id, waiter, workloop_monotonic_time_ns(),
             allow_wildcard_handoff, &from_handoff);
@@ -7112,6 +7113,16 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
             int host_errno = 0;
             uint64_t ulock_started_ns = workloop_monotonic_time_ns();
             bool ulock_watchdog_fired = false;
+            /*
+             * A queued handoff is a sync wake that arrived before this
+             * waiter armed.  It may equally be left over from a wake that
+             * the guest itself is about to deliver, and claiming it means
+             * returning from dispatch_sync() with no drainer having run -
+             * which then needs the waiter unlinked by hand.  Give the real
+             * ulock_wake a full poll slice to turn up first and only fall
+             * back to a queued handoff once the genuine wait has stalled.
+             */
+            bool allow_queued_handoff = false;
 
             if (active_sync_wait) {
                 if (do_strace || getenv("QEMU_DEBUG_CGS")) {
@@ -7135,6 +7146,7 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                 if (active_sync_wait &&
                     consume_active_ulock_sync_wake(wait_workloop, wait_thread,
                                                     (abi_ulong)arg2, value,
+                                                    allow_queued_handoff,
                                                     false,
                                                     "")) {
                     rv = 0;
@@ -7163,6 +7175,7 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                 if (active_sync_wait &&
                     consume_active_ulock_sync_wake(wait_workloop, wait_thread,
                                                    (abi_ulong)arg2, value,
+                                                   allow_queued_handoff,
                                                    true,
                                                    "after zero-wake")) {
                     rv = 0;
@@ -7172,6 +7185,7 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                 if (active_sync_wait &&
                     consume_active_ulock_sync_wake(wait_workloop, wait_thread,
                                                     (abi_ulong)arg2, value,
+                                                    allow_queued_handoff,
                                                     true,
                                                     "after service")) {
                     rv = 0;
@@ -7183,9 +7197,11 @@ abi_long do_macos_syscall(void *cpu_env, int num, abi_long arg1,
                     break;
                 }
                 service_blocking_workloop_events();
+                allow_queued_handoff = true;
                 if (active_sync_wait &&
                     consume_active_ulock_sync_wake(wait_workloop, wait_thread,
                                                     (abi_ulong)arg2, value,
+                                                    true,
                                                     true,
                                                     "after timeout")) {
                     rv = 0;
