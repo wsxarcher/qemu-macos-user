@@ -1050,6 +1050,12 @@ static void record_workloop_sync_wake(uint64_t wl_id, mach_port_t waiter,
 #define GUEST_DQ_ITEMS_HEAD_OFF 0x68
 #define GUEST_DSC_EVENT_OFF     0x60
 #define GUEST_DO_NEXT_OFF       0x10
+#define GUEST_DSC_DC_DATA_OFF   0x30
+#define GUEST_DQ_STATE_OFF      0x38
+/* dc_data for a waiter that is not attached to a workloop. */
+#define GUEST_DISPATCH_WLH_ANON ((uint64_t)-4)
+/* dq_state bits holding the drain lock owner. */
+#define GUEST_DQ_DRAIN_OWNER_MASK 0xfffffffcULL
 
 /*
  * Detach a sync waiter we are about to wake by hand.
@@ -1081,6 +1087,26 @@ static void detach_woken_sync_waiter(uint64_t dq, abi_ulong wait_addr)
     if (!dq || wait_addr < GUEST_DSC_EVENT_OFF ||
         !guest_range_writable((abi_ulong)dq + GUEST_DQ_ITEMS_HEAD_OFF,
                               sizeof(uint64_t))) {
+        return;
+    }
+
+    /*
+     * Only touch the case this repairs: a waiter with no workloop of its
+     * own, sitting at the tail of a queue nobody is draining.  A waiter
+     * attached to a workloop is woken through kevent_id and unregisters
+     * itself, and a queue with a drain owner has a real drainer that will
+     * pop the waiter for us.
+     */
+    if (!guest_range_readable(dsc + GUEST_DSC_DC_DATA_OFF,
+                              sizeof(uint64_t)) ||
+        *(uint64_t *)g2h_untagged(dsc + GUEST_DSC_DC_DATA_OFF) !=
+            GUEST_DISPATCH_WLH_ANON) {
+        return;
+    }
+    if (!guest_range_readable((abi_ulong)dq + GUEST_DQ_STATE_OFF,
+                              sizeof(uint64_t)) ||
+        (*(uint64_t *)g2h_untagged((abi_ulong)dq + GUEST_DQ_STATE_OFF) &
+         GUEST_DQ_DRAIN_OWNER_MASK)) {
         return;
     }
 
